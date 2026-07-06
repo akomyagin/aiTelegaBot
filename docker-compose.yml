@@ -1,0 +1,47 @@
+# docker-compose.yml — ЧАСТЬ ПРОДУКТА (не только dev).
+#
+# aiTelegaBot — первый проект портфеля с настоящим сервисным рантаймом: бот
+# работает постоянно (long-polling к Telegram + крон на дайджест). Поэтому
+# docker-compose здесь описывает сам продукт, а не только dev-зависимости.
+#
+# Сервисы:
+#   bot     — сам бот, собирается из Dockerfile; состояние на volume /data.
+#   ollama  — ОПЦИОНАЛЬНО (профиль "dev"): локальная LLM для теста без ключа;
+#             плейн `docker compose up` его НЕ поднимает.
+#
+# Использование:
+#   cp .env.example .env      # заполнить TELEGRAM_BOT_TOKEN и пр.
+#   docker compose up -d --build
+#   docker compose logs -f bot
+#   docker compose --profile dev up -d ollama   # локальная Ollama (dev)
+#
+# Секреты — только через .env (в .gitignore), НИКОГДА не в git и не в образе.
+# MTProto session-файл (Фаза 2) хранится на volume bot-state, не в git.
+
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aitelegabot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DB_PATH: /data/state.db
+    volumes:
+      - bot-state:/data          # SQLite + MTProto session (Фаза 2) переживают рестарт
+
+  ollama:
+    image: ollama/ollama
+    container_name: aitelegabot-ollama-dev
+    profiles: ["dev"]            # поднимается только с `--profile dev`
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    restart: unless-stopped
+
+volumes:
+  bot-state:
+  ollama-models:
