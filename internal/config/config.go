@@ -9,6 +9,8 @@
 package config
 
 import (
+	"encoding/hex"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -37,6 +39,12 @@ type Config struct {
 	TGPublicChannels  []string // env TG_PUBLIC_CHANNELS, comma-separated
 	TGManagedChannels []string // env TG_MANAGED_CHANNELS, comma-separated (chat usernames)
 	TGSourceLimit     int      // env TG_SOURCE_LIMIT, default 20 — max posts per channel
+
+	// MTProto (Фаза 2, Этап 6).
+	MTProtoAppID   int    // env MTPROTO_APP_ID
+	MTProtoAppHash string // env MTPROTO_APP_HASH
+	MTProtoSession string // env MTPROTO_SESSION_PATH, default "/data/session.encrypted"
+	MTProtoKey     []byte // env MTPROTO_SESSION_KEY (hex, 32 bytes); empty = unencrypted
 
 	// Scheduling.
 	DigestTime string // daily slot, e.g. "09:00"
@@ -68,9 +76,38 @@ func Load() (*Config, error) {
 		TGPublicChannels:  parseCSV(os.Getenv("TG_PUBLIC_CHANNELS")),
 		TGManagedChannels: parseCSV(os.Getenv("TG_MANAGED_CHANNELS")),
 		TGSourceLimit:     parseIntOr(os.Getenv("TG_SOURCE_LIMIT"), 20),
+
+		MTProtoAppID:   parseIntOr(os.Getenv("MTPROTO_APP_ID"), 0),
+		MTProtoAppHash: os.Getenv("MTPROTO_APP_HASH"),
+		MTProtoSession: envOr("MTPROTO_SESSION_PATH", "/data/session.encrypted"),
 	}
 	cfg.Offline = cfg.LLMAPIKey == ""
+
+	key, err := parseHexKey(os.Getenv("MTPROTO_SESSION_KEY"))
+	if err != nil {
+		return nil, err
+	}
+	cfg.MTProtoKey = key
+
 	return cfg, nil
+}
+
+// parseHexKey decodes a hex-encoded 32-byte session key. An empty value is
+// valid (unencrypted session); a non-empty value must decode to exactly 32
+// bytes.
+func parseHexKey(raw string) ([]byte, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	key, err := hex.DecodeString(raw)
+	if err != nil {
+		return nil, fmt.Errorf("config: MTPROTO_SESSION_KEY is not valid hex: %w", err)
+	}
+	if len(key) != 32 {
+		return nil, fmt.Errorf("config: MTPROTO_SESSION_KEY must decode to 32 bytes, got %d", len(key))
+	}
+	return key, nil
 }
 
 // parseCSV splits a comma-separated list, trimming whitespace and dropping

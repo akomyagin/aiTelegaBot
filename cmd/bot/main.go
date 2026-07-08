@@ -28,6 +28,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Subcommand: one-shot interactive MTProto login (`bot login`).
+	if len(os.Args) > 1 && os.Args[1] == "login" {
+		if err := runLogin(ctx, cfg); err != nil {
+			slog.Error("mtproto login failed", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if err := app.Run(ctx, cfg); err != nil {
 		slog.Error("bot exited with error", "err", err)
 		os.Exit(1)

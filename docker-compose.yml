@@ -29,6 +29,12 @@ services:
       - .env
     environment:
       DB_PATH: /data/state.db
+      # MTProto (Фаза 2, Этап 6). Credentials + session-encryption key from .env;
+      # the session file lives on the bot-state volume, never in git or the image.
+      MTPROTO_APP_ID: ${MTPROTO_APP_ID:-}
+      MTPROTO_APP_HASH: ${MTPROTO_APP_HASH:-}
+      MTPROTO_SESSION_PATH: /data/session.encrypted
+      MTPROTO_SESSION_KEY: ${MTPROTO_SESSION_KEY:-}
     volumes:
       - bot-state:/data          # SQLite + MTProto session (Фаза 2) переживают рестарт
 
