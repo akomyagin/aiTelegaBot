@@ -18,6 +18,7 @@ import (
 	"github.com/akomyagin/aiTelegaBot/internal/digest"
 	"github.com/akomyagin/aiTelegaBot/internal/feed"
 	"github.com/akomyagin/aiTelegaBot/internal/llm"
+	"github.com/akomyagin/aiTelegaBot/internal/mtproto"
 	"github.com/akomyagin/aiTelegaBot/internal/scheduler"
 	"github.com/akomyagin/aiTelegaBot/internal/storage"
 	"github.com/akomyagin/aiTelegaBot/internal/telegram"
@@ -80,6 +81,31 @@ func Run(ctx context.Context, cfg *config.Config) error {
 			continue
 		}
 		sources = append(sources, telegram.NewPublicSource("@"+ch, ch, hc, tgLimit))
+	}
+
+	// MTProto private-channel sources (Этап 7). Only wired when credentials and
+	// at least one channel are configured; otherwise no MTProto client is built.
+	if cfg.MTProtoAppID != 0 && cfg.MTProtoAppHash != "" && len(cfg.MTProtoChannels) > 0 {
+		mtClient, err := mtproto.NewClient(mtproto.MTProtoConfig{
+			AppID:       cfg.MTProtoAppID,
+			AppHash:     cfg.MTProtoAppHash,
+			SessionPath: cfg.MTProtoSession,
+			SessionKey:  cfg.MTProtoKey,
+		})
+		if err != nil {
+			return err
+		}
+		mtLimit := cfg.MTProtoLimit
+		if mtLimit <= 0 {
+			mtLimit = 20
+		}
+		for _, ch := range cfg.MTProtoChannels {
+			ch = strings.TrimPrefix(strings.TrimSpace(ch), "@")
+			if ch == "" {
+				continue
+			}
+			sources = append(sources, mtproto.NewChannelSource("@"+ch, ch, mtLimit, mtClient))
+		}
 	}
 
 	pipeline := &digest.Pipeline{

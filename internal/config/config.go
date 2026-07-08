@@ -46,6 +46,10 @@ type Config struct {
 	MTProtoSession string // env MTPROTO_SESSION_PATH, default "/data/session.encrypted"
 	MTProtoKey     []byte // env MTPROTO_SESSION_KEY (hex, 32 bytes); empty = unencrypted
 
+	// MTProto channel sources (Фаза 2, Этап 7).
+	MTProtoChannels []string // env MTPROTO_CHANNELS, comma-separated usernames (@channel)
+	MTProtoLimit    int      // env MTPROTO_LIMIT, default 20 — max posts per channel
+
 	// Scheduling.
 	DigestTime string // daily slot, e.g. "09:00"
 	Timezone   string // IANA TZ, e.g. "Europe/Moscow"
@@ -80,6 +84,9 @@ func Load() (*Config, error) {
 		MTProtoAppID:   parseIntOr(os.Getenv("MTPROTO_APP_ID"), 0),
 		MTProtoAppHash: os.Getenv("MTPROTO_APP_HASH"),
 		MTProtoSession: envOr("MTPROTO_SESSION_PATH", "/data/session.encrypted"),
+
+		MTProtoChannels: parseCSV(os.Getenv("MTPROTO_CHANNELS")),
+		MTProtoLimit:    parseIntOr(os.Getenv("MTPROTO_LIMIT"), 20),
 	}
 	cfg.Offline = cfg.LLMAPIKey == ""
 
