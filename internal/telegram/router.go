@@ -34,8 +34,18 @@ const (
 func (b *Bot) handleUpdate(ctx context.Context, api *bot.Bot, u *models.Update) {
 	_ = api // delivery goes through b.Deliver
 
+	// Channel posts from managed channels (bot is admin). Checked before the
+	// u.Message guard, otherwise channel posts would be dropped.
+	if u.ChannelPost != nil && b.channelBuf != nil {
+		post := u.ChannelPost
+		username := post.Chat.Username
+		item := channelPostToItem(username, post.ID, post.Text, int64(post.Date))
+		b.channelBuf.Push(item)
+		return
+	}
+
 	if u.Message == nil {
-		return // channel posts / callbacks are out of scope for Этап 1
+		return // other callbacks are out of scope
 	}
 
 	if !authorized(u.Message.Chat.ID, b.chatID) {

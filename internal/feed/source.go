@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -26,11 +27,17 @@ type Item struct {
 	URL       string
 	Text      string // body / abstract / message text
 	Published time.Time
+	ID        string // message ID for Telegram sources (tg_botapi, tg_public)
 }
 
 // DedupKey returns the stable key used to skip already-seen items across runs
 // (see docs/TECHNICAL_PLAN.md §7). Stage 0: placeholder.
 func (i Item) DedupKey() string {
+	// TG sources are deduplicated by message ID, not URL (the URL can change
+	// when a post is edited).
+	if strings.HasPrefix(i.Kind, "tg_") && i.ID != "" {
+		return "tg:" + i.Source + ":" + i.ID
+	}
 	if i.URL != "" {
 		return i.URL
 	}

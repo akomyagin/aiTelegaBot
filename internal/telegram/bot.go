@@ -31,6 +31,7 @@ type Bot struct {
 	chatID      int64    // owner chat; only accept commands from this single user
 	onDigest    func(ctx context.Context) error
 	listSources func(ctx context.Context) (string, error)
+	channelBuf  *ChannelBuffer // nil if no managed channels configured
 	log         *slog.Logger
 }
 
@@ -45,6 +46,12 @@ func WithDigestTrigger(fn func(ctx context.Context) error) Option {
 // WithSourceLister wires the /sources command to a source listing.
 func WithSourceLister(fn func(ctx context.Context) (string, error)) Option {
 	return func(b *Bot) { b.listSources = fn }
+}
+
+// WithChannelBuffer wires managed-channel posts into a shared buffer drained by
+// ManagedSource. When nil, channel posts are ignored.
+func WithChannelBuffer(buf *ChannelBuffer) Option {
+	return func(b *Bot) { b.channelBuf = buf }
 }
 
 // NewBot builds the Telegram bot over the go-telegram/bot library. The chatID
