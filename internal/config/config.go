@@ -8,7 +8,11 @@
 // Stage 0: skeleton only — real loading/validation lands in Этап 1+.
 package config
 
-import "os"
+import (
+	"os"
+	"strconv"
+	"strings"
+)
 
 // Config holds all runtime settings for the bot service.
 type Config struct {
@@ -23,6 +27,10 @@ type Config struct {
 
 	// State.
 	DBPath string // SQLite file, e.g. /data/state.db
+
+	// Web sources (Этап 2).
+	FeedURLs []string // RSS/Atom/arXiv feed URLs (env FEED_URLS, comma-separated)
+	HNLimit  int      // number of Hacker News top stories (env HN_LIMIT, default 15)
 
 	// Scheduling.
 	DigestTime string // daily slot, e.g. "09:00"
@@ -47,9 +55,34 @@ func Load() (*Config, error) {
 		DBPath:           envOr("DB_PATH", "/data/state.db"),
 		DigestTime:       envOr("DIGEST_TIME", "09:00"),
 		Timezone:         envOr("TZ", "UTC"),
+		FeedURLs:         parseFeedURLs(os.Getenv("FEED_URLS")),
+		HNLimit:          parseIntOr(os.Getenv("HN_LIMIT"), 15),
 	}
 	cfg.Offline = cfg.LLMAPIKey == ""
 	return cfg, nil
+}
+
+// parseFeedURLs splits a comma-separated list, trimming whitespace and dropping
+// empty entries.
+func parseFeedURLs(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		if u := strings.TrimSpace(part); u != "" {
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
+// parseIntOr returns the parsed int or def on any parse error.
+func parseIntOr(raw string, def int) int {
+	if n, err := strconv.Atoi(strings.TrimSpace(raw)); err == nil {
+		return n
+	}
+	return def
 }
 
 func envOr(key, def string) string {
