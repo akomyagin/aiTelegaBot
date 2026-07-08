@@ -35,15 +35,28 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		summarizer = llm.NewClient(cfg.LLMAPIKey, cfg.LLMBaseURL, cfg.LLMModel)
 	}
 
-	bot := telegram.NewBot(cfg.TelegramBotToken, cfg.TelegramChatID)
-
 	pipeline := &digest.Pipeline{
 		Store:     store,
 		Summarize: summarizer,
-		Deliver:   bot,
 		ChatID:    cfg.TelegramChatID,
 		// Sources are registered in Этап 2 (web) / Этап 5 (Telegram).
 	}
+
+	// listSources is a placeholder until real sources land in Этап 2.
+	listSources := func(ctx context.Context) (string, error) {
+		return "Источники будут добавлены в Этапе 2", nil
+	}
+
+	bot, err := telegram.NewBot(
+		cfg.TelegramBotToken,
+		cfg.TelegramChatID,
+		telegram.WithDigestTrigger(pipeline.Run),
+		telegram.WithSourceLister(listSources),
+	)
+	if err != nil {
+		return err
+	}
+	pipeline.Deliver = bot
 
 	sched := scheduler.New(cfg.DigestTime, cfg.Timezone, pipeline.Run)
 
