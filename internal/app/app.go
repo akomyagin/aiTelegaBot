@@ -58,6 +58,30 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		sources = append(sources, feed.NewHNSource("Hacker News", cfg.HNLimit, hc))
 	}
 
+	// Telegram sources (Этап 5).
+	var channelBuf *telegram.ChannelBuffer
+	if len(cfg.TGManagedChannels) > 0 {
+		channelBuf = &telegram.ChannelBuffer{}
+		for _, ch := range cfg.TGManagedChannels {
+			ch = strings.TrimPrefix(strings.TrimSpace(ch), "@")
+			if ch == "" {
+				continue
+			}
+			sources = append(sources, telegram.NewManagedSource("@"+ch, channelBuf))
+		}
+	}
+	tgLimit := cfg.TGSourceLimit
+	if tgLimit <= 0 {
+		tgLimit = 20
+	}
+	for _, ch := range cfg.TGPublicChannels {
+		ch = strings.TrimPrefix(strings.TrimSpace(ch), "@")
+		if ch == "" {
+			continue
+		}
+		sources = append(sources, telegram.NewPublicSource("@"+ch, ch, hc, tgLimit))
+	}
+
 	pipeline := &digest.Pipeline{
 		Sources:   sources,
 		Store:     store,
@@ -77,12 +101,14 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		return b.String(), nil
 	}
 
-	bot, err := telegram.NewBot(
-		cfg.TelegramBotToken,
-		cfg.TelegramChatID,
+	botOpts := []telegram.Option{
 		telegram.WithDigestTrigger(pipeline.Run),
 		telegram.WithSourceLister(listSources),
-	)
+	}
+	if channelBuf != nil {
+		botOpts = append(botOpts, telegram.WithChannelBuffer(channelBuf))
+	}
+	bot, err := telegram.NewBot(cfg.TelegramBotToken, cfg.TelegramChatID, botOpts...)
 	if err != nil {
 		return err
 	}

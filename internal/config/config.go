@@ -33,6 +33,11 @@ type Config struct {
 	FeedURLs []string // RSS/Atom/arXiv feed URLs (env FEED_URLS, comma-separated)
 	HNLimit  int      // number of Hacker News top stories (env HN_LIMIT, default 15)
 
+	// Telegram sources (Этап 5).
+	TGPublicChannels  []string // env TG_PUBLIC_CHANNELS, comma-separated
+	TGManagedChannels []string // env TG_MANAGED_CHANNELS, comma-separated (chat usernames)
+	TGSourceLimit     int      // env TG_SOURCE_LIMIT, default 20 — max posts per channel
+
 	// Scheduling.
 	DigestTime string // daily slot, e.g. "09:00"
 	Timezone   string // IANA TZ, e.g. "Europe/Moscow"
@@ -57,16 +62,20 @@ func Load() (*Config, error) {
 		DBPath:           envOr("DB_PATH", "/data/state.db"),
 		DigestTime:       envOr("DIGEST_TIME", "09:00"),
 		Timezone:         envOr("TZ", "UTC"),
-		FeedURLs:         parseFeedURLs(os.Getenv("FEED_URLS")),
+		FeedURLs:         parseCSV(os.Getenv("FEED_URLS")),
 		HNLimit:          parseIntOr(os.Getenv("HN_LIMIT"), 15),
+
+		TGPublicChannels:  parseCSV(os.Getenv("TG_PUBLIC_CHANNELS")),
+		TGManagedChannels: parseCSV(os.Getenv("TG_MANAGED_CHANNELS")),
+		TGSourceLimit:     parseIntOr(os.Getenv("TG_SOURCE_LIMIT"), 20),
 	}
 	cfg.Offline = cfg.LLMAPIKey == ""
 	return cfg, nil
 }
 
-// parseFeedURLs splits a comma-separated list, trimming whitespace and dropping
+// parseCSV splits a comma-separated list, trimming whitespace and dropping
 // empty entries.
-func parseFeedURLs(raw string) []string {
+func parseCSV(raw string) []string {
 	if raw == "" {
 		return nil
 	}
