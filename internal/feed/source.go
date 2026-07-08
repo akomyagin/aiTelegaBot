@@ -4,13 +4,18 @@
 // Telegram sources live in internal/telegram (Bot API) and internal/mtproto
 // (private channels, Фаза 2); they produce the same Item.
 //
-// Stage 0: types and interface only — collectors land in Этап 2.
+// Этап 2: RSS/Atom/arXiv and Hacker News collectors (rss.go, hn.go).
 package feed
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"time"
 )
+
+// timeZero is the zero Published time used when a source provides no date.
+var timeZero = time.Time{}
 
 // Item is the normalized unit of content flowing through the digest pipeline,
 // regardless of origin (web feed or Telegram).
@@ -38,9 +43,19 @@ type Source interface {
 	Name() string
 }
 
-// Collect gathers items from all given sources. Stage 0: stub.
+// Collect gathers items from all given sources. A single source failure is
+// recorded but does not abort the digest — partial results are returned along
+// with a joined error.
 func Collect(ctx context.Context, sources []Source) ([]Item, error) {
-	_ = ctx
-	_ = sources
-	return nil, nil
+	var all []Item
+	var errs []error
+	for _, src := range sources {
+		items, err := src.Collect(ctx)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", src.Name(), err))
+			continue
+		}
+		all = append(all, items...)
+	}
+	return all, errors.Join(errs...)
 }

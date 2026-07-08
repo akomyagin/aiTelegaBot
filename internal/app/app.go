@@ -8,10 +8,15 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"net/http"
+	"strings"
+	"time"
 
 	"github.com/akomyagin/aiTelegaBot/internal/config"
 	"github.com/akomyagin/aiTelegaBot/internal/digest"
+	"github.com/akomyagin/aiTelegaBot/internal/feed"
 	"github.com/akomyagin/aiTelegaBot/internal/llm"
 	"github.com/akomyagin/aiTelegaBot/internal/scheduler"
 	"github.com/akomyagin/aiTelegaBot/internal/storage"
@@ -35,16 +40,41 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		summarizer = llm.NewClient(cfg.LLMAPIKey, cfg.LLMBaseURL, cfg.LLMModel)
 	}
 
+	// Web sources from config (Этап 2). Telegram sources land in Этап 5.
+	var sources []feed.Source
+	hc := &http.Client{Timeout: 30 * time.Second}
+	for _, u := range cfg.FeedURLs {
+		u = strings.TrimSpace(u)
+		if u == "" {
+			continue
+		}
+		kind := "rss"
+		if strings.Contains(u, "arxiv.org") {
+			kind = "arxiv"
+		}
+		sources = append(sources, feed.NewRSSSource(u, u, kind, hc))
+	}
+	if cfg.HNLimit > 0 {
+		sources = append(sources, feed.NewHNSource("Hacker News", cfg.HNLimit, hc))
+	}
+
 	pipeline := &digest.Pipeline{
+		Sources:   sources,
 		Store:     store,
 		Summarize: summarizer,
 		ChatID:    cfg.TelegramChatID,
-		// Sources are registered in Этап 2 (web) / Этап 5 (Telegram).
 	}
 
-	// listSources is a placeholder until real sources land in Этап 2.
-	listSources := func(ctx context.Context) (string, error) {
-		return "Источники будут добавлены в Этапе 2", nil
+	listSources := func(_ context.Context) (string, error) {
+		if len(sources) == 0 {
+			return "Источники не настроены. Укажите FEED_URLS и/или HN_LIMIT.", nil
+		}
+		var b strings.Builder
+		b.WriteString("Активные источники:\n")
+		for i, src := range sources {
+			fmt.Fprintf(&b, "%d. %s\n", i+1, src.Name())
+		}
+		return b.String(), nil
 	}
 
 	bot, err := telegram.NewBot(
