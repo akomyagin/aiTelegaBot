@@ -21,9 +21,10 @@ type Config struct {
 	TelegramChatID   string // the single user's chat; digests are delivered here
 
 	// LLM (BYOK). Empty APIKey => offline extractive summarizer.
-	LLMAPIKey  string
-	LLMBaseURL string
-	LLMModel   string
+	LLMAPIKey     string
+	LLMBaseURL    string
+	LLMModel      string
+	LLMMaxRetries int // env LLM_MAX_RETRIES, default 3
 
 	// State.
 	DBPath string // SQLite file, e.g. /data/state.db
@@ -52,6 +53,7 @@ func Load() (*Config, error) {
 		LLMAPIKey:        os.Getenv("LLM_API_KEY"),
 		LLMBaseURL:       os.Getenv("LLM_BASE_URL"),
 		LLMModel:         os.Getenv("LLM_MODEL"),
+		LLMMaxRetries:    parseIntOr(os.Getenv("LLM_MAX_RETRIES"), 3),
 		DBPath:           envOr("DB_PATH", "/data/state.db"),
 		DigestTime:       envOr("DIGEST_TIME", "09:00"),
 		Timezone:         envOr("TZ", "UTC"),

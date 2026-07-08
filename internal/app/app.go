@@ -37,7 +37,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		slog.Info("no LLM API key configured; using offline summarizer")
 		summarizer = llm.NewOffline()
 	} else {
-		summarizer = llm.NewClient(cfg.LLMAPIKey, cfg.LLMBaseURL, cfg.LLMModel)
+		summarizer = llm.NewClient(cfg.LLMAPIKey, cfg.LLMBaseURL, cfg.LLMModel, cfg.LLMMaxRetries)
 	}
 
 	// Web sources from config (Этап 2). Telegram sources land in Этап 5.
