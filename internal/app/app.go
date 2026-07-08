@@ -88,7 +88,22 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	}
 	pipeline.Deliver = bot
 
-	sched := scheduler.New(cfg.DigestTime, cfg.Timezone, pipeline.Run)
+	// Bridge SQLite meta to the scheduler for slot idempotency across restarts.
+	getSlot := func(ctx context.Context) (string, error) {
+		v, _, err := store.GetMeta(ctx, "last_digest_date")
+		return v, err
+	}
+	setSlot := func(ctx context.Context, date string) error {
+		return store.SetMeta(ctx, "last_digest_date", date)
+	}
+
+	sched, err := scheduler.New(
+		cfg.DigestTime, cfg.Timezone, pipeline.Run,
+		scheduler.WithSlotStore(getSlot, setSlot),
+	)
+	if err != nil {
+		return err
+	}
 
 	// Stage 0: start the long-poll bot and the scheduler; both stop on ctx.Done.
 	slog.Info("aiTelegaBot starting", "offline", cfg.Offline, "db", cfg.DBPath)
