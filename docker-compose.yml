@@ -35,6 +35,8 @@ services:
       MTPROTO_APP_HASH: ${MTPROTO_APP_HASH:-}
       MTPROTO_SESSION_PATH: /data/session.encrypted
       MTPROTO_SESSION_KEY: ${MTPROTO_SESSION_KEY:-}
+      MTPROTO_CHANNELS: ${MTPROTO_CHANNELS:-}
+      MTPROTO_LIMIT: ${MTPROTO_LIMIT:-20}
     volumes:
       - bot-state:/data          # SQLite + MTProto session (Фаза 2) переживают рестарт
 
