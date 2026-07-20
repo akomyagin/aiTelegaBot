@@ -1,76 +1,228 @@
 # aiTelegaBot
 
-Персональный **AI-дайджест** в Telegram. Бот собирает контент из ваших источников —
-RSS-лент, arXiv, Hacker News и Telegram-каналов, на которые вы подписаны, — прогоняет
-через LLM и присылает **одну сжатую сводку** в удобное время (например, раз в день).
-
-Это соло pet-проект с приоритетом **обучения Go** и первый в портфеле с настоящим
-сервисным рантаймом: бот работает постоянно на дешёвом VPS, а не как локальный CLI.
+Персональный **AI-дайджест** в Telegram. Бот собирает контент из RSS-лент, arXiv,
+Hacker News и Telegram-каналов, суммаризует через LLM и присылает одну сжатую
+сводку раз в день.
 
 ## Возможности (MVP)
 
-- **Веб-источники:** RSS/Atom, arXiv, Hacker News → нормализация → дедуп.
-- **Telegram-источники:**
-  - каналы/группы, которыми вы **управляете** (бот добавлен админом) — через Bot API;
-  - **публичные** каналы — best-effort скрапинг `t.me/s/<channel>`;
-  - **приватные** каналы/чаты, где вы подписчик — через MTProto user-сессию (Фаза 2).
-- **LLM-суммаризация** с вашим ключом (**BYOK**); без ключа — рабочий offline-режим.
-- **Планировщик** — дайджест по расписанию; история в локальном SQLite.
-- **Доставка** — сообщение в личный чат с ботом.
+- **RSS/Atom/arXiv** — любые ленты через `gofeed`
+- **Hacker News** — топ-N историй через Firebase API
+- **Telegram-каналы** — три варианта:
+  - управляемые (бот добавлен администратором) — через Bot API
+  - публичные — best-effort скрапинг `t.me/s/<channel>`
+  - **приватные** — через MTProto user-сессию (требует вторичного аккаунта)
+- **LLM-суммаризация** — BYOK; без ключа включается offline-режим
+- **Расписание** — дайджест в заданное время в вашей TZ; история в SQLite
+- **Команды бота:** `/digest` — дайджест по запросу, `/sources` — список источников
 
-## Быстрый старт (dev)
+---
+
+## Быстрый старт
+
+### 1. Создать бота
+
+Напишите [@BotFather](https://t.me/BotFather), команда `/newbot`. Сохраните токен.
+
+Свой `chat_id` можно узнать через [@userinfobot](https://t.me/userinfobot).
+
+### 2. Установить переменные окружения
 
 ```bash
-# сборка и тесты
-go build ./...
-go test ./...
+cp .env.example .env
+```
 
-# запуск (long-polling); минимально нужен bot-токен
-export TELEGRAM_BOT_TOKEN=...      # токен от @BotFather
-export TELEGRAM_CHAT_ID=...        # ваш chat_id (куда слать дайджест)
-export LLM_API_KEY=...             # опционально; без него — offline-суммаризатор
+Откройте `.env` и заполните минимально необходимые поля:
+
+```dotenv
+TELEGRAM_BOT_TOKEN=1234567890:AAxxxxxx   # токен от @BotFather
+TELEGRAM_CHAT_ID=123456789               # ваш числовой chat_id
+```
+
+Опционально:
+
+```dotenv
+LLM_API_KEY=sk-...                       # ключ OpenAI-совместимого API
+LLM_BASE_URL=https://api.openai.com/v1   # или http://localhost:11434/v1 для Ollama
+LLM_MODEL=gpt-4o-mini
+
+DIGEST_TIME=09:00                        # время дайджеста (HH:MM)
+TZ=Europe/Moscow                         # ваша IANA-таймзона
+```
+
+### 3. Добавить источники
+
+```dotenv
+# RSS/Atom/arXiv (через запятую)
+FEED_URLS=https://hnrss.org/frontpage,https://export.arxiv.org/rss/cs.AI
+
+# Hacker News (0 = отключить)
+HN_LIMIT=15
+
+# Публичные Telegram-каналы (скрапинг t.me/s)
+TG_PUBLIC_CHANNELS=@durov,@golang_news
+
+# Управляемые каналы (бот должен быть администратором)
+TG_MANAGED_CHANNELS=@mychannel
+```
+
+### 4. Запустить
+
+**Через Docker (рекомендуется для VPS):**
+
+```bash
+docker compose up -d --build
+docker compose logs -f bot
+```
+
+**Локально (для разработки):**
+
+```bash
 go run ./cmd/bot
 ```
 
-## Запуск как сервис (docker-compose)
+---
 
-```bash
-cp .env.example .env               # заполнить TELEGRAM_BOT_TOKEN и пр.
-docker compose up -d --build       # сервис bot + volume состояния
-docker compose logs -f bot
+## Команды бота
 
-# опционально: локальная Ollama для теста LLM без ключа
-docker compose --profile dev up -d ollama
+| Команда | Действие |
+|---|---|
+| `/start` | Приветствие |
+| `/help` | Справка |
+| `/digest` | Запустить дайджест прямо сейчас |
+| `/sources` | Список активных источников |
+
+---
+
+## Приватные Telegram-каналы (MTProto)
+
+Для чтения каналов, где вы подписчик, нужна MTProto user-сессия.
+
+> **Важно:** используйте **отдельный вторичный Telegram-аккаунт**, а не основной личный.
+> Сессия = полный доступ к аккаунту; при подозрительной активности Telegram может ограничить его.
+
+### Получить app_id и app_hash
+
+1. Зайдите на [my.telegram.org](https://my.telegram.org) под **вторичным аккаунтом**
+2. Раздел **API development tools** → создайте приложение
+3. Скопируйте `App api_id` и `App api_hash`
+
+### Настроить .env
+
+```dotenv
+MTPROTO_APP_ID=1234567
+MTPROTO_APP_HASH=abcdef1234567890abcdef1234567890
+
+# Необязательно, но рекомендуется для production:
+MTPROTO_SESSION_KEY=$(openssl rand -hex 32)   # 32-байтный AES-ключ шифрования сессии
+
+# Каналы (через запятую, с @ или без)
+MTPROTO_CHANNELS=@privatechannel1,@privatechannel2
+MTPROTO_LIMIT=20
 ```
 
-Состояние (SQLite: история дайджестов, seen-items, подписки) хранится в
-именованном volume и переживает рестарт.
+### Выполнить разовый логин
 
-## BYOK и offline-режим
+```bash
+# Локально:
+go run ./cmd/bot login
 
-Ключ LLM — ваш (`LLM_API_KEY`, OpenAI-совместимый API). Проект **не хостит** чужие
-ключи. Без ключа автоматически включается детерминированный экстрактивный
-суммаризатор — разработка и тесты работают без сети.
+# В контейнере:
+docker compose run --rm bot login
+```
 
-## Безопасность
+Бот спросит номер телефона, код подтверждения и (если включена) 2FA-пароль.
+Сессия сохранится в `/data/session.encrypted` на volume — повторный логин не нужен.
 
-- Секреты (`TELEGRAM_BOT_TOKEN`, `LLM_API_KEY`) — только через env/`.env`, **никогда
-  не в git**.
-- **MTProto-сессия (Фаза 2) = полный доступ к Telegram-аккаунту.** Используйте
-  **отдельный вторичный аккаунт**, а не основной личный. Session-файл хранится вне
-  git (в `.gitignore`), шифруется и никогда не попадает в образ. Подробности и
-  риски — в [`docs/PLAN.md`](docs/PLAN.md) §5 и [`docs/TECHNICAL_PLAN.md`](docs/TECHNICAL_PLAN.md) §5.
+---
+
+## Offline-режим
+
+Без `LLM_API_KEY` автоматически включается детерминированный экстрактивный
+суммаризатор. Все функции работают — только качество сводки ниже, чем у LLM.
+
+---
+
+## Локальная разработка
+
+```bash
+# Сборка и тесты
+go build ./...
+go test -race ./...
+go vet ./...
+
+# Минимальный запуск
+export TELEGRAM_BOT_TOKEN=...
+export TELEGRAM_CHAT_ID=...
+go run ./cmd/bot
+
+# Тест с локальной Ollama
+docker compose --profile dev up -d ollama
+export LLM_BASE_URL=http://localhost:11434/v1
+export LLM_MODEL=llama3.2
+go run ./cmd/bot
+```
+
+---
+
+## Переменные окружения
+
+| Переменная | Обязательно | Описание | По умолчанию |
+|---|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | **да** | Токен от @BotFather | — |
+| `TELEGRAM_CHAT_ID` | **да** | Chat ID владельца | — |
+| `LLM_API_KEY` | нет | Ключ LLM (BYOK); пусто → offline | — |
+| `LLM_BASE_URL` | нет | URL OpenAI-совместимого API | `https://api.openai.com/v1` |
+| `LLM_MODEL` | нет | Модель | `gpt-4o-mini` |
+| `LLM_MAX_RETRIES` | нет | Макс. попыток retry к LLM | `3` |
+| `FEED_URLS` | нет | RSS/Atom-ленты, через запятую | — |
+| `HN_LIMIT` | нет | Топ-N историй HN; 0 = выкл | `15` |
+| `TG_PUBLIC_CHANNELS` | нет | Публичные каналы (`@name,...`) | — |
+| `TG_MANAGED_CHANNELS` | нет | Управляемые каналы (бот-админ) | — |
+| `TG_SOURCE_LIMIT` | нет | Макс. постов на TG-канал | `20` |
+| `DIGEST_TIME` | нет | Время дайджеста `HH:MM` | `09:00` |
+| `TZ` | нет | IANA-таймзона | `UTC` |
+| `DB_PATH` | нет | Путь к SQLite | `/data/state.db` |
+| `MTPROTO_APP_ID` | нет | App ID с my.telegram.org | — |
+| `MTPROTO_APP_HASH` | нет | App Hash с my.telegram.org | — |
+| `MTPROTO_SESSION_PATH` | нет | Путь к файлу сессии | `/data/session.encrypted` |
+| `MTPROTO_SESSION_KEY` | нет | Hex AES-256 ключ; пусто = plaintext | — |
+| `MTPROTO_CHANNELS` | нет | Приватные каналы (`@name,...`) | — |
+| `MTPROTO_LIMIT` | нет | Макс. постов на MTProto-канал | `20` |
+
+---
+
+## Деплой на VPS
+
+Минимально: VPS с 512 MB RAM и Docker. Европейские провайдеры предпочтительны
+(стабильный доступ к `api.telegram.org`).
+
+```bash
+# Первый деплой
+git clone https://github.com/akomyagin/aiTelegaBot && cd aiTelegaBot
+cp .env.example .env           # заполнить токены
+docker compose up -d --build
+
+# После обновления кода — пересобрать образ
+docker compose up -d --build
+
+# Логи
+docker compose logs -f bot
+
+# MTProto логин (один раз, под вторичным аккаунтом)
+docker compose run --rm bot login
+```
+
+Состояние (SQLite + сессия MTProto) хранится в volume `bot-state` и переживает
+рестарт и пересборку образа.
+
+---
 
 ## Документация
 
-- Видение и этапы — [`docs/PLAN.md`](docs/PLAN.md)
-- Технический план и разбивка по Этапам — [`docs/TECHNICAL_PLAN.md`](docs/TECHNICAL_PLAN.md)
-- За пределами MVP — [`docs/POST_MVP_PLAN.md`](docs/POST_MVP_PLAN.md)
-- Конвенции для AI-сессий — [`CLAUDE.md`](CLAUDE.md)
-
-## Статус
-
-Этап 0 (bootstrap): каркас и документация. Реализация ведётся по этапам (см. PLAN).
+- [`docs/PLAN.md`](docs/PLAN.md) — видение, этапы, пост-MVP
+- [`docs/TECHNICAL_PLAN.md`](docs/TECHNICAL_PLAN.md) — стек, архитектура, схема БД
+- [`docs/POST_MVP_PLAN.md`](docs/POST_MVP_PLAN.md) — дорожная карта после MVP
 
 ## Лицензия
 
