@@ -32,6 +32,13 @@ type Store interface {
 	GetMeta(ctx context.Context, key string) (value string, ok bool, err error)
 	// SetMeta upserts a scheduler/meta key.
 	SetMeta(ctx context.Context, key, value string) error
+	// AddSource inserts an enabled source and returns its new id.
+	AddSource(ctx context.Context, kind, ref string) (int64, error)
+	// ListSources returns all sources ordered by id (enabled and disabled).
+	ListSources(ctx context.Context) ([]Source, error)
+	// DisableSource sets enabled=0 for the given id. Returns (false, nil) when no
+	// row with that id exists.
+	DisableSource(ctx context.Context, id int64) (found bool, err error)
 	// Close releases the underlying database handle.
 	Close() error
 }

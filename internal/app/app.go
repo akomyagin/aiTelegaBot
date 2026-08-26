@@ -41,9 +41,15 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		summarizer = llm.NewClient(cfg.LLMAPIKey, cfg.LLMBaseURL, cfg.LLMModel, cfg.LLMMaxRetries)
 	}
 
-	// Web sources from config (Этап 2). Telegram sources land in Этап 5.
-	var sources []feed.Source
+	// Static sources from config. Built once at startup: some carry per-run
+	// state (channelBuf, mtClient), so they are reused across runs. Dynamic,
+	// DB-backed sources are (re)built on every run — see sourceProvider below.
+	var staticSources []feed.Source
 	hc := &http.Client{Timeout: 30 * time.Second}
+	tgLimit := cfg.TGSourceLimit
+	if tgLimit <= 0 {
+		tgLimit = 20
+	}
 	for _, u := range cfg.FeedURLs {
 		u = strings.TrimSpace(u)
 		if u == "" {
@@ -53,34 +59,29 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		if strings.Contains(u, "arxiv.org") {
 			kind = "arxiv"
 		}
-		sources = append(sources, feed.NewRSSSource(u, u, kind, hc))
+		staticSources = append(staticSources, feed.NewRSSSource(u, u, kind, hc))
 	}
 	if cfg.HNLimit > 0 {
-		sources = append(sources, feed.NewHNSource("Hacker News", cfg.HNLimit, hc))
+		staticSources = append(staticSources, feed.NewHNSource("Hacker News", cfg.HNLimit, hc))
 	}
 
-	// Telegram sources (Этап 5).
-	var channelBuf *telegram.ChannelBuffer
-	if len(cfg.TGManagedChannels) > 0 {
-		channelBuf = &telegram.ChannelBuffer{}
-		for _, ch := range cfg.TGManagedChannels {
-			ch = strings.TrimPrefix(strings.TrimSpace(ch), "@")
-			if ch == "" {
-				continue
-			}
-			sources = append(sources, telegram.NewManagedSource("@"+ch, channelBuf))
+	// Managed-channel posts flow through a shared buffer filled by handleUpdate.
+	// Created unconditionally so /addsource of a managed channel works even when
+	// TG_MANAGED_CHANNELS is empty at startup.
+	channelBuf := &telegram.ChannelBuffer{}
+	for _, ch := range cfg.TGManagedChannels {
+		ch = strings.TrimPrefix(strings.TrimSpace(ch), "@")
+		if ch == "" {
+			continue
 		}
-	}
-	tgLimit := cfg.TGSourceLimit
-	if tgLimit <= 0 {
-		tgLimit = 20
+		staticSources = append(staticSources, telegram.NewManagedSource("@"+ch, channelBuf))
 	}
 	for _, ch := range cfg.TGPublicChannels {
 		ch = strings.TrimPrefix(strings.TrimSpace(ch), "@")
 		if ch == "" {
 			continue
 		}
-		sources = append(sources, telegram.NewPublicSource("@"+ch, ch, hc, tgLimit))
+		staticSources = append(staticSources, telegram.NewPublicSource("@"+ch, ch, hc, tgLimit))
 	}
 
 	// MTProto private-channel sources (Этап 7). Only wired when credentials and
@@ -104,35 +105,123 @@ func Run(ctx context.Context, cfg *config.Config) error {
 			if ch == "" {
 				continue
 			}
-			sources = append(sources, mtproto.NewChannelSource("@"+ch, ch, mtLimit, mtClient))
+			staticSources = append(staticSources, mtproto.NewChannelSource("@"+ch, ch, mtLimit, mtClient))
 		}
+	}
+
+	// sourceProvider returns the source set for each run: the static config layer
+	// plus a fresh snapshot of enabled DB-backed sources. Called once per Run, so
+	// sources added via /addsource are picked up without a restart.
+	sourceProvider := func(ctx context.Context) ([]feed.Source, error) {
+		dbRows, err := store.ListSources(ctx)
+		if err != nil {
+			return nil, err
+		}
+		dyn := buildDynamicSources(dbRows, hc, tgLimit, channelBuf)
+		// Static first, then dynamic; order is cosmetic (dedup handles overlap).
+		all := make([]feed.Source, 0, len(staticSources)+len(dyn))
+		all = append(all, staticSources...)
+		all = append(all, dyn...)
+		return all, nil
 	}
 
 	pipeline := &digest.Pipeline{
-		Sources:   sources,
-		Store:     store,
-		Summarize: summarizer,
-		ChatID:    cfg.TelegramChatID,
+		SourceProvider: sourceProvider,
+		Store:          store,
+		Summarize:      summarizer,
+		ChatID:         cfg.TelegramChatID,
 	}
 
-	listSources := func(_ context.Context) (string, error) {
-		if len(sources) == 0 {
-			return "Источники не настроены. Укажите FEED_URLS и/или HN_LIMIT.", nil
+	listSources := func(ctx context.Context) (string, error) {
+		dbRows, err := store.ListSources(ctx)
+		if err != nil {
+			return "", err
 		}
 		var b strings.Builder
-		b.WriteString("Активные источники:\n")
-		for i, src := range sources {
-			fmt.Fprintf(&b, "%d. %s\n", i+1, src.Name())
+		b.WriteString("Статические источники (из .env):\n")
+		if len(staticSources) == 0 {
+			b.WriteString("  (нет; укажите FEED_URLS и/или HN_LIMIT)\n")
+		}
+		for _, src := range staticSources {
+			fmt.Fprintf(&b, "  • %s\n", src.Name())
+		}
+		b.WriteString("\nДинамические источники (команды):\n")
+		hasDyn := false
+		for _, ds := range dbRows {
+			status := "on"
+			if !ds.Enabled {
+				status = "off"
+			}
+			fmt.Fprintf(&b, "  #%d [%s] %s (%s)\n", ds.ID, ds.Kind, ds.Ref, status)
+			hasDyn = true
+		}
+		if !hasDyn {
+			b.WriteString("  (нет; добавьте через /addsource)\n")
 		}
 		return b.String(), nil
+	}
+
+	// addSourceFn validates a candidate source before persisting it, then
+	// inserts. Validation differs per kind:
+	//   - rss/tg_public: a trial collect MUST hit the network and return ≥1
+	//     item, with real errors (not "0 posts") surfaced on failure.
+	//   - tg_botapi: Bot API cannot pull channel history, so there is nothing to
+	//     trial-collect. Critically, a ManagedSource.Collect call DRAINS the
+	//     shared production channelBuf — running it here would silently discard
+	//     real posts already buffered for other managed channels. Admin-ness
+	//     (checked in detectKind, upstream of this call) is the only available
+	//     validation signal.
+	addSourceFn := func(ctx context.Context, kind, ref string) (int64, int, error) {
+		existing, err := store.ListSources(ctx)
+		if err != nil {
+			return 0, 0, err
+		}
+		for _, s := range existing {
+			if s.Enabled && s.Kind == kind && s.Ref == ref {
+				return 0, 0, fmt.Errorf("источник уже добавлен (#%d)", s.ID)
+			}
+		}
+
+		if kind == "tg_botapi" {
+			id, err := store.AddSource(ctx, kind, ref)
+			if err != nil {
+				return 0, 0, err
+			}
+			return id, 0, nil
+		}
+
+		cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+
+		var items []feed.Item
+		switch kind {
+		case "rss":
+			items, err = feed.NewRSSSource(ref, ref, "rss", hc).Collect(cctx)
+		case "tg_public":
+			items, err = telegram.NewPublicSource("@"+ref, ref, hc, tgLimit).TrialCollect(cctx)
+		default:
+			return 0, 0, fmt.Errorf("неизвестный вид источника %q", kind)
+		}
+		if err != nil {
+			return 0, 0, fmt.Errorf("источник недоступен: %w", err)
+		}
+		if len(items) == 0 {
+			return 0, 0, fmt.Errorf("источник не вернул ни одного поста (проверьте адрес/канал)")
+		}
+
+		id, err := store.AddSource(ctx, kind, ref)
+		if err != nil {
+			return 0, 0, err
+		}
+		return id, len(items), nil
 	}
 
 	botOpts := []telegram.Option{
 		telegram.WithDigestTrigger(pipeline.Run),
 		telegram.WithSourceLister(listSources),
-	}
-	if channelBuf != nil {
-		botOpts = append(botOpts, telegram.WithChannelBuffer(channelBuf))
+		telegram.WithChannelBuffer(channelBuf),
+		telegram.WithSourceAdder(addSourceFn),
+		telegram.WithSourceRemover(store.DisableSource),
 	}
 	bot, err := telegram.NewBot(cfg.TelegramBotToken, cfg.TelegramChatID, botOpts...)
 	if err != nil {

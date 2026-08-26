@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 
@@ -28,11 +29,13 @@ func TestChannelPostToItem(t *testing.T) {
 func TestChannelBuffer_Concurrent(t *testing.T) {
 	buf := &ChannelBuffer{}
 	var wg sync.WaitGroup
-	for g := 0; g < 10; g++ {
+	const perGoroutine = 10
+	const goroutines = 10 // total pushed (100) stays well under maxBufferedItems
+	for g := 0; g < goroutines; g++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for i := 0; i < 100; i++ {
+			for i := 0; i < perGoroutine; i++ {
 				buf.Push(feed.Item{Kind: "tg_botapi", Source: "c", ID: "x"})
 			}
 		}()
@@ -40,11 +43,33 @@ func TestChannelBuffer_Concurrent(t *testing.T) {
 	wg.Wait()
 
 	got := buf.Drain()
-	if len(got) != 1000 {
-		t.Fatalf("Drain() len = %d, want 1000", len(got))
+	want := goroutines * perGoroutine
+	if len(got) != want {
+		t.Fatalf("Drain() len = %d, want %d", len(got), want)
 	}
 	if len(buf.Drain()) != 0 {
 		t.Errorf("second Drain() should be empty")
+	}
+}
+
+// TestChannelBuffer_CapsAtMaxBufferedItems confirms Push bounds memory growth:
+// once the buffer exceeds maxBufferedItems, the oldest items are dropped so a
+// channel with no active drainer cannot grow the buffer without limit.
+func TestChannelBuffer_CapsAtMaxBufferedItems(t *testing.T) {
+	buf := &ChannelBuffer{}
+	total := maxBufferedItems + 50
+	for i := 0; i < total; i++ {
+		buf.Push(feed.Item{ID: fmt.Sprintf("%d", i)})
+	}
+
+	got := buf.Drain()
+	if len(got) != maxBufferedItems {
+		t.Fatalf("Drain() len = %d, want %d (capped)", len(got), maxBufferedItems)
+	}
+	// The dropped items should be the OLDEST ones — the newest item pushed
+	// (total-1) must be the last one retained.
+	if last := got[len(got)-1].ID; last != fmt.Sprintf("%d", total-1) {
+		t.Errorf("newest item not retained: last item ID = %q, want %q", last, fmt.Sprintf("%d", total-1))
 	}
 }
 

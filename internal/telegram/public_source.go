@@ -45,7 +45,8 @@ func (s *PublicSource) SetBaseURL(u string) { s.baseURL = u }
 // Name returns the human-readable source name.
 func (s *PublicSource) Name() string { return s.name }
 
-// Collect scrapes the channel page. Any failure degrades to (nil, nil).
+// Collect scrapes the channel page. Any failure degrades to (nil, nil) — used
+// by the digest pipeline, where one broken channel must never fail the run.
 func (s *PublicSource) Collect(ctx context.Context) ([]feed.Item, error) {
 	items, err := s.scrape(ctx)
 	if err != nil {
@@ -53,6 +54,14 @@ func (s *PublicSource) Collect(ctx context.Context) ([]feed.Item, error) {
 		return nil, nil // graceful degradation — never fail the digest
 	}
 	return items, nil
+}
+
+// TrialCollect scrapes the channel WITHOUT Collect's graceful degradation —
+// real errors (network failure, non-200 status, HTML parse failure) are
+// returned instead of silently becoming (nil, nil). Used by /addsource to
+// distinguish "channel genuinely has no posts" from "scrape failed".
+func (s *PublicSource) TrialCollect(ctx context.Context) ([]feed.Item, error) {
+	return s.scrape(ctx)
 }
 
 func (s *PublicSource) scrape(ctx context.Context) ([]feed.Item, error) {
