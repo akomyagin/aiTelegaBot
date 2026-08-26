@@ -13,6 +13,8 @@ func TestParseCommand(t *testing.T) {
 		{"botname suffix", "/help@MyBot", "help", true},
 		{"with arg", "/digest arg", "digest", true},
 		{"uppercase", "/SOURCES", "sources", true},
+		{"addsource", "/addsource https://x", "addsource", true},
+		{"removesource", "/removesource 5", "removesource", true},
 		{"not a command", "hello", "", false},
 		{"empty", "", "", false},
 		{"bare slash", "/", "", false},

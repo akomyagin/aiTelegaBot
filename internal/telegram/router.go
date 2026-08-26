@@ -14,17 +14,21 @@ const (
 		"и Telegram-каналов и присылаю сжатую сводку по расписанию.\n\n" +
 		"/digest — получить дайджест сейчас\n" +
 		"/sources — список источников\n" +
+		"/addsource <url|@channel> — добавить источник\n" +
+		"/removesource <id> — отключить источник\n" +
 		"/help — справка"
 
 	helpText = "Команды:\n" +
 		"/start — приветствие\n" +
 		"/digest — получить дайджест сейчас\n" +
 		"/sources — список источников\n" +
+		"/addsource <url|@channel> — добавить источник\n" +
+		"/removesource <id> — отключить источник\n" +
 		"/help — эта справка"
 
-	digestStartedText = "⏳ Собираю дайджест…"
-	digestErrorText   = "❌ Ошибка при сборке дайджеста"
-	digestUnavailable = "Дайджест пока недоступен"
+	digestStartedText  = "⏳ Собираю дайджест…"
+	digestErrorText    = "❌ Ошибка при сборке дайджеста"
+	digestUnavailable  = "Дайджест пока недоступен"
 	sourcesUnavailable = "Источники появятся в следующих версиях"
 	unknownCommandText = "Неизвестная команда. /help — список команд"
 )
@@ -68,6 +72,10 @@ func (b *Bot) handleUpdate(ctx context.Context, api *bot.Bot, u *models.Update) 
 		b.handleDigest(ctx)
 	case "sources":
 		b.handleSources(ctx)
+	case "addsource":
+		b.handleAddSource(ctx, parseCommandArg(u.Message.Text))
+	case "removesource":
+		b.handleRemoveSource(ctx, parseCommandArg(u.Message.Text))
 	default:
 		b.reply(ctx, unknownCommandText)
 	}
@@ -131,4 +139,15 @@ func parseCommand(text string) (cmd string, ok bool) {
 		return "", false
 	}
 	return strings.ToLower(word), true
+}
+
+// parseCommandArg returns the trimmed argument portion after the command word.
+// For "/addsource https://x" it returns "https://x". Empty when no argument.
+func parseCommandArg(text string) string {
+	text = strings.TrimSpace(text)
+	fields := strings.Fields(text)
+	if len(fields) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(strings.Join(fields[1:], " "))
 }

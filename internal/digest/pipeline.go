@@ -22,13 +22,16 @@ import (
 
 // Pipeline holds the dependencies for one digest run.
 type Pipeline struct {
-	Sources   []feed.Source
-	Store     storage.Store
-	Summarize llm.Summarizer
-	Deliver   telegram.Deliverer
-	ChatID    string
-	Log       *slog.Logger     // optional; defaults to slog.Default()
-	Now       func() time.Time // optional; defaults to time.Now (for tests)
+	// SourceProvider returns the source set for THIS run. It is called at the
+	// start of every Run, so DB-backed sources added at runtime are picked up
+	// without a restart. Must be non-nil.
+	SourceProvider func(ctx context.Context) ([]feed.Source, error)
+	Store          storage.Store
+	Summarize      llm.Summarizer
+	Deliver        telegram.Deliverer
+	ChatID         string
+	Log            *slog.Logger     // optional; defaults to slog.Default()
+	Now            func() time.Time // optional; defaults to time.Now (for tests)
 }
 
 // log returns the configured logger or the default.
@@ -43,8 +46,13 @@ func (p *Pipeline) log() *slog.Logger {
 func (p *Pipeline) Run(ctx context.Context) error {
 	log := p.log()
 
-	// 1. Collect from all sources (partial failures are non-fatal).
-	items, collectErr := feed.Collect(ctx, p.Sources)
+	// 1. Resolve the source set for this run (fresh DB snapshot each time), then
+	// collect from all sources (partial failures are non-fatal).
+	sources, err := p.SourceProvider(ctx)
+	if err != nil {
+		return fmt.Errorf("resolve sources: %w", err)
+	}
+	items, collectErr := feed.Collect(ctx, sources)
 	if collectErr != nil {
 		log.Warn("partial source errors", "err", collectErr)
 	}

@@ -46,6 +46,11 @@ func newStore(t *testing.T) storage.Store {
 
 func fixedNow() time.Time { return time.Date(2024, 1, 15, 9, 0, 0, 0, time.UTC) }
 
+// staticProvider returns a SourceProvider that always yields the given sources.
+func staticProvider(srcs ...feed.Source) func(context.Context) ([]feed.Source, error) {
+	return func(context.Context) ([]feed.Source, error) { return srcs, nil }
+}
+
 func sampleItems() []feed.Item {
 	return []feed.Item{
 		{Source: "fake", Kind: "rss", Title: "One", URL: "https://ex.com/1", Text: "First body."},
@@ -57,12 +62,12 @@ func TestPipeline_FirstRunDelivers(t *testing.T) {
 	store := newStore(t)
 	del := &fakeDeliverer{}
 	p := &Pipeline{
-		Sources:   []feed.Source{&fakeSource{items: sampleItems()}},
-		Store:     store,
-		Summarize: llm.NewOffline(),
-		Deliver:   del,
-		ChatID:    "123",
-		Now:       fixedNow,
+		SourceProvider: staticProvider(&fakeSource{items: sampleItems()}),
+		Store:          store,
+		Summarize:      llm.NewOffline(),
+		Deliver:        del,
+		ChatID:         "123",
+		Now:            fixedNow,
 	}
 
 	if err := p.Run(context.Background()); err != nil {
@@ -90,12 +95,12 @@ func TestPipeline_SecondRunNoDuplicate(t *testing.T) {
 	del := &fakeDeliverer{}
 	newP := func() *Pipeline {
 		return &Pipeline{
-			Sources:   []feed.Source{&fakeSource{items: sampleItems()}},
-			Store:     store,
-			Summarize: llm.NewOffline(),
-			Deliver:   del,
-			ChatID:    "123",
-			Now:       fixedNow,
+			SourceProvider: staticProvider(&fakeSource{items: sampleItems()}),
+			Store:          store,
+			Summarize:      llm.NewOffline(),
+			Deliver:        del,
+			ChatID:         "123",
+			Now:            fixedNow,
 		}
 	}
 
@@ -114,12 +119,12 @@ func TestPipeline_DeliveryFailureLeavesUnseen(t *testing.T) {
 	store := newStore(t)
 	del := &fakeDeliverer{err: errors.New("network down")}
 	p := &Pipeline{
-		Sources:   []feed.Source{&fakeSource{items: sampleItems()}},
-		Store:     store,
-		Summarize: llm.NewOffline(),
-		Deliver:   del,
-		ChatID:    "123",
-		Now:       fixedNow,
+		SourceProvider: staticProvider(&fakeSource{items: sampleItems()}),
+		Store:          store,
+		Summarize:      llm.NewOffline(),
+		Deliver:        del,
+		ChatID:         "123",
+		Now:            fixedNow,
 	}
 
 	if err := p.Run(context.Background()); err == nil {
@@ -136,16 +141,62 @@ func TestPipeline_DeliveryFailureLeavesUnseen(t *testing.T) {
 	}
 }
 
+// TestPipeline_SourceProviderReevaluatedEachRun confirms that SourceProvider is
+// called fresh on every Run — a source added between two runs (without
+// recreating the Pipeline, simulating a DB-backed source added at runtime via
+// /addsource) is picked up on the very next run, with no restart required.
+func TestPipeline_SourceProviderReevaluatedEachRun(t *testing.T) {
+	store := newStore(t)
+	del := &fakeDeliverer{}
+
+	itemA := feed.Item{Source: "fake", Kind: "rss", Title: "A", URL: "https://ex.com/a", Text: "Body A."}
+	itemB := feed.Item{Source: "fake", Kind: "rss", Title: "B", URL: "https://ex.com/b", Text: "Body B."}
+
+	var sources []feed.Source // mutated by the test between runs, like a DB snapshot
+	p := &Pipeline{
+		SourceProvider: func(context.Context) ([]feed.Source, error) { return sources, nil },
+		Store:          store,
+		Summarize:      llm.NewOffline(),
+		Deliver:        del,
+		ChatID:         "123",
+		Now:            fixedNow,
+	}
+
+	// First run: only source A exists.
+	sources = []feed.Source{&fakeSource{items: []feed.Item{itemA}}}
+	if err := p.Run(context.Background()); err != nil {
+		t.Fatalf("first Run: %v", err)
+	}
+	if len(del.delivered) != 1 || !strings.Contains(del.delivered[0], "1 материалов") {
+		t.Fatalf("after first run: delivered=%v, want one digest with 1 item", del.delivered)
+	}
+
+	// Simulate /addsource: a second source appears WITHOUT recreating p.
+	sources = []feed.Source{
+		&fakeSource{items: []feed.Item{itemA}}, // still present, but already seen
+		&fakeSource{items: []feed.Item{itemB}}, // newly added
+	}
+	if err := p.Run(context.Background()); err != nil {
+		t.Fatalf("second Run: %v", err)
+	}
+	if len(del.delivered) != 2 {
+		t.Fatalf("delivered %d digests after second run, want 2", len(del.delivered))
+	}
+	if !strings.Contains(del.delivered[1], "1 материалов") {
+		t.Errorf("second digest should contain only the new item B, got: %q", del.delivered[1])
+	}
+}
+
 func TestPipeline_EmptySourcesNoDelivery(t *testing.T) {
 	store := newStore(t)
 	del := &fakeDeliverer{}
 	p := &Pipeline{
-		Sources:   []feed.Source{&fakeSource{items: nil}},
-		Store:     store,
-		Summarize: llm.NewOffline(),
-		Deliver:   del,
-		ChatID:    "123",
-		Now:       fixedNow,
+		SourceProvider: staticProvider(&fakeSource{items: nil}),
+		Store:          store,
+		Summarize:      llm.NewOffline(),
+		Deliver:        del,
+		ChatID:         "123",
+		Now:            fixedNow,
 	}
 
 	if err := p.Run(context.Background()); err != nil {
