@@ -4,7 +4,7 @@
 # build a static binary and run it from a minimal distroless image.
 
 # --- builder ---
-FROM golang:1.22 AS builder
+FROM golang:1.25 AS builder
 WORKDIR /src
 
 # Cache modules first.
