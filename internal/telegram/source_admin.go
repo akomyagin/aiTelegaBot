@@ -20,7 +20,7 @@ func (b *Bot) handleAddSource(ctx context.Context, arg string) {
 	}
 	arg = strings.TrimSpace(arg)
 	if arg == "" {
-		b.reply(ctx, "Использование: /addsource <URL RSS-ленты | @channel>")
+		b.reply(ctx, "Использование: /addsource [URL RSS-ленты | @channel]")
 		return
 	}
 
@@ -55,7 +55,7 @@ func (b *Bot) handleRemoveSource(ctx context.Context, arg string) {
 	}
 	id, err := strconv.ParseInt(strings.TrimSpace(arg), 10, 64)
 	if err != nil {
-		b.reply(ctx, "Использование: /removesource <числовой id> (см. /sources)")
+		b.reply(ctx, "Использование: /removesource [числовой id] (см. /sources)")
 		return
 	}
 	found, err := b.removeSource(ctx, id)

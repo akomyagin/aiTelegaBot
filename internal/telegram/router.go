@@ -14,16 +14,16 @@ const (
 		"и Telegram-каналов и присылаю сжатую сводку по расписанию.\n\n" +
 		"/digest — получить дайджест сейчас\n" +
 		"/sources — список источников\n" +
-		"/addsource <url|@channel> — добавить источник\n" +
-		"/removesource <id> — отключить источник\n" +
+		"/addsource [url|@channel] — добавить источник\n" +
+		"/removesource [id] — отключить источник\n" +
 		"/help — справка"
 
 	helpText = "Команды:\n" +
 		"/start — приветствие\n" +
 		"/digest — получить дайджест сейчас\n" +
 		"/sources — список источников\n" +
-		"/addsource <url|@channel> — добавить источник\n" +
-		"/removesource <id> — отключить источник\n" +
+		"/addsource [url|@channel] — добавить источник\n" +
+		"/removesource [id] — отключить источник\n" +
 		"/help — эта справка"
 
 	digestStartedText  = "⏳ Собираю дайджест…"
