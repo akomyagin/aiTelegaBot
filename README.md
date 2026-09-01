@@ -216,6 +216,50 @@ docker compose run --rm bot login
 Состояние (SQLite + сессия MTProto) хранится в volume `bot-state` и переживает
 рестарт и пересборку образа.
 
+### Если VPS совсем маленький (≤512 MB RAM)
+
+На практике `docker compose up -d --build` на 512 MB (и тем более на ~458 MB
+фактически доступных) может падать: компилятор Go убивается OOM при сборке
+`gotd/td` (MTProto-зависимость — большой автогенерируемый пакет). Признак —
+`docker logs` пуст, а `docker images` не показывает собранный образ; в
+`dmesg | grep -i oom` — `Out of memory: Killed process ... (compile)`.
+
+Обходной путь — собрать образ **на машине с достаточной памятью** и перенести
+готовый образ на VPS (тот же тег, что использует `docker compose`, обычно
+`<имя-каталога-проекта>-bot`):
+
+```bash
+# Локально (или на CI-раннере с нормальным RAM)
+docker compose build bot
+docker save <имя-каталога-проекта>-bot -o bot.tar
+scp bot.tar user@vps:/tmp/bot.tar
+
+# На VPS
+docker load -i /tmp/bot.tar && rm /tmp/bot.tar
+cd /path/to/aiTelegaBot && docker compose up -d   # без --build
+```
+
+Также на свежем VPS `docker compose` (v2, плагин) может отсутствовать, если
+Docker ставился из пакета `docker.io` дистрибутива, а не из официального
+репозитория Docker — тогда `docker compose version` вернёт «unknown command».
+Ставится плагин вручную:
+
+```bash
+mkdir -p /usr/local/lib/docker/cli-plugins
+curl -fsSL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64 \
+  -o /usr/local/lib/docker/cli-plugins/docker-compose
+chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+```
+
+И ещё: свежесозданный docker-volume принадлежит `root`, а контейнер бежит от
+`nonroot` (distroless, uid/gid `65532`) — при первом запуске SQLite может не
+открыть файл БД (`unable to open database file (14)`). Разово починить:
+
+```bash
+MP=$(docker volume inspect <project>_bot-state --format '{{.Mountpoint}}')
+chown -R 65532:65532 "$MP"
+```
+
 ---
 
 ## Документация
