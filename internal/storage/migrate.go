@@ -38,6 +38,20 @@ var migrations = []string{
 	    value TEXT NOT NULL
 	);
 	`,
+	// v2 (Stage 8 A1): MTProto peer cache + uniqueness of (kind, ref) in
+	// sources. The UNIQUE index fails loudly if a legacy DB carries duplicate
+	// (kind, ref) rows — that is intentional (docs/plans/stage-8, A1): dedup
+	// is a separate manual query, migrations never swallow such conflicts.
+	`
+	CREATE TABLE IF NOT EXISTS mtproto_peers (
+	    peer_id     INTEGER PRIMARY KEY,          -- MTProto id (X of Bot API "-100X")
+	    access_hash INTEGER NOT NULL,             -- sensitive: never logged
+	    title       TEXT NOT NULL DEFAULT '',
+	    username    TEXT NOT NULL DEFAULT '',
+	    updated_at  TEXT NOT NULL
+	);
+	CREATE UNIQUE INDEX IF NOT EXISTS sources_kind_ref ON sources(kind, ref);
+	`,
 }
 
 // migrate applies pending migrations starting from the current PRAGMA

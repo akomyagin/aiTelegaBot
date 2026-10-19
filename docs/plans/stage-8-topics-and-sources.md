@@ -446,6 +446,45 @@ type ForwardOrigin struct {
 - `dynamic_sources_test.go`: строка `tg_mtproto` с ref `-100X` → PeerSource; `@user` → ChannelSource; disabled пропускаются.
 - Интеграция (фейки, temp SQLite): форвард-регистрация приватного канала с фейковым mtproto-клиентом (интерфейс не вводим — app-замыкание тестируется через подмену `ForwardRegistrar` в telegram-пакете; сетевой слой вне юнитов).
 
+**Итог A1 (реализован 2026-10-20, сдан одним PR — решение пользователя):**
+
+- Прогон: build/vet/gofmt чистые, `go test -race` 8/8 пакетов ok. Ревью (Opus):
+  1 high + 5 medium найдено и закрыто в цикле фиксов, low — частично техдолг.
+- **Подтверждённые отклонения от плана** (не переоткрывать):
+  - `AddSourceIfNotExists` → `(id, created, reactivated bool, err)`: повторное
+    добавление disabled-строки РЕАКТИВИРУЕТ её («✅ #N снова включён») — фикс
+    регрессии H1 против master (старая проверка дублей учитывала только enabled).
+  - `ForwardOrigin` — struct с полями Type/BotAPIChatID/Username/Title/**BotIsAdmin**
+    (admin-чек в telegram-пакете: у app нет доступа к bot.Bot); не интерфейс.
+  - `PeerCache` расширен `Get()` (username для deep link); `storagePeerCache`
+    живёт в `internal/app` (mtproto не импортирует storage); в кеш пишутся
+    только channel/supergroup (id-коллизии с basic chat/user).
+  - CHANNEL_INVALID/CHANNEL_PRIVATE → sentinel `errPeerStale` → один
+    `refreshPeerCache` + повтор (M1, митигация §7); `refreshPeerCache` —
+    in-memory rate-limit 30с, только успешные рефреши (M2).
+  - `messageToFeedItem(msg, source, url)` — URL параметризован (L8).
+  - `ParseTmeLink` отклоняет `t.me/c/X` при X ≥ 1e12 (симметрично ToMTProtoID, L3).
+  - Замыкания добавления/форварда извлечены из `Run` в `newSourceAdder`/
+    `newForwardRegistrar` (тестируемость); test-seam `deliverFn` в telegram.Bot.
+    Плановый интеграционный кейс «форвард с фейковым mtproto-клиентом»
+    **осознанно не реализован**: addMTProtoSource сетевой, вне юнитов;
+    registerForward покрыт тестами на ветвях без сети (register_forward_test.go).
+- **Техдолг A1** (триггеры пересмотра):
+  1. Число ключей ChannelBuffer не ограничено (L5) — single-user, ущерб = память;
+     триггер: бот админ во многих чужих каналах.
+  2. `storage.AddSource` — мёртвый production-код, используется только
+     migrate_test (L6); удалить в B/C, если не понадобится.
+  3. Валидация приватного источника считает только `*tg.Message` (L7): новый
+     канал с одним служебным сообщением будет отклонён; триггер: отказ
+     регистрации валидного чата.
+  4. Форвард из обычной группы (MessageOriginChat, id не −100…) при боте-админе
+     создаёт tg_botapi-источник, который ничего не собирает (handleUpdate
+     буферизует только ChannelPost); чинить в A2/B при встрече.
+  5. `addMTProtoSource` без юнитов (сеть) — покрыть, если появится seam.
+- **Перед деплоем на прод**: проверить БД VPS на дубликаты `(kind,ref)` —
+  миграция v2 (UNIQUE-индекс) на дублях упадёт явно; дедуп-скрипт —
+  `docs/handoff/2026-10-20-stage-8-plan-gate.md`.
+
 ---
 
 ### Подэтап A2 — `/dialogs`

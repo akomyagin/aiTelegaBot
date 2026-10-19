@@ -64,6 +64,37 @@
 - Риски с триггерами пересмотра — таблица в §7 плана (JSON-формат LLM,
   FloodWait, UNIQUE(kind,ref) на прод-БД с дублями, размер L3 >4096 и т.д.).
 
+## Деплой-риск A1: миграция v2 (UNIQUE(kind,ref)) на прод-БД
+
+Старый код (master) при повторном `/addsource` после `/removesource` вставлял
+ВТОРУЮ строку того же `(kind, ref)` (проверка дублей учитывала только
+`Enabled`). Если на прод-БД такое делали, миграция v2 (`CREATE UNIQUE INDEX
+sources_kind_ref`) упадёт и бот не стартует — по плану это осознанное
+поведение («миграция падает явно, чистка руками», §7).
+
+**Проверка ПЕРЕД деплоем A1** (на VPS, файл БД на volume):
+
+```sql
+SELECT kind, ref, COUNT(*) AS n FROM sources GROUP BY kind, ref HAVING n > 1;
+```
+
+Если есть дубликаты — дедупликация (оставить строку с минимальным id, если
+хотя бы одна из группы enabled — оставить enabled-строку с минимальным id):
+
+```sql
+DELETE FROM sources
+WHERE id NOT IN (
+    SELECT MIN(id) FROM sources GROUP BY kind, ref
+)
+AND (kind, ref) IN (
+    SELECT kind, ref FROM sources GROUP BY kind, ref HAVING COUNT(*) > 1
+);
+-- затем вручную проверить enabled у выживших строк:
+-- UPDATE sources SET enabled=1 WHERE id IN (...);
+```
+
+(Запускать при остановленном боте, сделав копию файла БД: `cp bot.db bot.db.bak`.)
+
 ## Замечание по KnowledgeVault
 
 В KV (workspace `myProjects`) есть артефакты README и competitive-analysis по

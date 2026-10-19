@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gotd/td/tg"
@@ -46,21 +47,41 @@ func (s *ChannelSource) Collect(ctx context.Context) ([]feed.Item, error) {
 	}
 	items := make([]feed.Item, 0, len(msgs))
 	for _, msg := range msgs {
-		items = append(items, messageToFeedItem(msg, s.channel))
+		items = append(items, messageToFeedItem(msg, s.channel, channelDeepLink(s.channel, msg.ID)))
 	}
 	return items, nil
 }
 
-// messageToFeedItem normalizes a tg.Message into a feed.Item. Private channels
-// have no public URL, so URL is left empty.
-func messageToFeedItem(msg tg.Message, channel string) feed.Item {
+// messageToFeedItem normalizes a tg.Message into a feed.Item. source is the
+// source ref (item.Source / DedupKey); url is the READY message deep link —
+// callers know their peer best (ChannelSource: channelDeepLink by ref;
+// PeerSource: the cached username decides public vs t.me/c form), so the link
+// is built exactly once (review L8).
+func messageToFeedItem(msg tg.Message, source, url string) feed.Item {
 	return feed.Item{
 		Kind:      "tg_mtproto",
-		Source:    channel,
+		Source:    source,
 		ID:        strconv.Itoa(msg.ID),
 		Title:     firstLine(msg.Message),
-		URL:       "",
+		URL:       url,
 		Text:      msg.Message,
 		Published: time.Unix(int64(msg.Date), 0).UTC(),
 	}
+}
+
+// channelDeepLink builds the t.me URL for one message given the source ref.
+// Unparseable refs yield "" (no link is better than a wrong one).
+func channelDeepLink(channel string, msgID int) string {
+	if strings.HasPrefix(channel, "-") {
+		botAPIID, err := strconv.ParseInt(channel, 10, 64)
+		if err != nil {
+			return ""
+		}
+		x, ok := ToMTProtoID(botAPIID)
+		if !ok {
+			return ""
+		}
+		return deepLinkURL("", x, msgID)
+	}
+	return deepLinkURL(strings.TrimPrefix(channel, "@"), 0, msgID)
 }

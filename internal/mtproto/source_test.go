@@ -15,7 +15,7 @@ func TestMessageToFeedItem(t *testing.T) {
 		Message: "Breaking headline\nBody text on the second line.",
 		Date:    1700000000,
 	}
-	item := messageToFeedItem(msg, "somechannel")
+	item := messageToFeedItem(msg, "somechannel", channelDeepLink("somechannel", msg.ID))
 
 	if item.Kind != "tg_mtproto" {
 		t.Errorf("Kind = %q, want tg_mtproto", item.Kind)
@@ -32,8 +32,9 @@ func TestMessageToFeedItem(t *testing.T) {
 	if item.Text != msg.Message {
 		t.Errorf("Text = %q, want full message", item.Text)
 	}
-	if item.URL != "" {
-		t.Errorf("URL = %q, want empty for private channel", item.URL)
+	// Stage 8: public refs get a t.me deep link (was empty before).
+	if want := "https://t.me/somechannel/42"; item.URL != want {
+		t.Errorf("URL = %q, want %q", item.URL, want)
 	}
 	want := time.Unix(1700000000, 0).UTC()
 	if !item.Published.Equal(want) {
@@ -45,6 +46,34 @@ func TestMessageToFeedItem(t *testing.T) {
 		t.Errorf("DedupKey = %q, want %q", got, want)
 	}
 }
+
+// TestMessageToFeedItem_DeepLinks covers channelDeepLink (Stage 8): a
+// "-100X" ref yields the private t.me/c/<X> form, "@user" the public one,
+// garbage yields no link.
+func TestMessageToFeedItem_DeepLinks(t *testing.T) {
+	tests := []struct {
+		name    string
+		channel string
+		wantURL string
+	}{
+		{"private -100X", "-1001234567890", "https://t.me/c/1234567890/42"},
+		{"public with at", "@somechannel", "https://t.me/somechannel/42"},
+		{"public bare", "somechannel", "https://t.me/somechannel/42"},
+		{"non-channel numeric", "-12345", ""},
+		{"garbage", "-100abc", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			msg := tg.Message{ID: 42, Message: "x", Date: 1700000000}
+			if got := messageToFeedItem(msg, tt.channel, channelDeepLink(tt.channel, msg.ID)).URL; got != tt.wantURL {
+				t.Errorf("messageToFeedItem(_, %q).URL = %q, want %q", tt.channel, got, tt.wantURL)
+			}
+		})
+	}
+}
+
+// Ensure PeerSource satisfies feed.Source at compile time.
+var _ feed.Source = (*PeerSource)(nil)
 
 // Ensure ChannelSource satisfies feed.Source at compile time.
 var _ feed.Source = (*ChannelSource)(nil)

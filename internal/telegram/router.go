@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"context"
+	"strconv"
 	"strings"
 
 	"github.com/go-telegram/bot"
@@ -14,17 +15,21 @@ const (
 		"и Telegram-каналов и присылаю сжатую сводку по расписанию.\n\n" +
 		"/digest — получить дайджест сейчас\n" +
 		"/sources — список источников\n" +
-		"/addsource [url|@channel] — добавить источник\n" +
+		"/addsource [url|@channel|t.me-ссылка] — добавить источник\n" +
 		"/removesource [id] — отключить источник\n" +
-		"/help — справка"
+		"/help — справка\n\n" +
+		"Перешлите любое сообщение из канала или чата — добавлю его как источник.\n" +
+		"/addsource понимает t.me-ссылки, включая приватные t.me/c/…"
 
 	helpText = "Команды:\n" +
 		"/start — приветствие\n" +
 		"/digest — получить дайджест сейчас\n" +
 		"/sources — список источников\n" +
-		"/addsource [url|@channel] — добавить источник\n" +
+		"/addsource [url|@channel|t.me-ссылка] — добавить источник\n" +
 		"/removesource [id] — отключить источник\n" +
-		"/help — эта справка"
+		"/help — эта справка\n\n" +
+		"Перешлите любое сообщение из канала или чата — добавлю его как источник.\n" +
+		"/addsource понимает t.me-ссылки, включая приватные t.me/c/…"
 
 	digestStartedText  = "⏳ Собираю дайджест…"
 	digestErrorText    = "❌ Ошибка при сборке дайджеста"
@@ -39,12 +44,18 @@ func (b *Bot) handleUpdate(ctx context.Context, api *bot.Bot, u *models.Update) 
 	_ = api // delivery goes through b.Deliver
 
 	// Channel posts from managed channels (bot is admin). Checked before the
-	// u.Message guard, otherwise channel posts would be dropped.
+	// u.Message guard, otherwise channel posts would be dropped. Buffer key:
+	// the username, or the string form of the chat id for private chats
+	// (plan §4.5) — the same key ManagedSource is constructed with.
 	if u.ChannelPost != nil && b.channelBuf != nil {
 		post := u.ChannelPost
 		username := post.Chat.Username
-		item := channelPostToItem(username, post.ID, post.Text, int64(post.Date))
-		b.channelBuf.Push(item)
+		key := username
+		if key == "" {
+			key = strconv.FormatInt(post.Chat.ID, 10)
+		}
+		item := channelPostToItem(key, username, post.ID, post.Text, int64(post.Date))
+		b.channelBuf.Push(key, item)
 		return
 	}
 
@@ -54,6 +65,14 @@ func (b *Bot) handleUpdate(ctx context.Context, api *bot.Bot, u *models.Update) 
 
 	if !authorized(u.Message.Chat.ID, b.chatID) {
 		b.log.Warn("ignoring update from unauthorized chat", "chat_id", u.Message.Chat.ID)
+		return
+	}
+
+	// Forwarded message from the owner: candidate source registration
+	// (Stage 8 A1). Checked before command parsing so a forwarded
+	// command-looking text is never treated as a command.
+	if u.Message.ForwardOrigin != nil {
+		b.handleForward(ctx, u.Message.ForwardOrigin)
 		return
 	}
 
