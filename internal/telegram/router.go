@@ -17,6 +17,7 @@ const (
 		"/sources — список источников\n" +
 		"/addsource [url|@channel|t.me-ссылка] — добавить источник\n" +
 		"/removesource [id] — отключить источник\n" +
+		"/dialogs — список моих Telegram-диалогов, добавление кнопкой\n" +
 		"/help — справка\n\n" +
 		"Перешлите любое сообщение из канала или чата — добавлю его как источник.\n" +
 		"/addsource понимает t.me-ссылки, включая приватные t.me/c/…"
@@ -27,6 +28,7 @@ const (
 		"/sources — список источников\n" +
 		"/addsource [url|@channel|t.me-ссылка] — добавить источник\n" +
 		"/removesource [id] — отключить источник\n" +
+		"/dialogs — список моих Telegram-диалогов, добавление кнопкой\n" +
 		"/help — эта справка\n\n" +
 		"Перешлите любое сообщение из канала или чата — добавлю его как источник.\n" +
 		"/addsource понимает t.me-ссылки, включая приватные t.me/c/…"
@@ -59,8 +61,16 @@ func (b *Bot) handleUpdate(ctx context.Context, api *bot.Bot, u *models.Update) 
 		return
 	}
 
+	// Callback queries (Stage 8 A2): owner check, ack and dispatch happen in
+	// handleCallbackQuery. Checked before the u.Message guard — a callback
+	// update carries no Message.
+	if u.CallbackQuery != nil {
+		b.handleCallbackQuery(ctx, u.CallbackQuery)
+		return
+	}
+
 	if u.Message == nil {
-		return // other callbacks are out of scope
+		return // other updates are out of scope
 	}
 
 	if !authorized(u.Message.Chat.ID, b.chatID) {
@@ -91,6 +101,8 @@ func (b *Bot) handleUpdate(ctx context.Context, api *bot.Bot, u *models.Update) 
 		b.handleDigest(ctx)
 	case "sources":
 		b.handleSources(ctx)
+	case "dialogs":
+		b.handleDialogs(ctx)
 	case "addsource":
 		b.handleAddSource(ctx, parseCommandArg(u.Message.Text))
 	case "removesource":
