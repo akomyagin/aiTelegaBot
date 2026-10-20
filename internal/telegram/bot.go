@@ -35,7 +35,7 @@ type Bot struct {
 	chatID       int64    // owner chat; only accept commands from this single user
 	onDigest     func(ctx context.Context) error
 	listSources  func(ctx context.Context) (string, error)
-	addSource    func(ctx context.Context, kind, ref string) (id int64, freshCount int, err error)
+	addSource    func(ctx context.Context, kind, ref string) (SourceAddResult, error)
 	removeSource func(ctx context.Context, id int64) (found bool, err error)
 	// forwardRegistrar registers a source from a forwarded message (Stage 8
 	// A1); nil => forwards get the "unavailable" refusal.
@@ -99,8 +99,10 @@ func WithSourceLister(fn func(ctx context.Context) (string, error)) Option {
 }
 
 // WithSourceAdder wires /addsource to a closure that validates (trial collect)
-// and persists a new source, returning its id and the number of posts found.
-func WithSourceAdder(fn func(ctx context.Context, kind, ref string) (int64, int, error)) Option {
+// and persists a new source, returning SourceAddResult: the row id, the number
+// of posts found, and the trial items reused as the topic-suggestion sample
+// (Stage 8 B, review M3 — no second collect).
+func WithSourceAdder(fn func(ctx context.Context, kind, ref string) (SourceAddResult, error)) Option {
 	return func(b *Bot) { b.addSource = fn }
 }
 

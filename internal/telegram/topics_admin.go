@@ -9,6 +9,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/go-telegram/bot/models"
+
+	"github.com/akomyagin/aiTelegaBot/internal/feed"
 )
 
 // Stage 8 B: темы — команды /topics, /newtopic, /settopic и callback'и
@@ -117,12 +119,15 @@ type TopicSuggestion struct {
 
 // TopicSuggester вызывается telegram-слоем после УСПЕШНОГО добавления
 // источника (любой путь: /addsource, форвард, кнопка «Добавить» из /dialogs).
-// Возвращает nil («нет предложения») при любом отказе — ошибка SuggestTopic,
-// нет LLM-ключа, пустое имя: добавление тогда работает как раньше, без
-// кнопок (обязательная деградация, план: «addSource без LLM-ключа не падает
-// и не шлёт кнопки»). Всю работу делает seam (app): sample, ListTopics,
+// sample — trial-элементы, собранные при валидации самого добавления
+// (ForwardResult.Sample / SourceAddResult.Sample): ВТОРОЙ сетевой сбор не
+// выполняется (ревью M3). Возвращает nil («нет предложения») при любом
+// отказе — ошибка SuggestTopic, пустое имя: добавление тогда работает как
+// раньше, без кнопок (обязательная деградация, план: «addSource без
+// LLM-ключа не падает и не шлёт кнопки»; без ключа опция в app вообще не
+// проводится — ревью M1). Всю работу делает seam (app): ListTopics,
 // SuggestTopic (таймаут 15с), CreateTopic.
-type TopicSuggester func(ctx context.Context, sourceID int64, kind, ref string) *TopicSuggestion
+type TopicSuggester func(ctx context.Context, sourceID int64, kind, ref string, sample []feed.Item) *TopicSuggestion
 
 // SourceRemoveResult — типизированный ответ расширенного remover'а
 // (Stage 8 B): текущий контракт (found bool) не знает про origin, а
@@ -268,11 +273,11 @@ func bindSuccessText(sourceID int64, topicName string) string {
 // (регистраторы генерируют его как раньше) и, если TopicSuggester вернул
 // предложение, добавляет строку «Предложенная тема: X» и ts/tl/tn-клавиатуру.
 // Без опции / при nil-предложении — базовый текст без кнопок.
-func (b *Bot) withTopicSuggestion(ctx context.Context, base string, sourceID int64, kind, ref string) (string, *models.InlineKeyboardMarkup) {
+func (b *Bot) withTopicSuggestion(ctx context.Context, base string, sourceID int64, kind, ref string, sample []feed.Item) (string, *models.InlineKeyboardMarkup) {
 	if b.topicSuggest == nil || sourceID == 0 {
 		return base, nil
 	}
-	sug := b.topicSuggest(ctx, sourceID, kind, ref)
+	sug := b.topicSuggest(ctx, sourceID, kind, ref, sample)
 	if sug == nil || sug.TopicID == 0 || strings.TrimSpace(sug.TopicName) == "" {
 		return base, nil
 	}
@@ -283,8 +288,8 @@ func (b *Bot) withTopicSuggestion(ctx context.Context, base string, sourceID int
 // replyAdded доставляет ответ успешного добавления: текст + (опционально)
 // клавиатура предложения. Используется /addsource и форвардом; диалоговая
 // кнопка «Добавить» редактирует своё сообщение сама (editCallbackMessage).
-func (b *Bot) replyAdded(ctx context.Context, base string, sourceID int64, kind, ref string) {
-	text, kb := b.withTopicSuggestion(ctx, base, sourceID, kind, ref)
+func (b *Bot) replyAdded(ctx context.Context, base string, sourceID int64, kind, ref string, sample []feed.Item) {
+	text, kb := b.withTopicSuggestion(ctx, base, sourceID, kind, ref, sample)
 	if kb != nil {
 		b.sendPage(ctx, text, kb)
 		return

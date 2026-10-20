@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/go-telegram/bot/models"
+
+	"github.com/akomyagin/aiTelegaBot/internal/feed"
 )
 
 // Stage 8 B (темы): тесты telegram-стороны — golden-рендер /topics и
@@ -481,7 +483,9 @@ func TestHandleAddSource_SuggestionFlow(t *testing.T) {
 
 	t.Run("no suggestion option → old text, no buttons", func(t *testing.T) {
 		b, rec := newTopicsTestBot()
-		b.addSource = func(context.Context, string, string) (int64, int, error) { return 5, 2, nil }
+		b.addSource = func(context.Context, string, string) (SourceAddResult, error) {
+			return SourceAddResult{ID: 5, Fresh: 2}, nil
+		}
 		b.handleUpdate(context.Background(), nil, cmdUpdate(123, "/addsource https://x"))
 		if len(rec.replies) != 1 || rec.replies[0] != wantPlain {
 			t.Errorf("replies = %v, want [%s]", rec.replies, wantPlain)
@@ -492,8 +496,10 @@ func TestHandleAddSource_SuggestionFlow(t *testing.T) {
 	})
 	t.Run("suggestion nil (no LLM key) → old text", func(t *testing.T) {
 		b, rec := newTopicsTestBot()
-		b.addSource = func(context.Context, string, string) (int64, int, error) { return 5, 2, nil }
-		b.topicSuggest = func(context.Context, int64, string, string) *TopicSuggestion { return nil }
+		b.addSource = func(context.Context, string, string) (SourceAddResult, error) {
+			return SourceAddResult{ID: 5, Fresh: 2}, nil
+		}
+		b.topicSuggest = func(context.Context, int64, string, string, []feed.Item) *TopicSuggestion { return nil }
 		b.handleUpdate(context.Background(), nil, cmdUpdate(123, "/addsource https://x"))
 		if len(rec.replies) != 1 || rec.replies[0] != wantPlain {
 			t.Errorf("replies = %v, want [%s]", rec.replies, wantPlain)
@@ -504,16 +510,22 @@ func TestHandleAddSource_SuggestionFlow(t *testing.T) {
 	})
 	t.Run("suggestion → text + ts/tl/tn keyboard", func(t *testing.T) {
 		b, rec := newTopicsTestBot()
-		b.addSource = func(context.Context, string, string) (int64, int, error) { return 5, 2, nil }
+		b.addSource = func(context.Context, string, string) (SourceAddResult, error) {
+			return SourceAddResult{ID: 5, Fresh: 2, Sample: []feed.Item{{Title: "trial"}}}, nil
+		}
 		var gotID int64
 		var gotKind, gotRef string
-		b.topicSuggest = func(_ context.Context, sourceID int64, kind, ref string) *TopicSuggestion {
-			gotID, gotKind, gotRef = sourceID, kind, ref
+		var gotSample []feed.Item
+		b.topicSuggest = func(_ context.Context, sourceID int64, kind, ref string, sample []feed.Item) *TopicSuggestion {
+			gotID, gotKind, gotRef, gotSample = sourceID, kind, ref, sample
 			return &TopicSuggestion{TopicID: 9, TopicName: "AI <3>"}
 		}
 		b.handleUpdate(context.Background(), nil, cmdUpdate(123, "/addsource https://x"))
 		if gotID != 5 || gotKind != "rss" || gotRef != "https://x" {
 			t.Errorf("suggest got (%d, %q, %q), want (5, rss, https://x)", gotID, gotKind, gotRef)
+		}
+		if len(gotSample) != 1 || gotSample[0].Title != "trial" {
+			t.Errorf("suggest sample = %+v, want trial-элемент из пути добавления (M3)", gotSample)
 		}
 		if len(rec.sends) != 1 {
 			t.Fatalf("sends = %+v, want exactly one message with keyboard", rec.sends)
@@ -542,11 +554,15 @@ func TestHandleForward_V2WithSuggestion(t *testing.T) {
 		return ForwardResult{
 			Reply:    "✅ Источник #5 добавлен: My Channel (публичный канал).",
 			SourceID: 5, Kind: "tg_public", Ref: "chan",
+			Sample: []feed.Item{{Title: "trial"}},
 		}
 	}
-	b.topicSuggest = func(_ context.Context, sourceID int64, kind, ref string) *TopicSuggestion {
+	b.topicSuggest = func(_ context.Context, sourceID int64, kind, ref string, sample []feed.Item) *TopicSuggestion {
 		if sourceID != 5 || kind != "tg_public" || ref != "chan" {
 			t.Errorf("suggest got (%d, %q, %q)", sourceID, kind, ref)
+		}
+		if len(sample) != 1 || sample[0].Title != "trial" {
+			t.Errorf("suggest sample = %+v, want ForwardResult.Sample (M3)", sample)
 		}
 		return &TopicSuggestion{TopicID: 9, TopicName: "Новости"}
 	}
@@ -568,7 +584,7 @@ func TestHandleForward_LegacyRegistrarUnchanged(t *testing.T) {
 	// Без V2 форвард работает как в A1: текст регистратора, без кнопок.
 	b, rec := newTopicsTestBot()
 	b.forwardRegistrar = func(context.Context, ForwardOrigin) string { return "registered" }
-	b.topicSuggest = func(context.Context, int64, string, string) *TopicSuggestion {
+	b.topicSuggest = func(context.Context, int64, string, string, []feed.Item) *TopicSuggestion {
 		t.Error("suggestion must not be called without a V2 registrar (no sourceID)")
 		return nil
 	}

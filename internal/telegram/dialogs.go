@@ -323,7 +323,7 @@ func (b *Bot) handleDialogAdd(ctx context.Context, q *models.CallbackQuery, arg 
 		// Stage 8 B: расширенный регистратор возвращает sourceID/kind/ref —
 		// suggested-поток (§4.11) добавляет ts/tl/tn-кнопки без парсинга текста.
 		res := b.forwardRegistrarV2(ctx, origin)
-		text, kb := b.withTopicSuggestion(ctx, res.Reply, res.SourceID, res.Kind, res.Ref)
+		text, kb := b.withTopicSuggestion(ctx, res.Reply, res.SourceID, res.Kind, res.Ref, res.Sample)
 		b.editCallbackMessage(ctx, msg, text, kb)
 		return
 	}

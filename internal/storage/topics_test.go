@@ -281,3 +281,81 @@ func TestListTopics_SourceCount(t *testing.T) {
 		}
 	}
 }
+
+// TestPruneStaticSources (ревью M4): static-строки, отсутствующие в keep,
+// удаляются; keep-строки и dynamic-строки не трогаются; повторный прогон
+// идемпотентен (removed=0).
+func TestPruneStaticSources(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	if err := st.UpsertStaticSource(ctx, "rss", "https://keep.example/f.xml"); err != nil {
+		t.Fatalf("UpsertStaticSource keep: %v", err)
+	}
+	if err := st.UpsertStaticSource(ctx, "hn", "frontpage"); err != nil {
+		t.Fatalf("UpsertStaticSource orphan: %v", err)
+	}
+	dynID, err := st.AddSource(ctx, "tg_public", "dynamic_chan")
+	if err != nil {
+		t.Fatalf("AddSource: %v", err)
+	}
+	// Осиротевшая строка была привязана к теме — удаляется вместе со строкой.
+	orphanTopicID, err := st.CreateTopic(ctx, "OrphanTopic")
+	if err != nil {
+		t.Fatalf("CreateTopic: %v", err)
+	}
+	var orphanRowID int64
+	pre, err := st.ListSources(ctx)
+	if err != nil {
+		t.Fatalf("ListSources (pre): %v", err)
+	}
+	for _, r := range pre {
+		if r.Origin == "static" && r.Kind == "hn" {
+			orphanRowID = r.ID
+		}
+	}
+	if orphanRowID == 0 {
+		t.Fatalf("orphan static row not found in %+v", pre)
+	}
+	if _, err := st.SetSourceTopic(ctx, orphanRowID, orphanTopicID); err != nil {
+		t.Fatalf("SetSourceTopic: %v", err)
+	}
+
+	keep := []StaticRef{{Kind: "rss", Ref: "https://keep.example/f.xml"}}
+	removed, err := st.PruneStaticSources(ctx, keep)
+	if err != nil {
+		t.Fatalf("PruneStaticSources: %v", err)
+	}
+	if removed != 1 {
+		t.Errorf("removed = %d, want 1", removed)
+	}
+
+	rows, err := st.ListSources(ctx)
+	if err != nil {
+		t.Fatalf("ListSources: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("rows = %+v, want 2 (keep + dynamic)", rows)
+	}
+	for _, r := range rows {
+		switch {
+		case r.Origin == "static":
+			if r.Kind != "rss" || r.Ref != "https://keep.example/f.xml" {
+				t.Errorf("static row = %+v, want the kept rss row", r)
+			}
+		case r.ID == dynID && r.Kind == "tg_public" && r.Origin == "dynamic":
+			// dynamic-строка не тронута
+		default:
+			t.Errorf("unexpected row %+v", r)
+		}
+	}
+
+	// Повторный прогон с тем же keep — удалять нечего.
+	removed2, err := st.PruneStaticSources(ctx, keep)
+	if err != nil {
+		t.Fatalf("PruneStaticSources (2): %v", err)
+	}
+	if removed2 != 0 {
+		t.Errorf("removed2 = %d, want 0 (идемпотентность)", removed2)
+	}
+}

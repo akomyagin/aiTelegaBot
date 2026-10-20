@@ -5,6 +5,8 @@ import (
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
+
+	"github.com/akomyagin/aiTelegaBot/internal/feed"
 )
 
 // ForwardOrigin identifies the chat/channel a forwarded message came from.
@@ -31,6 +33,10 @@ type ForwardResult struct {
 	SourceID int64  // id сохранённого источника; 0 => отказ/ошибка — без предложения темы
 	Kind     string // вид источника ("rss", "tg_public", …) — для TopicSuggester
 	Ref      string
+	// Sample — trial-элементы, собранные при валидации добавления (ревью M3:
+	// suggested-поток переиспользует их, второго сетевого сбора нет).
+	// Для tg_botapi всегда пусто (план §4.11).
+	Sample []feed.Item
 }
 
 // ForwardRegistrarV2 is the extended ForwardRegistrar (additive: the legacy
@@ -101,7 +107,7 @@ func (b *Bot) handleForward(ctx context.Context, o *models.MessageOrigin) {
 		// Stage 8 B: единый хелпер suggested-потока (replyAdded) — тот же, что
 		// для /addsource; текст регистратора доставляется как есть + кнопки.
 		res := b.forwardRegistrarV2(ctx, origin)
-		b.replyAdded(ctx, res.Reply, res.SourceID, res.Kind, res.Ref)
+		b.replyAdded(ctx, res.Reply, res.SourceID, res.Kind, res.Ref, res.Sample)
 		return
 	}
 	b.reply(ctx, b.forwardRegistrar(ctx, origin))

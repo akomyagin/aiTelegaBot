@@ -148,6 +148,32 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	// обычные строки. Ошибка upsert одного источника не фатальна (лог внутри).
 	registerStaticSources(ctx, store, staticRefs)
 
+	// Ревью M4: pruning осиротевших static-строк — источники, исчезнувшие из
+	// config (например URL убрали из .env), иначе навсегда остались бы в БД
+	// и засоряли /topics. Ошибка pruning'а не фатальна (Warn).
+	// Keep-set включает MTPROTO_CHANNELS даже когда mtClient==nil: деградный
+	// запуск их не регистрирует, но и удалять существующие строки нельзя —
+	// с MTProto-переменными в следующем запуске каналы вернутся, а pruning
+	// необратимо потерял бы их привязку topic_id.
+	keep := make([]storage.StaticRef, 0, len(staticRefs)+len(cfg.MTProtoChannels))
+	for _, r := range staticRefs {
+		keep = append(keep, storage.StaticRef{Kind: r.Kind, Ref: r.Ref})
+	}
+	if mtClient == nil {
+		for _, ch := range cfg.MTProtoChannels {
+			ch = strings.TrimPrefix(strings.TrimSpace(ch), "@")
+			if ch == "" {
+				continue
+			}
+			keep = append(keep, storage.StaticRef{Kind: "tg_mtproto", Ref: ch})
+		}
+	}
+	if removed, err := store.PruneStaticSources(ctx, keep); err != nil {
+		slog.Warn("static source pruning failed", "err", err)
+	} else if removed > 0 {
+		slog.Info("pruned orphaned static sources", "removed", removed)
+	}
+
 	// sourceProvider returns the source set for each run: the static config layer
 	// plus a fresh snapshot of enabled DB-backed sources. Called once per Run, so
 	// sources added via /addsource are picked up without a restart.
@@ -223,13 +249,14 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		telegram.WithTopicCreator(newTopicCreator(store)),
 		telegram.WithTopicBinder(newTopicBinder(store)),
 	}
-	// Suggested-поток (§4.11): llm.Client и llm.Offline оба реализуют
-	// TopicSuggester (offline → («», nil) → seam вернёт nil → ответ без
-	// кнопок). Если суммаризатор вдруг не реализует интерфейс — опция просто
-	// не проводится, деградация та же.
-	if ts, ok := summarizer.(llm.TopicSuggester); ok {
+	// Suggested-поток (§4.11, ревью M1): опция проводится ТОЛЬКО для
+	// сетевого LLM-клиента (*llm.Client). llm.Offline тоже реализует
+	// TopicSuggester (всегда («», nil)), но type-assert на интерфейс
+	// проводил бы seam и для него; offline → опция не проводится → ответ
+	// добавления без кнопок и НОЛЬ дополнительных сетевых вызовов.
+	if lc, ok := summarizer.(*llm.Client); ok {
 		botOpts = append(botOpts, telegram.WithTopicSuggestion(
-			newTopicSuggester(store, ts, hc, tgLimit, mtClient)))
+			newTopicSuggester(store, lc)))
 	}
 	// /dialogs (Stage 8 A2): the list comes from the secondary MTProto
 	// account; registration of the chosen peer reuses registerForward (same
@@ -282,9 +309,11 @@ func Run(ctx context.Context, cfg *config.Config) error {
 }
 
 // sourceAdder validates and persists a candidate source; the signature
-// matches telegram.WithSourceAdder. freshCount is the number of posts seen by
-// the trial collect (0 for kinds without one).
-type sourceAdder func(ctx context.Context, kind, ref string) (id int64, freshCount int, err error)
+// matches telegram.WithSourceAdder. Результат — telegram.SourceAddResult:
+// id строки, Fresh (число постов trial-collect'а, 0 для видов без него) и
+// Sample — trial-элементы валидации для suggested-потока (ревью M3: второй
+// сетевой сбор не выполняется).
+type sourceAdder func(ctx context.Context, kind, ref string) (telegram.SourceAddResult, error)
 
 // sourceExistsError is returned by the source adder when an ENABLED row for
 // (kind, ref) already exists. It carries the row id so forward registration
@@ -313,29 +342,32 @@ func (e *sourceExistsError) Error() string {
 // covers DISABLED duplicates: a re-add after /removesource REACTIVATES the
 // row (review H1) and is reported as success, not as "уже добавлен".
 func newSourceAdder(store *storage.SQLiteStore, mtClient *mtproto.Client, hc *http.Client, tgLimit int) sourceAdder {
-	return func(ctx context.Context, kind, ref string) (int64, int, error) {
+	return func(ctx context.Context, kind, ref string) (telegram.SourceAddResult, error) {
 		if kind == "tg_botapi" {
 			id, created, reactivated, err := store.AddSourceIfNotExists(ctx, kind, ref)
 			if err != nil {
-				return 0, 0, err
+				return telegram.SourceAddResult{}, err
 			}
 			if !created && !reactivated {
-				return 0, 0, &sourceExistsError{id: id}
+				return telegram.SourceAddResult{}, &sourceExistsError{id: id}
 			}
-			return id, 0, nil
+			// Sample всегда пуст: Collect ManagedSource дренирует production
+			// channelBuf (план §4.11) — терять реальные посты нельзя.
+			return telegram.SourceAddResult{ID: id}, nil
 		}
 
 		if kind == "tg_mtproto" {
-			id, created, reactivated, err := addMTProtoSource(ctx, store, mtClient, ref)
+			id, created, reactivated, sample, err := addMTProtoSource(ctx, store, mtClient, ref)
 			if err != nil {
-				return 0, 0, err
+				return telegram.SourceAddResult{}, err
 			}
 			if !created && !reactivated {
-				return 0, 0, &sourceExistsError{id: id}
+				return telegram.SourceAddResult{}, &sourceExistsError{id: id}
 			}
-			// freshCount=0: the trial read (limit=1) validates access, it is
-			// not a count of "fresh posts" (review L1).
-			return id, 0, nil
+			// Fresh=0: the trial read (limit=1) validates access, it is
+			// not a count of "fresh posts" (review L1). Sample — тот самый
+			// trial-элемент (ревью M3: без второго GetHistory).
+			return telegram.SourceAddResult{ID: id, Sample: sample}, nil
 		}
 
 		cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
@@ -349,23 +381,24 @@ func newSourceAdder(store *storage.SQLiteStore, mtClient *mtproto.Client, hc *ht
 		case "tg_public":
 			items, err = telegram.NewPublicSource("@"+ref, ref, hc, tgLimit).TrialCollect(cctx)
 		default:
-			return 0, 0, fmt.Errorf("неизвестный вид источника %q", kind)
+			return telegram.SourceAddResult{}, fmt.Errorf("неизвестный вид источника %q", kind)
 		}
 		if err != nil {
-			return 0, 0, fmt.Errorf("источник недоступен: %w", err)
+			return telegram.SourceAddResult{}, fmt.Errorf("источник недоступен: %w", err)
 		}
 		if len(items) == 0 {
-			return 0, 0, fmt.Errorf("источник не вернул ни одного поста (проверьте адрес/канал)")
+			return telegram.SourceAddResult{}, fmt.Errorf("источник не вернул ни одного поста (проверьте адрес/канал)")
 		}
 
 		id, created, reactivated, err := store.AddSourceIfNotExists(ctx, kind, ref)
 		if err != nil {
-			return 0, 0, err
+			return telegram.SourceAddResult{}, err
 		}
 		if !created && !reactivated {
-			return 0, 0, &sourceExistsError{id: id}
+			return telegram.SourceAddResult{}, &sourceExistsError{id: id}
 		}
-		return id, len(items), nil
+		// Trial-элементы валидации переиспользуются как sample темы (M3).
+		return telegram.SourceAddResult{ID: id, Fresh: len(items), Sample: items}, nil
 	}
 }
 
@@ -414,7 +447,7 @@ func newForwardRegistrar(store *storage.SQLiteStore, mtClient *mtproto.Client, a
 			}
 
 		case origin.Username != "":
-			id, _, err := addSourceFn(ctx, "tg_public", origin.Username)
+			res, err := addSourceFn(ctx, "tg_public", origin.Username)
 			if err != nil {
 				var exists *sourceExistsError
 				if errors.As(err, &exists) {
@@ -425,8 +458,9 @@ func newForwardRegistrar(store *storage.SQLiteStore, mtClient *mtproto.Client, a
 				return telegram.ForwardResult{Reply: "❌ " + telegram.EscapeHTML(err.Error())}
 			}
 			return telegram.ForwardResult{
-				Reply:    fmt.Sprintf("✅ Источник #%d добавлен: %s (публичный канал).", id, title),
-				SourceID: id, Kind: "tg_public", Ref: origin.Username,
+				Reply:    fmt.Sprintf("✅ Источник #%d добавлен: %s (публичный канал).", res.ID, title),
+				SourceID: res.ID, Kind: "tg_public", Ref: origin.Username,
+				Sample: res.Sample, // trial-элементы валидации (ревью M3)
 			}
 
 		default:
@@ -436,7 +470,7 @@ func newForwardRegistrar(store *storage.SQLiteStore, mtClient *mtproto.Client, a
 					"или добавьте бота в администраторы чата."}
 			}
 			ref := strconv.FormatInt(origin.BotAPIChatID, 10)
-			id, created, reactivated, err := addMTProtoSource(ctx, store, mtClient, ref)
+			id, created, reactivated, sample, err := addMTProtoSource(ctx, store, mtClient, ref)
 			if err != nil {
 				return telegram.ForwardResult{Reply: "❌ " + telegram.EscapeHTML(err.Error())}
 			}
@@ -444,7 +478,7 @@ func newForwardRegistrar(store *storage.SQLiteStore, mtClient *mtproto.Client, a
 			case reactivated:
 				return telegram.ForwardResult{
 					Reply:    fmt.Sprintf("✅ Источник #%d снова включён: %s.", id, title),
-					SourceID: id, Kind: "tg_mtproto", Ref: ref,
+					SourceID: id, Kind: "tg_mtproto", Ref: ref, Sample: sample,
 				}
 			case !created:
 				return telegram.ForwardResult{
@@ -454,6 +488,7 @@ func newForwardRegistrar(store *storage.SQLiteStore, mtClient *mtproto.Client, a
 			return telegram.ForwardResult{
 				Reply:    fmt.Sprintf("✅ Источник #%d добавлен: %s (приватный канал через MTProto).", id, title),
 				SourceID: id, Kind: "tg_mtproto", Ref: ref,
+				Sample: sample, // trial-элемент валидационного чтения (ревью M3)
 			}
 		}
 	}
@@ -471,17 +506,21 @@ const mtprotoValidationTimeout = 25 * time.Second
 // re-enabled (review H1). When MTProto is not configured the call fails with
 // the degradation message — a first-class path, since the VPS may legitimately
 // run without MTPROTO_APP_ID/HASH (user decision 2026-10-20).
-func addMTProtoSource(ctx context.Context, store *storage.SQLiteStore, mtClient *mtproto.Client, ref string) (int64, bool, bool, error) {
+// Stage 8 B (ревью M3): возвращает также sample — trial-элемент из уже
+// прочитанного при валидации сообщения (limit=1) для suggested-потока;
+// второй GetHistory не выполняется (лишний FloodWait-риск), одного элемента
+// достаточно для предложения темы по заголовку.
+func addMTProtoSource(ctx context.Context, store *storage.SQLiteStore, mtClient *mtproto.Client, ref string) (int64, bool, bool, []feed.Item, error) {
 	if mtClient == nil {
-		return 0, false, false, fmt.Errorf("приватные источники требуют настроенного MTProto (MTPROTO_APP_ID и MTPROTO_APP_HASH)")
+		return 0, false, false, nil, fmt.Errorf("приватные источники требуют настроенного MTProto (MTPROTO_APP_ID и MTPROTO_APP_HASH)")
 	}
 	botAPIID, err := strconv.ParseInt(ref, 10, 64)
 	if err != nil {
-		return 0, false, false, fmt.Errorf("некорректный id приватного канала %q", ref)
+		return 0, false, false, nil, fmt.Errorf("некорректный id приватного канала %q", ref)
 	}
 	x, ok := mtproto.ToMTProtoID(botAPIID)
 	if !ok {
-		return 0, false, false, fmt.Errorf("источник %q не является каналом или супергруппой", ref)
+		return 0, false, false, nil, fmt.Errorf("источник %q не является каналом или супергруппой", ref)
 	}
 
 	cctx, cancel := context.WithTimeout(ctx, mtprotoValidationTimeout)
@@ -490,15 +529,16 @@ func addMTProtoSource(ctx context.Context, store *storage.SQLiteStore, mtClient 
 	if err != nil {
 		// GetHistoryByPeer errors mention peer ids / RPC codes only — safe to
 		// surface; no session data or access_hash is ever included.
-		return 0, false, false, fmt.Errorf("источник недоступен (аккаунт не в этом чате?): %w", err)
+		return 0, false, false, nil, fmt.Errorf("источник недоступен (аккаунт не в этом чате?): %w", err)
 	}
 	if len(msgs) == 0 {
-		return 0, false, false, fmt.Errorf("источник не вернул ни одного поста")
+		return 0, false, false, nil, fmt.Errorf("источник не вернул ни одного поста")
 	}
+	sample := []feed.Item{mtproto.TrialItem(msgs[0], ref)}
 
 	id, created, reactivated, err := store.AddSourceIfNotExists(ctx, "tg_mtproto", ref)
 	if err != nil {
-		return 0, false, false, err
+		return 0, false, false, nil, err
 	}
-	return id, created, reactivated, nil
+	return id, created, reactivated, sample, nil
 }

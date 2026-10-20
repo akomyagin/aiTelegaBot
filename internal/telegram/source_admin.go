@@ -8,7 +8,20 @@ import (
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
+
+	"github.com/akomyagin/aiTelegaBot/internal/feed"
 )
+
+// SourceAddResult — итог успешного /addsource (Stage 8 B, ревью M3): id
+// сохранённой строки, число свежих постов и trial-элементы, собранные при
+// валидации добавления. Sample переиспользуется suggested-потоком (§4.11) —
+// второй сетевой сбор не выполняется. Для tg_botapi Sample всегда пуст
+// (Collect дренажирует production channelBuf, план §4.11).
+type SourceAddResult struct {
+	ID     int64
+	Fresh  int
+	Sample []feed.Item
+}
 
 // handleAddSource classifies the /addsource argument, then delegates validation
 // and persistence to the wired addSource closure (which does a trial collect
@@ -30,7 +43,7 @@ func (b *Bot) handleAddSource(ctx context.Context, arg string) {
 		return
 	}
 
-	id, fresh, err := b.addSource(ctx, kind, ref)
+	res, err := b.addSource(ctx, kind, ref)
 	if err != nil {
 		// addSource does validation (trial Collect) + insert; a validation
 		// failure is a normal user error. Replies go out with ParseMode HTML,
@@ -42,14 +55,16 @@ func (b *Bot) handleAddSource(ctx context.Context, arg string) {
 	// добавляет строку «Предложенная тема: X» и ts/tl/tn-кнопки ВНУТРИ
 	// replyAdded — только если seam WithTopicSuggestion подключён и вернул
 	// предложение (без LLM-ключа/при ошибке ответ прежний, без кнопок).
+	// Trial-элементы валидации (res.Sample) передаются как sample — второй
+	// сетевой сбор не выполняется (ревью M3).
 	if kind == "tg_botapi" {
 		b.replyAdded(ctx, fmt.Sprintf(
 			"✅ Источник #%d добавлен (%s: %s). Посты появятся при новых публикациях канала.",
-			id, kind, EscapeHTML(ref)), id, kind, ref)
+			res.ID, kind, EscapeHTML(ref)), res.ID, kind, ref, res.Sample)
 		return
 	}
 	b.replyAdded(ctx, fmt.Sprintf("✅ Источник #%d добавлен (%s: %s). Свежих постов: %d.",
-		id, kind, EscapeHTML(ref), fresh), id, kind, ref)
+		res.ID, kind, EscapeHTML(ref), res.Fresh), res.ID, kind, ref, res.Sample)
 }
 
 // handleRemoveSource disables a source by numeric id (see /sources).

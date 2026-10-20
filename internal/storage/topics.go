@@ -108,3 +108,70 @@ func (s *SQLiteStore) UpsertStaticSource(ctx context.Context, kind, ref string) 
 	}
 	return nil
 }
+
+// StaticRef — координаты (kind, ref) одного статического источника для
+// PruneStaticSources (Stage 8 B, ревью M4).
+type StaticRef struct {
+	Kind string
+	Ref  string
+}
+
+// PruneStaticSources удаляет static-строки, отсутствующие в keep: источник
+// исчез из config (например URL убрали из .env) — его строка иначе навсегда
+// осталась бы в БД и засоряла /topics (origin='static' недоступен
+// /removesource). Dynamic-строки и keep-строки не трогаются. Одна
+// транзакция: SELECT static-строк → diff с keep в Go → DELETE по id.
+// Возвращает число удалённых строк.
+func (s *SQLiteStore) PruneStaticSources(ctx context.Context, keep []StaticRef) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	rows, err := tx.QueryContext(ctx, "SELECT id, kind, ref FROM sources WHERE origin='static'")
+	if err != nil {
+		return 0, fmt.Errorf("query static sources: %w", err)
+	}
+	keepSet := make(map[StaticRef]struct{}, len(keep))
+	for _, r := range keep {
+		keepSet[r] = struct{}{}
+	}
+	var orphans []int64
+	for rows.Next() {
+		var (
+			id int64
+			r  StaticRef
+		)
+		if err := rows.Scan(&id, &r.Kind, &r.Ref); err != nil {
+			_ = rows.Close()
+			return 0, fmt.Errorf("scan static source: %w", err)
+		}
+		if _, ok := keepSet[r]; !ok {
+			orphans = append(orphans, id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, fmt.Errorf("iterate static sources: %w", err)
+	}
+	// rows закрываем до DELETE: соединение одно (SetMaxOpenConns(1)).
+	_ = rows.Close()
+
+	var removed int64
+	for _, id := range orphans {
+		res, err := tx.ExecContext(ctx, "DELETE FROM sources WHERE id=? AND origin='static'", id)
+		if err != nil {
+			return 0, fmt.Errorf("delete static source %d: %w", id, err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return 0, fmt.Errorf("rows affected: %w", err)
+		}
+		removed += n
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit: %w", err)
+	}
+	return removed, nil
+}

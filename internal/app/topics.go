@@ -3,14 +3,12 @@ package app
 import (
 	"context"
 	"log/slog"
-	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/akomyagin/aiTelegaBot/internal/feed"
 	"github.com/akomyagin/aiTelegaBot/internal/llm"
-	"github.com/akomyagin/aiTelegaBot/internal/mtproto"
 	"github.com/akomyagin/aiTelegaBot/internal/storage"
 	"github.com/akomyagin/aiTelegaBot/internal/telegram"
 )
@@ -140,6 +138,17 @@ func newTopicBinder(store *storage.SQLiteStore) telegram.TopicBinder {
 					break
 				}
 			}
+			if topicID == 0 {
+				// Ревью L2: числовой topicArg трактуется как id, но тема с
+				// числовым именем («2024») иначе недостижима — при отсутствии
+				// темы с таким id fallback на ТОЧНОЕ совпадение по имени.
+				for _, t := range topics {
+					if t.Name == topicArg {
+						topicID, topicName = t.ID, t.Name
+						break
+					}
+				}
+			}
 		} else {
 			for _, t := range topics {
 				if t.Name == topicArg {
@@ -165,38 +174,40 @@ func newTopicBinder(store *storage.SQLiteStore) telegram.TopicBinder {
 	}
 }
 
-// Таймауты suggested-потока (§4.11): 15с на сам LLM-запрос SuggestTopic;
-// sample — пробный Collect с тем же потолком, что trial-collect добавления
-// (паттерн mtprotoValidationTimeout / 20с у sourceAdder).
-const (
-	topicSuggestTimeout = 15 * time.Second
-	topicSampleTimeout  = 20 * time.Second
-	// topicSampleLimit — сколько элементов достаточно для предложения темы
-	// (tg_mtproto пробный Collect; полный mtLimit здесь не нужен).
-	topicSampleLimit = 5
-)
+// Таймаут suggested-потока (§4.11): 15с на LLM-запрос SuggestTopic.
+// Отдельного sample-таймаута больше нет (ревью M3): sample — trial-элементы,
+// собранные при валидации самого добавления (SourceAddResult/ForwardResult.
+// Sample), второй сетевой сбор не выполняется. collectTopicSample и
+// topicSampleTimeout/topicSampleLimit удалены — единственный потребитель
+// исчез.
+const topicSuggestTimeout = 15 * time.Second
 
-// newTopicSuggester собирает telegram.TopicSuggester (§4.11): sample (пробный
-// Collect добавленного источника) + existing (имена тем, «Без темы»
-// исключается) → llm.SuggestTopic с таймаутом 15с → при непустом имени
-// CreateTopic СРАЗУ → &TopicSuggestion. ЛЮБОЙ отказ (ошибка, пустое имя) →
-// nil: telegram доставит старый ответ без кнопок, добавление не падает.
-// Ошибки логируются на Warn — предложение темы не фатально.
+// normalizeTopicName — нормализация имени темы для case-insensitive сверки
+// (ревью L1): lower + trim пробелов по краям.
+func normalizeTopicName(name string) string {
+	return strings.ToLower(strings.TrimSpace(name))
+}
+
+// newTopicSuggester собирает telegram.TopicSuggester (§4.11): sample
+// (trial-элементы из пути добавления — ревью M3, без повторного сбора) +
+// existing (имена тем, «Без темы» исключается) → llm.SuggestTopic с
+// таймаутом 15с → при непустом имени CreateTopic СРАЗУ → &TopicSuggestion.
+// ЛЮБОЙ отказ (ошибка, пустое имя) → nil: telegram доставит старый ответ
+// без кнопок, добавление не падает. Ошибки логируются на Warn — предложение
+// темы не фатально.
 func newTopicSuggester(
 	store *storage.SQLiteStore,
 	suggester llm.TopicSuggester,
-	hc *http.Client,
-	tgLimit int,
-	mtClient *mtproto.Client, // nil — MTProto не сконфигурирован (first-class)
 ) telegram.TopicSuggester {
-	return func(ctx context.Context, sourceID int64, kind, ref string) *telegram.TopicSuggestion {
+	return func(ctx context.Context, sourceID int64, kind, ref string, sample []feed.Item) *telegram.TopicSuggestion {
 		if sourceID == 0 || suggester == nil {
 			return nil
 		}
 
-		sample := collectTopicSample(ctx, kind, ref, hc, tgLimit, mtClient)
-
+		// existing — имена для промпта (сигнатура llm.SuggestTopic не
+		// меняется), byNorm — id по нормализованному имени для сверки (L1).
 		var existing []string
+		byNorm := make(map[string]storage.Topic)
 		if topics, err := store.ListTopics(ctx); err != nil {
 			slog.Warn("topic suggestion: ListTopics failed", "err", err)
 			return nil
@@ -205,6 +216,7 @@ func newTopicSuggester(
 				// Seed-тема «Без темы» (id=1) — не кандидат для предложения.
 				if t.ID != 1 {
 					existing = append(existing, t.Name)
+					byNorm[normalizeTopicName(t.Name)] = t
 				}
 			}
 		}
@@ -221,6 +233,14 @@ func newTopicSuggester(
 			return nil // «предложить нечего» — не ошибка
 		}
 
+		// Ревью L1: модель могла вернуть имя, отличающееся от существующего
+		// только регистром/пробелами («AI News» vs «ai news») — UNIQUE точный,
+		// CreateTopic создал бы near-duplicate. Совпадение по нормализованной
+		// строке → возвращаем существующую тему, не создавая новую.
+		if t, ok := byNorm[normalizeTopicName(name)]; ok {
+			return &telegram.TopicSuggestion{TopicID: t.ID, TopicName: t.Name}
+		}
+
 		id, err := store.CreateTopic(ctx, name)
 		if err != nil {
 			slog.Warn("topic suggestion: CreateTopic failed", "name", name, "err", err)
@@ -228,62 +248,6 @@ func newTopicSuggester(
 		}
 		return &telegram.TopicSuggestion{TopicID: id, TopicName: name}
 	}
-}
-
-// collectTopicSample берёт пробные элементы добавленного источника для
-// SuggestTopic. Любая ошибка/пусто → nil-sample: предложение всё равно
-// пробуется сделать (по одному ref тема обычно очевидна из existing).
-//   - tg_botapi → ВСЕГДА пусто: Collect ManagedSource ДРЕНИРУЕТ production
-//     channelBuf (см. newSourceAdder) — терять реальные посты нельзя.
-//   - rss/arxiv/hn → Collect; tg_public → TrialCollect (тот же путь, что
-//     валидация добавления); tg_mtproto → пробный Collect через PeerSource/
-//     ChannelSource (read-only, без записи в seen_items) с лимитом
-//     topicSampleLimit.
-func collectTopicSample(
-	ctx context.Context,
-	kind, ref string,
-	hc *http.Client,
-	tgLimit int,
-	mtClient *mtproto.Client,
-) []feed.Item {
-	if kind == "tg_botapi" {
-		return nil
-	}
-	cctx, cancel := context.WithTimeout(ctx, topicSampleTimeout)
-	defer cancel()
-
-	var (
-		items []feed.Item
-		err   error
-	)
-	switch kind {
-	case "rss", "arxiv", "hn":
-		// hn/arxiv динамически не добавляются, но sample по kind безвреден:
-		// NewRSSSource с kind="arxiv" парсит тот же фид (форма ref — URL,
-		// как в статическом слое).
-		items, err = feed.NewRSSSource(ref, ref, kind, hc).Collect(cctx)
-	case "tg_public":
-		items, err = telegram.NewPublicSource("@"+ref, ref, hc, tgLimit).TrialCollect(cctx)
-	case "tg_mtproto":
-		if mtClient == nil {
-			return nil
-		}
-		if botAPIID, perr := strconv.ParseInt(ref, 10, 64); perr == nil {
-			if x, ok := mtproto.ToMTProtoID(botAPIID); ok {
-				items, err = mtproto.NewPeerSource(ref, x, topicSampleLimit, mtClient).Collect(cctx)
-				break
-			}
-		}
-		trimmed := strings.TrimPrefix(ref, "@")
-		items, err = mtproto.NewChannelSource("@"+trimmed, trimmed, topicSampleLimit, mtClient).Collect(cctx)
-	default:
-		return nil
-	}
-	if err != nil {
-		slog.Warn("topic sample collect failed", "kind", kind, "ref", ref, "err", err)
-		return nil
-	}
-	return items
 }
 
 // newSourceRemoverV2 собирает origin-aware версию /removesource (контракт

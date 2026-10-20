@@ -322,8 +322,8 @@ func TestNewTopicSuggester(t *testing.T) {
 			}
 			// kind=tg_botapi: sample заведомо пустой, без сети и без дренажа
 			// channelBuf — тест проверяет seam, а не коллекторы.
-			sug := newTopicSuggester(st, tt.suggester, http.DefaultClient, 20, nil)
-			got := sug(ctx, tt.sourceID, "tg_botapi", "chan")
+			sug := newTopicSuggester(st, tt.suggester)
+			got := sug(ctx, tt.sourceID, "tg_botapi", "chan", nil)
 
 			if tt.wantNil {
 				if got != nil {
@@ -364,6 +364,85 @@ func TestNewTopicSuggester(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestNewTopicSuggester_CaseInsensitiveExisting (ревью L1): модель вернула
+// имя, отличающееся от существующего регистром/пробелами → возвращается
+// существующая тема, near-duplicate НЕ создаётся.
+func TestNewTopicSuggester_CaseInsensitiveExisting(t *testing.T) {
+	st := newForwardTestStore(t)
+	ctx := context.Background()
+	aiID, err := st.CreateTopic(ctx, "AI News")
+	if err != nil {
+		t.Fatalf("CreateTopic: %v", err)
+	}
+	sug := newTopicSuggester(st, &fakeTopicSuggester{name: "  ai news "})
+	got := sug(ctx, 5, "rss", "https://x", nil)
+	if got == nil {
+		t.Fatalf("got nil, want the existing topic")
+	}
+	if got.TopicID != aiID || got.TopicName != "AI News" {
+		t.Errorf("got %+v, want {%d, «AI News»} — существующая тема", got, aiID)
+	}
+	topics, err := st.ListTopics(ctx)
+	if err != nil {
+		t.Fatalf("ListTopics: %v", err)
+	}
+	// seed «Без темы» + «AI News»: новая near-duplicate тема не появилась.
+	if len(topics) != 2 {
+		t.Errorf("topics = %+v, want 2 (near-duplicate не создана)", topics)
+	}
+}
+
+// TestNewTopicSuggester_SamplePassThrough (ревью M3): sample из пути
+// добавления передаётся в SuggestTopic как есть — seam ничего не собирает.
+func TestNewTopicSuggester_SamplePassThrough(t *testing.T) {
+	st := newForwardTestStore(t)
+	ctx := context.Background()
+	fake := &fakeTopicSuggester{name: ""}
+	sug := newTopicSuggester(st, fake)
+	sample := []feed.Item{{Title: "a"}, {Title: "b"}}
+	if got := sug(ctx, 5, "tg_public", "chan", sample); got != nil {
+		t.Fatalf("got %+v, want nil (пустое имя)", got)
+	}
+	if fake.gotSampleLen != 2 {
+		t.Errorf("sample len = %d, want 2 (проброс из пути добавления)", fake.gotSampleLen)
+	}
+}
+
+// TestNewTopicBinder_NumericNameFallback (ревью L2): числовой topicArg
+// трактуется как id, но при отсутствии темы с таким id — fallback на ТОЧНОЕ
+// имя: тема «2024» достижима. Приоритет id сохраняется.
+func TestNewTopicBinder_NumericNameFallback(t *testing.T) {
+	st := newForwardTestStore(t)
+	ctx := context.Background()
+	binder := newTopicBinder(st)
+
+	srcID, _, _, err := st.AddSourceIfNotExists(ctx, "rss", "https://example.com/f.xml")
+	if err != nil {
+		t.Fatalf("AddSourceIfNotExists: %v", err)
+	}
+	yearID, err := st.CreateTopic(ctx, "2024")
+	if err != nil {
+		t.Fatalf("CreateTopic: %v", err)
+	}
+
+	// Темы с id=2024 нет → fallback на точное имя «2024».
+	res, err := binder(ctx, srcID, "2024")
+	if err != nil {
+		t.Fatalf("binder: %v", err)
+	}
+	if !res.SourceFound || !res.TopicFound || res.TopicID != yearID || res.TopicName != "2024" {
+		t.Fatalf("res = %+v, want привязку к теме «2024» (#%d)", res, yearID)
+	}
+	// id имеет приоритет: «1» → seed-тема «Без темы», а не поиск по имени.
+	res2, err := binder(ctx, srcID, "1")
+	if err != nil {
+		t.Fatalf("binder(1): %v", err)
+	}
+	if !res2.TopicFound || res2.TopicID != 1 {
+		t.Fatalf("id должен иметь приоритет над именем: %+v", res2)
 	}
 }
 
