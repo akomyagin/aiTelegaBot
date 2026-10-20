@@ -228,6 +228,34 @@ CREATE TABLE IF NOT EXISTS mtproto_peers (
     updated_at  TEXT NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS sources_kind_ref ON sources(kind, ref);
+
+-- v3 (Этап 8, подэтап B): темы и привязка источников к темам.
+CREATE TABLE IF NOT EXISTS topics (
+    id         INTEGER PRIMARY KEY,
+    name       TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL
+);
+-- seed-строка: id=1 'Без темы'. sources += origin TEXT NOT NULL DEFAULT
+-- 'dynamic' ('static' — регистрируемые при старте из config) и topic_id
+-- INTEGER REFERENCES topics(id); NULL ≡ тема 1, чтения через COALESCE(topic_id,1).
+
+-- v4 (Этап 8, подэтап C1): дайджест по темам + данные drill-down.
+ALTER TABLE digests ADD COLUMN topic_id INTEGER REFERENCES topics(id);
+ALTER TABLE digests ADD COLUMN run_id  INTEGER NOT NULL DEFAULT 0; -- 0 = legacy-строка
+CREATE TABLE IF NOT EXISTS digest_items (
+    id           INTEGER PRIMARY KEY,
+    digest_id    INTEGER NOT NULL REFERENCES digests(id),
+    source_id    INTEGER,
+    dedup_key    TEXT NOT NULL,
+    title        TEXT NOT NULL DEFAULT '',
+    url          TEXT NOT NULL DEFAULT '',
+    tg_peer      TEXT NOT NULL DEFAULT '', -- username или -100X
+    tg_msg_id    INTEGER NOT NULL DEFAULT 0,
+    published_at TEXT NOT NULL DEFAULT '',
+    snippet      TEXT NOT NULL DEFAULT '', -- первые ~200 рун Text
+    summary      TEXT NOT NULL DEFAULT ''  -- LLM-строка элемента (L2)
+);
+CREATE INDEX IF NOT EXISTS digest_items_digest ON digest_items(digest_id);
 ```
 
 Дедуп-ключ (`internal/feed` / `internal/storage`): для веб-источников — канонический
