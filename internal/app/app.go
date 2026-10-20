@@ -187,6 +187,18 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		telegram.WithSourceRemover(store.DisableSource),
 		telegram.WithForwardRegistrar(registerForward),
 	}
+	// /dialogs (Stage 8 A2): the list comes from the secondary MTProto
+	// account; registration of the chosen peer reuses registerForward (same
+	// admin-check → tg_botapi / tg_public / tg_mtproto paths and validation
+	// as forwards). Without MTProto the option is not wired and /dialogs
+	// degrades to the first-class "requires MTProto" refusal. The 30s
+	// rate-limit + snapshot live in telegram.Bot (plan §4.6).
+	if mtClient != nil {
+		botOpts = append(botOpts, telegram.WithDialogLister(
+			func(ctx context.Context, limit int) ([]mtproto.PeerInfo, error) {
+				return mtClient.GetDialogs(ctx, limit)
+			}))
+	}
 	bot, err := telegram.NewBot(cfg.TelegramBotToken, cfg.TelegramChatID, botOpts...)
 	if err != nil {
 		return err

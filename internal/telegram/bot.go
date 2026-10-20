@@ -14,9 +14,13 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"sync"
+	"time"
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
+
+	"github.com/akomyagin/aiTelegaBot/internal/mtproto"
 )
 
 // Deliverer sends a rendered digest to the user's chat.
@@ -37,9 +41,30 @@ type Bot struct {
 	// A1); nil => forwards get the "unavailable" refusal.
 	forwardRegistrar ForwardRegistrar
 	channelBuf       *ChannelBuffer // nil if no managed channels configured
+	// dialogLister fetches MTProto dialogs for /dialogs (Stage 8 A2);
+	// nil => MTProto is not configured and /dialogs degrades to a refusal.
+	dialogLister DialogLister
+	// callbackHandler receives callbacks whose data matches no known prefix
+	// (ad:/dp:) — the skeleton Stage 8 D extends into the drill-down/topic
+	// dispatcher. It must answer the callback itself.
+	callbackHandler func(ctx context.Context, q *models.CallbackQuery)
+
+	// Dialogs snapshot + rate limit (plan §4.6: at most one real GetDialogs
+	// per 30s; repeated calls reuse the last successful snapshot).
+	dialogsMu        sync.Mutex
+	dialogsSnapshot  []mtproto.PeerInfo
+	dialogsFetchedAt time.Time
+	dialogsCached    bool
+
 	// deliverFn is a test seam overriding Deliver's transport; nil => b.api.
 	deliverFn func(ctx context.Context, chatID, text string) error
-	log       *slog.Logger
+	// Test seams for the callback transport; nil => b.api (no-op when api is
+	// nil, i.e. in unit tests without a library client).
+	nowFn  func() time.Time
+	sendFn func(ctx context.Context, chatID int64, text string, kb *models.InlineKeyboardMarkup) error
+	ackFn  func(ctx context.Context, callbackQueryID, text string) error
+	editFn func(ctx context.Context, chatID int64, messageID int, text string, kb *models.InlineKeyboardMarkup) error
+	log    *slog.Logger
 }
 
 // Option configures the Bot.
@@ -78,6 +103,19 @@ func WithChannelBuffer(buf *ChannelBuffer) Option {
 // extracted origin and returns the reply text shown to the owner.
 func WithForwardRegistrar(fn ForwardRegistrar) Option {
 	return func(b *Bot) { b.forwardRegistrar = fn }
+}
+
+// WithDialogLister wires /dialogs to the MTProto dialogs fetcher (Stage 8
+// A2). Without it /dialogs answers that MTProto is not configured.
+func WithDialogLister(fn DialogLister) Option {
+	return func(b *Bot) { b.dialogLister = fn }
+}
+
+// WithCallbackHandler wires callbacks whose data matches no known dialogs
+// prefix (ad:/dp:) to fn — the skeleton Stage 8 D extends for drill-down
+// (L1/L2/L3) and topic (ts/tl/tn) dispatching. fn must ack the callback.
+func WithCallbackHandler(fn func(ctx context.Context, q *models.CallbackQuery)) Option {
+	return func(b *Bot) { b.callbackHandler = fn }
 }
 
 // NewBot builds the Telegram bot over the go-telegram/bot library. The chatID
