@@ -26,10 +26,6 @@ type Store interface {
 	FilterUnseen(ctx context.Context, items []feed.Item) ([]feed.Item, error)
 	// MarkSeen records items so they are skipped on future runs.
 	MarkSeen(ctx context.Context, items []feed.Item) error
-	// SaveDigest stores a delivered digest for audit/history.
-	// Deprecated (Stage 8 C): the topic pipeline uses InsertDigest +
-	// MarkDelivered; removal happens in C2 together with the legacy Render.
-	SaveDigest(ctx context.Context, body string, itemCount int) error
 	// InsertDigest creates a digests row with delivered=0 and returns its id
 	// (Stage 8 C, plan §4.3 — delivery gates persistence).
 	InsertDigest(ctx context.Context, runID, topicID int64, body string, itemCount int) (digestID int64, err error)
@@ -177,18 +173,6 @@ func (s *SQLiteStore) MarkSeen(ctx context.Context, items []feed.Item) error {
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit: %w", err)
-	}
-	return nil
-}
-
-// SaveDigest stores a delivered digest for audit/history.
-func (s *SQLiteStore) SaveDigest(ctx context.Context, body string, itemCount int) error {
-	now := time.Now().UTC().Format(time.RFC3339)
-	_, err := s.db.ExecContext(ctx,
-		"INSERT INTO digests(created_at, item_count, body, delivered) VALUES(?,?,?,1)",
-		now, itemCount, body)
-	if err != nil {
-		return fmt.Errorf("insert digest: %w", err)
 	}
 	return nil
 }

@@ -114,11 +114,11 @@ func TestBuildDynamicSources_SkipsStatic(t *testing.T) {
 	if len(out) != 2 {
 		t.Fatalf("got %d sources, want 2 (static skipped): %v", len(out), names(out))
 	}
-	if out[0].Name() != "https://example.com/dyn.xml" {
-		t.Errorf("source[0] = %q, want the dynamic rss ref", out[0].Name())
+	if out[0].Src.Name() != "https://example.com/dyn.xml" {
+		t.Errorf("source[0] = %q, want the dynamic rss ref", out[0].Src.Name())
 	}
-	if out[1].Name() != "@dynmanaged" {
-		t.Errorf("source[1] = %q, want @dynmanaged", out[1].Name())
+	if out[1].Src.Name() != "@dynmanaged" {
+		t.Errorf("source[1] = %q, want @dynmanaged", out[1].Src.Name())
 	}
 }
 

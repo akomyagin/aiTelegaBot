@@ -198,13 +198,15 @@ const buttonLabelBudget = 64 - len("Добавить: ") - len("…")
 // truncateButtonLabel shortens s to buttonLabelBudget bytes, cutting on a
 // rune boundary (utf8.DecodeLastRuneInString) and appending "…".
 func truncateButtonLabel(s string) string {
-	return truncateButtonLabelTo(s, buttonLabelBudget)
+	return TruncateButtonLabelTo(s, buttonLabelBudget)
 }
 
-// truncateButtonLabelTo is truncateButtonLabel with a caller-provided byte
-// budget (Stage 8 B: the topic picker uses the full 64−len("…") budget since
-// its labels carry no «Добавить: » prefix). Cuts on a rune boundary.
-func truncateButtonLabelTo(s string, budget int) string {
+// TruncateButtonLabelTo shortens s to budget BYTES (Bot API limit — 64 bytes
+// per button label, урок A2 H1), cutting on a rune boundary and appending "…".
+// Exported for the digest renders (plan Stage 8 C: digest.TOCButtons cuts
+// labels to its own byte budget). Stage 8 B callers (topic picker) use the
+// full 64−len("…") budget since their labels carry no «Добавить: » prefix.
+func TruncateButtonLabelTo(s string, budget int) string {
 	if len(s) <= budget {
 		return s
 	}
@@ -251,6 +253,17 @@ func (b *Bot) handleCallbackQuery(ctx context.Context, q *models.CallbackQuery) 
 	}
 	if rest, ok := strings.CutPrefix(q.Data, cbPrefixTopicNone); ok {
 		b.handleTopicNoneCallback(ctx, q, rest)
+		return
+	}
+	// Stage 8 C: digest navigation (план §4.4/§C) — TOC: проверяется раньше
+	// T: (читаемость; префиксы не пересекаются — второй символ различается).
+	// Обработчики в topic_view.go; owner-чек и ack-контур — выше.
+	if rest, ok := strings.CutPrefix(q.Data, cbPrefixTOC); ok {
+		b.handleTOC(ctx, q, rest)
+		return
+	}
+	if rest, ok := strings.CutPrefix(q.Data, cbPrefixTopicOpen); ok {
+		b.handleTopicOpen(ctx, q, rest)
 		return
 	}
 	if b.callbackHandler != nil {
@@ -439,13 +452,4 @@ func (b *Bot) editCallbackMessage(ctx context.Context, msg *models.Message, text
 	if _, err := b.api.EditMessageText(ctx, params); err != nil {
 		b.log.Error("editing callback message failed", "error", err)
 	}
-}
-
-// TruncateButtonLabelTo is truncateButtonLabelTo exported for the digest
-// renders (plan Stage 8 C: digest.TOCButtons cuts labels to the same byte
-// budget — 64-BYTE Bot API limit, rune-boundary cut, "…" suffix). Behavior is
-// identical; the unexported call sites keep working (full rename per plan
-// happens in C2).
-func TruncateButtonLabelTo(s string, budget int) string {
-	return truncateButtonLabelTo(s, budget)
 }
