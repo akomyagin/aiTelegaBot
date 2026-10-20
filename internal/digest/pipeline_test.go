@@ -309,8 +309,8 @@ func TestTaggedSource_StampCopyAndPartialError(t *testing.T) {
 		t.Errorf("Name = %q, want s", ts.Name())
 	}
 
-	// -race: параллельный Collect нескольких taggedSource (feed.Collect
-	// собирает источники конкурентно).
+	// -race: Collect нескольких taggedSource одним feed.Collect (последоват-
+	// ельный обход; -race страхует будущую конкуренцию и stamping-копии).
 	srcs := make([]taggedSource, 4)
 	for i := range srcs {
 		srcs[i] = taggedSource{

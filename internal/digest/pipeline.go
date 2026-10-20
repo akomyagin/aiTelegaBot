@@ -217,8 +217,10 @@ type TrackedSource struct {
 // taggedSource wraps a feed.Source and stamps SourceID/TopicID onto a COPY of
 // the collected items (§4.2). The originals are never mutated: static sources
 // are reused across runs. The inner error is returned as-is together with the
-// (possibly partial) stamped items — feed.Collect's partial-fail semantics
-// (items + err simultaneously).
+// (possibly partial) stamped items; NOTE that feed.Collect itself is
+// sequential and DROPS a failed source's items (it appends the error and
+// continues) — partial items are never consumed in the production path. No
+// data is lost: undelivered items stay unseen and the next run picks them up.
 type taggedSource struct {
 	inner             feed.Source
 	sourceID, topicID int64
