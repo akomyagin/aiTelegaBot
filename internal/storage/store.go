@@ -47,6 +47,19 @@ type Store interface {
 	// DisableSource sets enabled=0 for the given id. Returns (false, nil) when no
 	// row with that id exists.
 	DisableSource(ctx context.Context, id int64) (found bool, err error)
+	// ListTopics returns all topics ordered by id with the number of bound
+	// sources (Stage 8 B). Sources with topic_id NULL count toward "Без темы"
+	// (id 1).
+	ListTopics(ctx context.Context) ([]Topic, error)
+	// CreateTopic creates a topic with a unique name. Idempotent by name: an
+	// existing topic's id is returned unchanged.
+	CreateTopic(ctx context.Context, name string) (id int64, err error)
+	// SetSourceTopic binds a source to a topic. Returns (false, nil) when no
+	// source with that id exists.
+	SetSourceTopic(ctx context.Context, sourceID, topicID int64) (found bool, err error)
+	// UpsertStaticSource registers a config-backed static source with
+	// origin='static' (re-enabling it if disabled) without touching topic_id.
+	UpsertStaticSource(ctx context.Context, kind, ref string) error
 	// Close releases the underlying database handle.
 	Close() error
 }

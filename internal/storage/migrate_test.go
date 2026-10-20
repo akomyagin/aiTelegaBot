@@ -7,9 +7,10 @@ import (
 	"testing"
 )
 
-// TestMigrate_V2AppliedOnTopOfV1: a fresh Open runs both migrations
-// (user_version=2) and a repeated Open of the same file is idempotent.
-func TestMigrate_V2AppliedOnTopOfV1(t *testing.T) {
+// TestMigrate_FreshDBReachesLatestVersion: a fresh Open runs all migrations
+// (user_version=3 since Stage 8 B) and a repeated Open of the same file is
+// idempotent. The v2→v3 upgrade path itself is covered in topics_test.go.
+func TestMigrate_FreshDBReachesLatestVersion(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "v2.db")
 	ctx := context.Background()
 
@@ -21,8 +22,8 @@ func TestMigrate_V2AppliedOnTopOfV1(t *testing.T) {
 	if err := st.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatalf("read user_version: %v", err)
 	}
-	if version != 2 {
-		t.Errorf("user_version = %d, want 2", version)
+	if version != 3 {
+		t.Errorf("user_version = %d, want 3", version)
 	}
 	if err := st.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -37,8 +38,8 @@ func TestMigrate_V2AppliedOnTopOfV1(t *testing.T) {
 	if err := st2.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatalf("read user_version after reopen: %v", err)
 	}
-	if version != 2 {
-		t.Errorf("user_version after reopen = %d, want 2", version)
+	if version != 3 {
+		t.Errorf("user_version after reopen = %d, want 3", version)
 	}
 }
 

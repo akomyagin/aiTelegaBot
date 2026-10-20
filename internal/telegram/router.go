@@ -17,6 +17,9 @@ const (
 		"/sources — список источников\n" +
 		"/addsource [url|@channel|t.me-ссылка] — добавить источник\n" +
 		"/removesource [id] — отключить источник\n" +
+		"/topics — темы и их источники\n" +
+		"/newtopic [имя] — новая тема\n" +
+		"/settopic [id источника] [id темы] — привязать\n" +
 		"/dialogs — список моих Telegram-диалогов, добавление кнопкой\n" +
 		"/help — справка\n\n" +
 		"Перешлите любое сообщение из канала или чата — добавлю его как источник.\n" +
@@ -28,6 +31,9 @@ const (
 		"/sources — список источников\n" +
 		"/addsource [url|@channel|t.me-ссылка] — добавить источник\n" +
 		"/removesource [id] — отключить источник\n" +
+		"/topics — темы и их источники\n" +
+		"/newtopic [имя] — новая тема\n" +
+		"/settopic [id источника] [id темы] — привязать\n" +
 		"/dialogs — список моих Telegram-диалогов, добавление кнопкой\n" +
 		"/help — эта справка\n\n" +
 		"Перешлите любое сообщение из канала или чата — добавлю его как источник.\n" +
@@ -103,6 +109,13 @@ func (b *Bot) handleUpdate(ctx context.Context, api *bot.Bot, u *models.Update) 
 		b.handleSources(ctx)
 	case "dialogs":
 		b.handleDialogs(ctx)
+	// Stage 8 B (темы). Дайджест по темам в справке НЕ обещаем — заработает в C.
+	case "topics":
+		b.handleTopics(ctx)
+	case "newtopic":
+		b.handleNewTopic(ctx, parseCommandArg(u.Message.Text))
+	case "settopic":
+		b.handleSetTopic(ctx, parseCommandArg(u.Message.Text))
 	case "addsource":
 		b.handleAddSource(ctx, parseCommandArg(u.Message.Text))
 	case "removesource":

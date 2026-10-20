@@ -52,6 +52,14 @@ func (s *ChannelSource) Collect(ctx context.Context) ([]feed.Item, error) {
 	return items, nil
 }
 
+// TrialItem нормализует одно пробное сообщение (валидационное чтение
+// GetHistoryByPeer limit=1, Stage 8 A1) в feed.Item для suggested-потока
+// (Stage 8 B, ревью M3): второй GetHistory был бы лишним FloodWait-риском,
+// поэтому sample темы строится из уже прочитанного при валидации сообщения.
+func TrialItem(msg tg.Message, ref string) feed.Item {
+	return messageToFeedItem(msg, ref, channelDeepLink(ref, msg.ID))
+}
+
 // messageToFeedItem normalizes a tg.Message into a feed.Item. source is the
 // source ref (item.Source / DedupKey); url is the READY message deep link —
 // callers know their peer best (ChannelSource: channelDeepLink by ref;

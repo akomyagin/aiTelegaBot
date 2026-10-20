@@ -198,10 +198,17 @@ const buttonLabelBudget = 64 - len("Добавить: ") - len("…")
 // truncateButtonLabel shortens s to buttonLabelBudget bytes, cutting on a
 // rune boundary (utf8.DecodeLastRuneInString) and appending "…".
 func truncateButtonLabel(s string) string {
-	if len(s) <= buttonLabelBudget {
+	return truncateButtonLabelTo(s, buttonLabelBudget)
+}
+
+// truncateButtonLabelTo is truncateButtonLabel with a caller-provided byte
+// budget (Stage 8 B: the topic picker uses the full 64−len("…") budget since
+// its labels carry no «Добавить: » prefix). Cuts on a rune boundary.
+func truncateButtonLabelTo(s string, budget int) string {
+	if len(s) <= budget {
 		return s
 	}
-	for len(s) > buttonLabelBudget {
+	for len(s) > budget {
 		_, size := utf8.DecodeLastRuneInString(s)
 		s = s[:len(s)-size]
 	}
@@ -228,6 +235,22 @@ func (b *Bot) handleCallbackQuery(ctx context.Context, q *models.CallbackQuery) 
 	}
 	if rest, ok := strings.CutPrefix(q.Data, cbPrefixDialogPage); ok {
 		b.handleDialogPage(ctx, q, rest)
+		return
+	}
+	// Stage 8 B: topic prefixes (план §4.4/§4.11) — тот же диспетчер, owner-чек
+	// и ack-контур выше; обработчики в topics_admin.go. Второй диспетчер НЕ
+	// заводится. Порядок CutPrefix безопасен: ts:/tl:/tn: не пересекаются с
+	// ad:/dp: (и будущими L1/L2/L3).
+	if rest, ok := strings.CutPrefix(q.Data, cbPrefixTopicSet); ok {
+		b.handleTopicSetCallback(ctx, q, rest)
+		return
+	}
+	if rest, ok := strings.CutPrefix(q.Data, cbPrefixTopicList); ok {
+		b.handleTopicListCallback(ctx, q, rest)
+		return
+	}
+	if rest, ok := strings.CutPrefix(q.Data, cbPrefixTopicNone); ok {
+		b.handleTopicNoneCallback(ctx, q, rest)
 		return
 	}
 	if b.callbackHandler != nil {
@@ -285,7 +308,7 @@ func (b *Bot) handleDialogAdd(ctx context.Context, q *models.CallbackQuery, arg 
 		b.editCallbackMessage(ctx, msg, dialogAddForbiddenText, nil)
 		return
 	}
-	if b.forwardRegistrar == nil {
+	if b.forwardRegistrar == nil && b.forwardRegistrarV2 == nil {
 		b.editCallbackMessage(ctx, msg, addSourceUnavailable, nil)
 		return
 	}
@@ -296,6 +319,14 @@ func (b *Bot) handleDialogAdd(ctx context.Context, q *models.CallbackQuery, arg 
 		Title:        peer.Title,
 	}
 	origin.BotIsAdmin = b.checkForwardAdmin(ctx, origin)
+	if b.forwardRegistrarV2 != nil {
+		// Stage 8 B: расширенный регистратор возвращает sourceID/kind/ref —
+		// suggested-поток (§4.11) добавляет ts/tl/tn-кнопки без парсинга текста.
+		res := b.forwardRegistrarV2(ctx, origin)
+		text, kb := b.withTopicSuggestion(ctx, res.Reply, res.SourceID, res.Kind, res.Ref, res.Sample)
+		b.editCallbackMessage(ctx, msg, text, kb)
+		return
+	}
 	b.editCallbackMessage(ctx, msg, b.forwardRegistrar(ctx, origin), nil)
 }
 

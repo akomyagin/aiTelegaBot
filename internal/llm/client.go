@@ -125,3 +125,72 @@ func (c *Client) Summarize(ctx context.Context, items []feed.Item) (string, erro
 	}
 	return strings.TrimSpace(parsed.Choices[0].Message.Content), nil
 }
+
+// SuggestTopic implements TopicSuggester over the chat-completions API. The
+// model is asked for strict JSON {"topic":"<имя>"}; HTTP-level failures are
+// retried by doWithRetry as usual, and an unparseable answer triggers exactly
+// ONE additional request before giving up with an error (plan §4.10). An answer
+// that is not in existing is fine — it is accepted as a new topic name; the
+// caller decides what to do with it. Empty name = "предложить нечего".
+// The API key is never logged.
+func (c *Client) SuggestTopic(ctx context.Context, existing []string, sample []feed.Item) (string, error) {
+	msgs := buildTopicPrompt(existing, sample)
+	body, err := json.Marshal(chatRequest{
+		Model:       c.model,
+		Messages:    msgs,
+		Temperature: 0.2,
+	})
+	if err != nil {
+		return "", fmt.Errorf("llm: marshal request: %w", err)
+	}
+
+	url := c.baseURL + "/chat/completions"
+	makeReq := func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+c.apiKey) // apiKey never logged
+		return req, nil
+	}
+
+	const maxParseAttempts = 2 // initial request + one repeat on an unparseable answer
+	var lastErr error
+	for attempt := 0; attempt < maxParseAttempts; attempt++ {
+		resp, err := c.doWithRetry(ctx, makeReq)
+		if err != nil {
+			// HTTP-level failures were already retried per maxRetries inside
+			// doWithRetry; fatal errors (401/400) must not be re-requested.
+			return "", err
+		}
+		content, err := extractContent(resp)
+		if err != nil {
+			return "", err
+		}
+		name, perr := parseTopicSuggestion(content)
+		if perr == nil {
+			return name, nil
+		}
+		lastErr = perr
+		c.log.Warn("llm topic suggestion unparseable", "attempt", attempt, "err", perr)
+	}
+	return "", fmt.Errorf("llm: topic suggestion unparseable after %d attempts: %w", maxParseAttempts, lastErr)
+}
+
+// extractContent reads the first choice's content from an open chat-completions
+// response and closes the body.
+func extractContent(resp *http.Response) (string, error) {
+	defer func() { _ = resp.Body.Close() }()
+	var parsed chatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return "", fmt.Errorf("llm: decode response: %w", err)
+	}
+	if parsed.Error != nil {
+		return "", fmt.Errorf("llm: api error: %s", parsed.Error.Message)
+	}
+	if len(parsed.Choices) == 0 {
+		return "", fmt.Errorf("llm: empty choices in response")
+	}
+	return strings.TrimSpace(parsed.Choices[0].Message.Content), nil
+}

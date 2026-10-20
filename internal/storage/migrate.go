@@ -52,6 +52,23 @@ var migrations = []string{
 	);
 	CREATE UNIQUE INDEX IF NOT EXISTS sources_kind_ref ON sources(kind, ref);
 	`,
+	// v3 (Stage 8 B): topics + source attribution. topics is seeded with id=1
+	// "Без темы"; sources.topic_id NULL ≡ topic 1 — all reads go through
+	// COALESCE(topic_id, 1). origin separates config-backed static sources
+	// ('static', registered by app.Run at startup) from user-added ones
+	// ('dynamic'). ALTER TABLE ADD COLUMN with REFERENCES is legal in SQLite
+	// because the column defaults to NULL; FK enforcement is not enabled in
+	// Open (no PRAGMA foreign_keys), consistent with the rest of the schema.
+	`
+	CREATE TABLE IF NOT EXISTS topics (
+	    id         INTEGER PRIMARY KEY,
+	    name       TEXT NOT NULL UNIQUE,
+	    created_at TEXT NOT NULL
+	);
+	INSERT OR IGNORE INTO topics(id, name, created_at) VALUES (1, 'Без темы', datetime('now'));
+	ALTER TABLE sources ADD COLUMN origin   TEXT NOT NULL DEFAULT 'dynamic';
+	ALTER TABLE sources ADD COLUMN topic_id INTEGER REFERENCES topics(id);
+	`,
 }
 
 // migrate applies pending migrations starting from the current PRAGMA

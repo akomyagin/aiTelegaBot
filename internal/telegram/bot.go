@@ -35,7 +35,7 @@ type Bot struct {
 	chatID       int64    // owner chat; only accept commands from this single user
 	onDigest     func(ctx context.Context) error
 	listSources  func(ctx context.Context) (string, error)
-	addSource    func(ctx context.Context, kind, ref string) (id int64, freshCount int, err error)
+	addSource    func(ctx context.Context, kind, ref string) (SourceAddResult, error)
 	removeSource func(ctx context.Context, id int64) (found bool, err error)
 	// forwardRegistrar registers a source from a forwarded message (Stage 8
 	// A1); nil => forwards get the "unavailable" refusal.
@@ -44,6 +44,24 @@ type Bot struct {
 	// dialogLister fetches MTProto dialogs for /dialogs (Stage 8 A2);
 	// nil => MTProto is not configured and /dialogs degrades to a refusal.
 	dialogLister DialogLister
+	// Stage 8 B seams (темы). Все опциональны: nil => команда/callback
+	// деградирует в отказ «функция недоступна» (сборка и поведение без
+	// wiring'а в app.go не меняются).
+	topicLister  TopicLister
+	topicCreator TopicCreator
+	topicBinder  TopicBinder
+	// topicSuggest вызывается после успешного добавления источника;
+	// nil (или nil-результат) => ответ без кнопок предложения темы.
+	topicSuggest TopicSuggester
+	// removeSourceV2 — origin-aware /removesource (static → отказ «через
+	// .env»); при nil используется legacy removeSource.
+	removeSourceV2 SourceRemoverV2
+	// forwardRegistrarV2 — расширенная версия forwardRegistrar: вместе с
+	// текстом ответа возвращает sourceID/kind/ref, чтобы suggested-поток
+	// (§4.11) работал для форвардов и кнопки «Добавить» из /dialogs без
+	// парсинга текста. При nil оба пути используют legacy-регистратор
+	// (текст как раньше, без кнопок темы).
+	forwardRegistrarV2 ForwardRegistrarV2
 	// callbackHandler receives callbacks whose data matches no known prefix
 	// (ad:/dp:) — the skeleton Stage 8 D extends into the drill-down/topic
 	// dispatcher. It must answer the callback itself.
@@ -81,8 +99,10 @@ func WithSourceLister(fn func(ctx context.Context) (string, error)) Option {
 }
 
 // WithSourceAdder wires /addsource to a closure that validates (trial collect)
-// and persists a new source, returning its id and the number of posts found.
-func WithSourceAdder(fn func(ctx context.Context, kind, ref string) (int64, int, error)) Option {
+// and persists a new source, returning SourceAddResult: the row id, the number
+// of posts found, and the trial items reused as the topic-suggestion sample
+// (Stage 8 B, review M3 — no second collect).
+func WithSourceAdder(fn func(ctx context.Context, kind, ref string) (SourceAddResult, error)) Option {
 	return func(b *Bot) { b.addSource = fn }
 }
 
@@ -109,6 +129,55 @@ func WithForwardRegistrar(fn ForwardRegistrar) Option {
 // A2). Without it /dialogs answers that MTProto is not configured.
 func WithDialogLister(fn DialogLister) Option {
 	return func(b *Bot) { b.dialogLister = fn }
+}
+
+// WithTopicLister wires /topics and the tl: topic picker to a closure over
+// storage.ListTopics + ListSources (Stage 8 B). The closure groups sources by
+// COALESCE(topic_id,1) into TopicView; telegram renders (golden-tested).
+func WithTopicLister(fn TopicLister) Option {
+	return func(b *Bot) { b.topicLister = fn }
+}
+
+// WithTopicCreator wires /newtopic to a closure over storage.CreateTopic.
+// The closure reports Created=false when the UNIQUE name already existed
+// (CreateTopic itself is idempotent and returns only the id).
+func WithTopicCreator(fn TopicCreator) Option {
+	return func(b *Bot) { b.topicCreator = fn }
+}
+
+// WithTopicBinder wires /settopic and the ts: callback to a closure over
+// storage.SetSourceTopic. The closure validates that the source and the topic
+// exist (storage does not — FK is not enforced) and resolves a non-numeric
+// topicArg (exact topic name) into an id.
+func WithTopicBinder(fn TopicBinder) Option {
+	return func(b *Bot) { b.topicBinder = fn }
+}
+
+// WithTopicSuggestion wires the suggested-topic flow (plan §4.11): after a
+// successful source add (any path) telegram calls fn(sourceID, kind, ref);
+// the closure runs sample collection + llm.SuggestTopic (15s timeout) +
+// storage.CreateTopic and returns the suggestion, or nil for "no suggestion"
+// (no LLM key, error, empty name) — the add reply then stays exactly as
+// before, without buttons.
+func WithTopicSuggestion(fn TopicSuggester) Option {
+	return func(b *Bot) { b.topicSuggest = fn }
+}
+
+// WithSourceRemoverV2 wires /removesource to an origin-aware closure: for a
+// static source it returns Static=true WITHOUT disabling it (reply: managed
+// via .env); for dynamic sources Found mirrors the legacy semantics. Takes
+// precedence over WithSourceRemover when both are set.
+func WithSourceRemoverV2(fn SourceRemoverV2) Option {
+	return func(b *Bot) { b.removeSourceV2 = fn }
+}
+
+// WithForwardRegistrarV2 wires forward registration (and the /dialogs
+// «Добавить» button) to an extended registrar returning ForwardResult: the
+// reply text PLUS the persisted source's id/kind/ref, so the suggested-topic
+// buttons can be attached without parsing the text. Takes precedence over
+// WithForwardRegistrar when both are set.
+func WithForwardRegistrarV2(fn ForwardRegistrarV2) Option {
+	return func(b *Bot) { b.forwardRegistrarV2 = fn }
 }
 
 // WithCallbackHandler wires callbacks whose data matches no known dialogs

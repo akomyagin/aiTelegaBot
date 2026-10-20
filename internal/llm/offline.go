@@ -48,6 +48,16 @@ func (o *Offline) Summarize(ctx context.Context, items []feed.Item) (string, err
 	return strings.Join(lines, "\n"), nil
 }
 
+// SuggestTopic implements TopicSuggester offline: deterministically no
+// suggestion ("", nil) — the offline summarizer never proposes topics
+// (plan §4.10).
+func (o *Offline) SuggestTopic(ctx context.Context, existing []string, sample []feed.Item) (string, error) {
+	_ = ctx
+	_ = existing
+	_ = sample
+	return "", nil
+}
+
 // extractLead takes the first ~leadRunes runes of text, or everything up to the
 // first ". " sentence boundary, whichever is shorter. Deterministic.
 func extractLead(text string) string {
