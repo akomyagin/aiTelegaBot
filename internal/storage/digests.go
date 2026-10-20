@@ -162,16 +162,44 @@ func (s *SQLiteStore) GetDigest(ctx context.Context, digestID int64) (Digest, bo
 	return d, true, nil
 }
 
+// digestItemSelect is the shared column list for digest_items reads
+// (source_id through COALESCE(…, 0): NULL ↔ «0 = unknown»).
+const digestItemSelect = `SELECT id, COALESCE(source_id, 0), dedup_key, title, url, tg_peer, tg_msg_id, published_at, snippet, summary
+	 FROM digest_items`
+
 // ListDigestItems returns a digest's drill-down rows ordered by id ASC.
 func (s *SQLiteStore) ListDigestItems(ctx context.Context, digestID int64) ([]DigestItem, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, COALESCE(source_id, 0), dedup_key, title, url, tg_peer, tg_msg_id, published_at, snippet, summary
-		 FROM digest_items WHERE digest_id=? ORDER BY id ASC`, digestID)
+	rows, err := s.db.QueryContext(ctx, digestItemSelect+" WHERE digest_id=? ORDER BY id ASC", digestID)
 	if err != nil {
 		return nil, fmt.Errorf("query digest_items: %w", err)
 	}
 	defer rows.Close()
+	return scanDigestItems(rows)
+}
 
+// ListDigestItemsBySource returns one source's drill-down rows of a digest,
+// ordered by id ASC (Stage 8 D, план §D — выборка для L3). sourceID=0 means
+// «all rows of the digest»: L3:<did>:0 renders the common list without a
+// source filter (plan D: кнопка «слишком много источников» → L3:<did>:0), so
+// it delegates to ListDigestItems. Rows with source_id NULL never match a
+// non-zero sourceID (SQL NULL semantics) — unknown provenance stays out of
+// per-source views but is present in the 0-list.
+func (s *SQLiteStore) ListDigestItemsBySource(ctx context.Context, digestID, sourceID int64) ([]DigestItem, error) {
+	if sourceID == 0 {
+		return s.ListDigestItems(ctx, digestID)
+	}
+	rows, err := s.db.QueryContext(ctx, digestItemSelect+" WHERE digest_id=? AND source_id=? ORDER BY id ASC",
+		digestID, sourceID)
+	if err != nil {
+		return nil, fmt.Errorf("query digest_items by source: %w", err)
+	}
+	defer rows.Close()
+	return scanDigestItems(rows)
+}
+
+// scanDigestItems reads the digestItemSelect column list from an open *sql.Rows
+// (caller closes). Empty result → nil slice, NOT an error.
+func scanDigestItems(rows *sql.Rows) ([]DigestItem, error) {
 	var out []DigestItem
 	for rows.Next() {
 		var it DigestItem

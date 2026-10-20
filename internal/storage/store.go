@@ -37,6 +37,10 @@ type Store interface {
 	GetDigest(ctx context.Context, digestID int64) (d Digest, ok bool, err error)
 	// ListDigestItems returns a digest's drill-down rows ordered by id ASC.
 	ListDigestItems(ctx context.Context, digestID int64) ([]DigestItem, error)
+	// ListDigestItemsBySource returns one source's drill-down rows of a digest
+	// ordered by id ASC; sourceID=0 → ВСЕ строки дайджеста (Stage 8 D, план
+	// §D: L3:<did>:0 рендерит общий список).
+	ListDigestItemsBySource(ctx context.Context, digestID, sourceID int64) ([]DigestItem, error)
 	// ListRunDigests returns one run's digests ordered by topic_id ASC;
 	// runID=0 means «легаси, не прогон» and always yields an empty result.
 	ListRunDigests(ctx context.Context, runID int64) ([]Digest, error)

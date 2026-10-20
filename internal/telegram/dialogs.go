@@ -266,6 +266,20 @@ func (b *Bot) handleCallbackQuery(ctx context.Context, q *models.CallbackQuery) 
 		b.handleTopicOpen(ctx, q, rest)
 		return
 	}
+	// Stage 8 D: drill-down L1→L2→L3 (план §4.4/§D). L1: — alias T:-пути
+	// (кнопка «◀ Назад» из L2 ведёт в тот же topic-view: viewer seam, owner/
+	// ack/inaccessible-механики общие). L2:/L3: уходят в drillDown seam;
+	// аргументы НЕ парсятся здесь — q.Data передаётся как есть (D-2). Порядок
+	// CutPrefix безопасен: L1:/L2:/L3: не пересекаются с ad:/dp:/ts:/tl:/tn:/
+	// T:/TOC: (регистр и второй байт различаются).
+	if rest, ok := strings.CutPrefix(q.Data, cbPrefixL1); ok {
+		b.handleTopicOpen(ctx, q, rest)
+		return
+	}
+	if strings.HasPrefix(q.Data, cbPrefixL2) || strings.HasPrefix(q.Data, cbPrefixL3) {
+		b.handleDrillDown(ctx, q)
+		return
+	}
 	if b.callbackHandler != nil {
 		// Stage 8 D owns ack + dispatch for the remaining prefixes.
 		b.callbackHandler(ctx, q)
