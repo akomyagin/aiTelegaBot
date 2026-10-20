@@ -36,6 +36,12 @@ func buildDynamicSources(
 		if !ds.Enabled {
 			continue
 		}
+		// Строки origin='static' (подэтап B) — те же источники, что уже
+		// построены статическим слоем из config: без фильтра здесь были бы
+		// дубли (план 614–615).
+		if ds.Origin == "static" {
+			continue
+		}
 		switch ds.Kind {
 		case "rss":
 			out = append(out, feed.NewRSSSource(ds.Ref, ds.Ref, "rss", hc))

@@ -17,6 +17,8 @@ type Source struct {
 	Ref     string // RSS URL, or channel username WITHOUT leading '@'
 	Enabled bool
 	AddedAt string // RFC3339 UTC
+	Origin  string // 'dynamic' (added via commands) | 'static' (config-backed, Stage 8 B)
+	TopicID int64  // effective topic: COALESCE(topic_id, 1) — NULL reads as 1 ("Без темы")
 }
 
 // AddSource inserts an enabled source and returns its new id.
@@ -97,7 +99,7 @@ func (s *SQLiteStore) AddSourceIfNotExists(ctx context.Context, kind, ref string
 // ListSources returns all sources ordered by id (enabled and disabled).
 func (s *SQLiteStore) ListSources(ctx context.Context) ([]Source, error) {
 	rows, err := s.db.QueryContext(ctx,
-		"SELECT id, kind, ref, enabled, added_at FROM sources ORDER BY id")
+		"SELECT id, kind, ref, enabled, added_at, origin, COALESCE(topic_id, 1) FROM sources ORDER BY id")
 	if err != nil {
 		return nil, fmt.Errorf("query sources: %w", err)
 	}
@@ -106,7 +108,7 @@ func (s *SQLiteStore) ListSources(ctx context.Context) ([]Source, error) {
 	for rows.Next() {
 		var src Source
 		var enabled int
-		if err := rows.Scan(&src.ID, &src.Kind, &src.Ref, &enabled, &src.AddedAt); err != nil {
+		if err := rows.Scan(&src.ID, &src.Kind, &src.Ref, &enabled, &src.AddedAt, &src.Origin, &src.TopicID); err != nil {
 			return nil, fmt.Errorf("scan source: %w", err)
 		}
 		src.Enabled = enabled != 0

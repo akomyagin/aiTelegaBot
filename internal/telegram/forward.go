@@ -23,6 +23,20 @@ type ForwardOrigin struct {
 // escape dynamic parts (EscapeHTML).
 type ForwardRegistrar func(ctx context.Context, origin ForwardOrigin) (reply string)
 
+// ForwardResult extends the A1 registrar reply with the persisted source's
+// coordinates so the suggested-topic flow (plan §4.11, Stage 8 B) can attach
+// ts/tl/tn buttons WITHOUT parsing the reply text.
+type ForwardResult struct {
+	Reply    string // текст ответа (уже HTML-экранированный на стороне app)
+	SourceID int64  // id сохранённого источника; 0 => отказ/ошибка — без предложения темы
+	Kind     string // вид источника ("rss", "tg_public", …) — для TopicSuggester
+	Ref      string
+}
+
+// ForwardRegistrarV2 is the extended ForwardRegistrar (additive: the legacy
+// option keeps working; V2 takes precedence when both are wired).
+type ForwardRegistrarV2 func(ctx context.Context, origin ForwardOrigin) ForwardResult
+
 // forwardUnsupportedText is the refusal for forwards of personal
 // correspondence (user / hidden_user origins): only channels and chats can
 // become sources.
@@ -78,11 +92,18 @@ func (b *Bot) handleForward(ctx context.Context, o *models.MessageOrigin) {
 		b.reply(ctx, forwardUnsupportedText)
 		return
 	}
-	if b.forwardRegistrar == nil {
+	if b.forwardRegistrar == nil && b.forwardRegistrarV2 == nil {
 		b.reply(ctx, "Добавление источников недоступно.")
 		return
 	}
 	origin.BotIsAdmin = b.checkForwardAdmin(ctx, origin)
+	if b.forwardRegistrarV2 != nil {
+		// Stage 8 B: единый хелпер suggested-потока (replyAdded) — тот же, что
+		// для /addsource; текст регистратора доставляется как есть + кнопки.
+		res := b.forwardRegistrarV2(ctx, origin)
+		b.replyAdded(ctx, res.Reply, res.SourceID, res.Kind, res.Ref)
+		return
+	}
 	b.reply(ctx, b.forwardRegistrar(ctx, origin))
 }
 

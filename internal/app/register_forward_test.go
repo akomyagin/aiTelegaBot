@@ -33,7 +33,7 @@ func newForwardTestStore(t *testing.T) *storage.SQLiteStore {
 //     hits the real t.me/s endpoint;
 //   - addMTProtoSource with a live client — needs a network seam (tech debt,
 //     recorded in the A1 review M3).
-func newTestRegistrar(t *testing.T, st *storage.SQLiteStore) telegram.ForwardRegistrar {
+func newTestRegistrar(t *testing.T, st *storage.SQLiteStore) telegram.ForwardRegistrarV2 {
 	t.Helper()
 	return newForwardRegistrar(st, nil, newSourceAdder(st, nil, http.DefaultClient, 20))
 }
@@ -53,8 +53,13 @@ func TestRegisterForward_BotAdmin(t *testing.T) {
 		Title:        "My <Chan> & Co",
 	}
 
-	// (a) first forward: row created, reply mentions the id.
-	reply := reg(ctx, origin)
+	// (a) first forward: row created, reply mentions the id; V2 несёт
+	// координаты источника для suggested-потока (§4.11).
+	res := reg(ctx, origin)
+	reply := res.Reply
+	if res.Kind != "tg_botapi" || res.Ref != "mychan" || res.SourceID == 0 {
+		t.Errorf("V2 coords = {%d,%q,%q}, want non-zero SourceID + tg_botapi/mychan", res.SourceID, res.Kind, res.Ref)
+	}
 	if !strings.Contains(reply, "✅") || !strings.Contains(reply, "добавлен") {
 		t.Fatalf("first reply = %q, want a ✅ «добавлен» text", reply)
 	}
@@ -73,8 +78,13 @@ func TestRegisterForward_BotAdmin(t *testing.T) {
 	}
 	id := rows[0].ID
 
-	// (г) duplicate forward: informational, NOT an error tone.
-	reply2 := reg(ctx, origin)
+	// (г) duplicate forward: informational, NOT an error tone; SourceID=0 —
+	// «уже добавлен» не считается успешным добавлением, кнопок темы нет.
+	res2 := reg(ctx, origin)
+	reply2 := res2.Reply
+	if res2.SourceID != 0 {
+		t.Errorf("duplicate V2 SourceID = %d, want 0 (no topic suggestion)", res2.SourceID)
+	}
 	if !strings.Contains(reply2, "ℹ️") || !strings.Contains(reply2, "уже добавлен") {
 		t.Fatalf("duplicate reply = %q, want «ℹ️ … уже добавлен»", reply2)
 	}
@@ -89,7 +99,11 @@ func TestRegisterForward_BotAdmin(t *testing.T) {
 	if ok, err := st.DisableSource(ctx, id); err != nil || !ok {
 		t.Fatalf("DisableSource: ok=%v err=%v", ok, err)
 	}
-	reply3 := reg(ctx, origin)
+	res3 := reg(ctx, origin)
+	reply3 := res3.Reply
+	if res3.SourceID != id || res3.Kind != "tg_botapi" || res3.Ref != "mychan" {
+		t.Errorf("reactivation V2 coords = {%d,%q,%q}, want {%d,tg_botapi,mychan}", res3.SourceID, res3.Kind, res3.Ref, id)
+	}
 	if !strings.Contains(reply3, "✅") || !strings.Contains(reply3, "снова включён") {
 		t.Fatalf("reactivation reply = %q, want «✅ … снова включён»", reply3)
 	}
@@ -109,11 +123,15 @@ func TestRegisterForward_BotAdminPrivateChat(t *testing.T) {
 	reg := newTestRegistrar(t, st)
 	ctx := context.Background()
 
-	reply := reg(ctx, telegram.ForwardOrigin{
+	res := reg(ctx, telegram.ForwardOrigin{
 		BotIsAdmin:   true,
 		BotAPIChatID: -1001234567890,
 		Title:        "Private chat",
 	})
+	reply := res.Reply
+	if res.Kind != "tg_botapi" || res.Ref != "-1001234567890" || res.SourceID == 0 {
+		t.Errorf("V2 coords = {%d,%q,%q}, want non-zero SourceID + tg_botapi/-1001234567890", res.SourceID, res.Kind, res.Ref)
+	}
 	if !strings.Contains(reply, "✅") || !strings.Contains(reply, "добавлен") {
 		t.Fatalf("reply = %q, want a ✅ «добавлен» text", reply)
 	}
@@ -133,10 +151,14 @@ func TestRegisterForward_NilMTClientDegrades(t *testing.T) {
 	reg := newTestRegistrar(t, st)
 	ctx := context.Background()
 
-	reply := reg(ctx, telegram.ForwardOrigin{
+	res := reg(ctx, telegram.ForwardOrigin{
 		BotAPIChatID: -1002222222222,
 		Title:        "Private channel",
 	})
+	reply := res.Reply
+	if res.SourceID != 0 {
+		t.Errorf("degradation V2 SourceID = %d, want 0", res.SourceID)
+	}
 	if !strings.Contains(reply, "MTPROTO_APP_ID") || !strings.Contains(reply, "MTPROTO_APP_HASH") {
 		t.Fatalf("reply = %q, want the MTPROTO_APP_ID/HASH degradation text", reply)
 	}

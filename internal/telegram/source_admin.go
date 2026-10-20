@@ -38,19 +38,23 @@ func (b *Bot) handleAddSource(ctx context.Context, arg string) {
 		b.reply(ctx, "❌ Источник не добавлен: "+EscapeHTML(err.Error()))
 		return
 	}
+	// Базовый текст ответа не меняется с A1; suggested-поток (§4.11)
+	// добавляет строку «Предложенная тема: X» и ts/tl/tn-кнопки ВНУТРИ
+	// replyAdded — только если seam WithTopicSuggestion подключён и вернул
+	// предложение (без LLM-ключа/при ошибке ответ прежний, без кнопок).
 	if kind == "tg_botapi" {
-		b.reply(ctx, fmt.Sprintf(
+		b.replyAdded(ctx, fmt.Sprintf(
 			"✅ Источник #%d добавлен (%s: %s). Посты появятся при новых публикациях канала.",
-			id, kind, EscapeHTML(ref)))
+			id, kind, EscapeHTML(ref)), id, kind, ref)
 		return
 	}
-	b.reply(ctx, fmt.Sprintf("✅ Источник #%d добавлен (%s: %s). Свежих постов: %d.",
-		id, kind, EscapeHTML(ref), fresh))
+	b.replyAdded(ctx, fmt.Sprintf("✅ Источник #%d добавлен (%s: %s). Свежих постов: %d.",
+		id, kind, EscapeHTML(ref), fresh), id, kind, ref)
 }
 
 // handleRemoveSource disables a source by numeric id (see /sources).
 func (b *Bot) handleRemoveSource(ctx context.Context, arg string) {
-	if b.removeSource == nil {
+	if b.removeSource == nil && b.removeSourceV2 == nil {
 		b.reply(ctx, "Удаление источников недоступно.")
 		return
 	}
@@ -59,10 +63,16 @@ func (b *Bot) handleRemoveSource(ctx context.Context, arg string) {
 		b.reply(ctx, "Использование: /removesource [числовой id] (см. /sources)")
 		return
 	}
-	found, err := b.removeSource(ctx, id)
+	// Stage 8 B: origin-aware remover (static → отказ «через .env»);
+	// removeSourceAny откатывается на legacy-контракт, когда V2 не подключён.
+	found, static, err := b.removeSourceAny(ctx, id)
 	if err != nil {
 		b.log.Error("remove source failed", "error", err)
 		b.reply(ctx, "❌ Внутренняя ошибка при удалении источника.")
+		return
+	}
+	if static {
+		b.reply(ctx, staticSourceRemoveText)
 		return
 	}
 	if !found {

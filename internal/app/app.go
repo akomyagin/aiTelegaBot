@@ -47,6 +47,22 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	// state (channelBuf, mtClient), so they are reused across runs. Dynamic,
 	// DB-backed sources are (re)built on every run — see sourceProvider below.
 	var staticSources []feed.Source
+	// staticRefs — те же источники координатами (kind, ref) для регистрации в
+	// БД (подэтап B). Собирается ВМЕСТЕ со staticSources, чтобы в БД не попало
+	// то, что фактически не строится (например MTPROTO_CHANNELS без mtClient).
+	// Правила kind/ref (план 609–614, множество kind БД = полное множество
+	// feed.Kind):
+	//   - RSS-фиды → (rss, <url>); arXiv-фид → (arxiv, <url>) — вид определяет
+	//     ТО ЖЕ правило, что и у статического слоя: вхождение "arxiv.org" в URL
+	//     (arXiv API отдаёт Atom по обычному URL, отдельного ident нет);
+	//   - HN → (hn, "frontpage") — единственный источник, limit не часть ref;
+	//   - managed TG-каналы → (tg_botapi, <username без @>) — та же форма ref,
+	//     что использует forward-регистрация для tg_botapi (username, либо
+	//     числовой "-100X" для приватных чатов);
+	//   - публичные TG-каналы → (tg_public, <username без @>);
+	//   - MTProto-каналы → (tg_mtproto, <username без @>) — форма @username
+	//     ветки ChannelSource в buildDynamicSources.
+	var staticRefs []staticSourceRef
 	hc := &http.Client{Timeout: 30 * time.Second}
 	tgLimit := cfg.TGSourceLimit
 	if tgLimit <= 0 {
@@ -62,9 +78,11 @@ func Run(ctx context.Context, cfg *config.Config) error {
 			kind = "arxiv"
 		}
 		staticSources = append(staticSources, feed.NewRSSSource(u, u, kind, hc))
+		staticRefs = append(staticRefs, staticSourceRef{Kind: kind, Ref: u})
 	}
 	if cfg.HNLimit > 0 {
 		staticSources = append(staticSources, feed.NewHNSource("Hacker News", cfg.HNLimit, hc))
+		staticRefs = append(staticRefs, staticSourceRef{Kind: "hn", Ref: "frontpage"})
 	}
 
 	// Managed-channel posts flow through a shared per-key buffer filled by
@@ -78,6 +96,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 			continue
 		}
 		staticSources = append(staticSources, telegram.NewManagedSource("@"+ch, ch, channelBuf))
+		staticRefs = append(staticRefs, staticSourceRef{Kind: "tg_botapi", Ref: ch})
 	}
 	for _, ch := range cfg.TGPublicChannels {
 		ch = strings.TrimPrefix(strings.TrimSpace(ch), "@")
@@ -85,6 +104,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 			continue
 		}
 		staticSources = append(staticSources, telegram.NewPublicSource("@"+ch, ch, hc, tgLimit))
+		staticRefs = append(staticRefs, staticSourceRef{Kind: "tg_public", Ref: ch})
 	}
 
 	// MTProto client (Stage 8): built whenever credentials are present,
@@ -119,8 +139,14 @@ func Run(ctx context.Context, cfg *config.Config) error {
 				continue
 			}
 			staticSources = append(staticSources, mtproto.NewChannelSource("@"+ch, ch, mtLimit, mtClient))
+			staticRefs = append(staticRefs, staticSourceRef{Kind: "tg_mtproto", Ref: ch})
 		}
 	}
+
+	// Stage 8 B: статические источники регистрируются в БД (origin='static')
+	// ДО sourceProvider — чтобы /topics,/settopic,/removesource видели их как
+	// обычные строки. Ошибка upsert одного источника не фатальна (лог внутри).
+	registerStaticSources(ctx, store, staticRefs)
 
 	// sourceProvider returns the source set for each run: the static config layer
 	// plus a fresh snapshot of enabled DB-backed sources. Called once per Run, so
@@ -163,6 +189,11 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		b.WriteString("\nДинамические источники (команды):\n")
 		hasDyn := false
 		for _, ds := range dbRows {
+			// Static-строки (подэтап B) уже показаны секцией выше из config —
+			// без фильтра они дублировались бы в «динамических».
+			if ds.Origin == "static" {
+				continue
+			}
 			status := "on"
 			if !ds.Enabled {
 				status = "off"
@@ -184,8 +215,21 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		telegram.WithSourceLister(listSources),
 		telegram.WithChannelBuffer(channelBuf),
 		telegram.WithSourceAdder(addSourceFn),
-		telegram.WithSourceRemover(store.DisableSource),
-		telegram.WithForwardRegistrar(registerForward),
+		// Stage 8 B: V2-опции имеют приоритет над legacy (b-tg §5–6), поэтому
+		// legacy WithSourceRemover/WithForwardRegistrar здесь больше не нужны.
+		telegram.WithSourceRemoverV2(newSourceRemoverV2(store)),
+		telegram.WithForwardRegistrarV2(registerForward),
+		telegram.WithTopicLister(newTopicLister(store)),
+		telegram.WithTopicCreator(newTopicCreator(store)),
+		telegram.WithTopicBinder(newTopicBinder(store)),
+	}
+	// Suggested-поток (§4.11): llm.Client и llm.Offline оба реализуют
+	// TopicSuggester (offline → («», nil) → seam вернёт nil → ответ без
+	// кнопок). Если суммаризатор вдруг не реализует интерфейс — опция просто
+	// не проводится, деградация та же.
+	if ts, ok := summarizer.(llm.TopicSuggester); ok {
+		botOpts = append(botOpts, telegram.WithTopicSuggestion(
+			newTopicSuggester(store, ts, hc, tgLimit, mtClient)))
 	}
 	// /dialogs (Stage 8 A2): the list comes from the secondary MTProto
 	// account; registration of the chosen peer reuses registerForward (same
@@ -333,8 +377,13 @@ func newSourceAdder(store *storage.SQLiteStore, mtClient *mtproto.Client, hc *ht
 // adder's trial collect); private chats need the MTProto secondary account
 // (tg_mtproto, validated by a trial history read). All dynamic text is
 // HTML-escaped — replies go out with ParseMode HTML.
-func newForwardRegistrar(store *storage.SQLiteStore, mtClient *mtproto.Client, addSourceFn sourceAdder) telegram.ForwardRegistrar {
-	return func(ctx context.Context, origin telegram.ForwardOrigin) string {
+//
+// Stage 8 B: возвращает ForwardRegistrarV2 — вместе с текстом координаты
+// сохранённого источника (SourceID/Kind/Ref) для suggested-потока (§4.11).
+// SourceID != 0 ТОЛЬКО при успешном добавлении (создан или ре-активирован);
+// «уже добавлен» (ℹ️), отказы и ошибки → SourceID=0, кнопок темы не будет.
+func newForwardRegistrar(store *storage.SQLiteStore, mtClient *mtproto.Client, addSourceFn sourceAdder) telegram.ForwardRegistrarV2 {
+	return func(ctx context.Context, origin telegram.ForwardOrigin) telegram.ForwardResult {
 		title := telegram.EscapeHTML(origin.Title)
 
 		switch {
@@ -346,45 +395,66 @@ func newForwardRegistrar(store *storage.SQLiteStore, mtClient *mtproto.Client, a
 			id, created, reactivated, err := store.AddSourceIfNotExists(ctx, "tg_botapi", ref)
 			if err != nil {
 				slog.Error("forward registration failed", "kind", "tg_botapi", "err", err)
-				return "❌ Внутренняя ошибка при добавлении источника."
+				return telegram.ForwardResult{Reply: "❌ Внутренняя ошибка при добавлении источника."}
 			}
 			switch {
 			case reactivated:
-				return fmt.Sprintf("✅ Источник #%d снова включён: %s.", id, title)
+				return telegram.ForwardResult{
+					Reply:    fmt.Sprintf("✅ Источник #%d снова включён: %s.", id, title),
+					SourceID: id, Kind: "tg_botapi", Ref: ref,
+				}
 			case !created:
-				return fmt.Sprintf("ℹ️ Источник уже добавлен (#%d): %s.", id, title)
+				return telegram.ForwardResult{
+					Reply: fmt.Sprintf("ℹ️ Источник уже добавлен (#%d): %s.", id, title),
+				}
 			}
-			return fmt.Sprintf("✅ Источник #%d добавлен: %s (бот читает посты напрямую).", id, title)
+			return telegram.ForwardResult{
+				Reply:    fmt.Sprintf("✅ Источник #%d добавлен: %s (бот читает посты напрямую).", id, title),
+				SourceID: id, Kind: "tg_botapi", Ref: ref,
+			}
 
 		case origin.Username != "":
 			id, _, err := addSourceFn(ctx, "tg_public", origin.Username)
 			if err != nil {
 				var exists *sourceExistsError
 				if errors.As(err, &exists) {
-					return fmt.Sprintf("ℹ️ Источник уже добавлен (#%d): %s.", exists.id, title)
+					return telegram.ForwardResult{
+						Reply: fmt.Sprintf("ℹ️ Источник уже добавлен (#%d): %s.", exists.id, title),
+					}
 				}
-				return "❌ " + telegram.EscapeHTML(err.Error())
+				return telegram.ForwardResult{Reply: "❌ " + telegram.EscapeHTML(err.Error())}
 			}
-			return fmt.Sprintf("✅ Источник #%d добавлен: %s (публичный канал).", id, title)
+			return telegram.ForwardResult{
+				Reply:    fmt.Sprintf("✅ Источник #%d добавлен: %s (публичный канал).", id, title),
+				SourceID: id, Kind: "tg_public", Ref: origin.Username,
+			}
 
 		default:
 			if mtClient == nil {
-				return "Приватные чаты требуют настроенного MTProto (MTPROTO_APP_ID и MTPROTO_APP_HASH). " +
+				return telegram.ForwardResult{Reply: "Приватные чаты требуют настроенного MTProto (MTPROTO_APP_ID и MTPROTO_APP_HASH). " +
 					"Сейчас он не сконфигурирован: перешлите сообщение из публичного канала " +
-					"или добавьте бота в администраторы чата."
+					"или добавьте бота в администраторы чата."}
 			}
 			ref := strconv.FormatInt(origin.BotAPIChatID, 10)
 			id, created, reactivated, err := addMTProtoSource(ctx, store, mtClient, ref)
 			if err != nil {
-				return "❌ " + telegram.EscapeHTML(err.Error())
+				return telegram.ForwardResult{Reply: "❌ " + telegram.EscapeHTML(err.Error())}
 			}
 			switch {
 			case reactivated:
-				return fmt.Sprintf("✅ Источник #%d снова включён: %s.", id, title)
+				return telegram.ForwardResult{
+					Reply:    fmt.Sprintf("✅ Источник #%d снова включён: %s.", id, title),
+					SourceID: id, Kind: "tg_mtproto", Ref: ref,
+				}
 			case !created:
-				return fmt.Sprintf("ℹ️ Источник уже добавлен (#%d): %s.", id, title)
+				return telegram.ForwardResult{
+					Reply: fmt.Sprintf("ℹ️ Источник уже добавлен (#%d): %s.", id, title),
+				}
 			}
-			return fmt.Sprintf("✅ Источник #%d добавлен: %s (приватный канал через MTProto).", id, title)
+			return telegram.ForwardResult{
+				Reply:    fmt.Sprintf("✅ Источник #%d добавлен: %s (приватный канал через MTProto).", id, title),
+				SourceID: id, Kind: "tg_mtproto", Ref: ref,
+			}
 		}
 	}
 }
