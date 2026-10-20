@@ -27,7 +27,23 @@ type Store interface {
 	// MarkSeen records items so they are skipped on future runs.
 	MarkSeen(ctx context.Context, items []feed.Item) error
 	// SaveDigest stores a delivered digest for audit/history.
+	// Deprecated (Stage 8 C): the topic pipeline uses InsertDigest +
+	// MarkDelivered; removal happens in C2 together with the legacy Render.
 	SaveDigest(ctx context.Context, body string, itemCount int) error
+	// InsertDigest creates a digests row with delivered=0 and returns its id
+	// (Stage 8 C, plan §4.3 — delivery gates persistence).
+	InsertDigest(ctx context.Context, runID, topicID int64, body string, itemCount int) (digestID int64, err error)
+	// MarkDelivered flips delivered=1, inserts the digest_items rows and marks
+	// the items seen — all in ONE transaction; any error rolls everything back.
+	MarkDelivered(ctx context.Context, digestID int64, items []DigestItem) error
+	// GetDigest reads one digest; ok=false (NOT an error) when the id is
+	// unknown — crafted callback ids must not fail the viewer.
+	GetDigest(ctx context.Context, digestID int64) (d Digest, ok bool, err error)
+	// ListDigestItems returns a digest's drill-down rows ordered by id ASC.
+	ListDigestItems(ctx context.Context, digestID int64) ([]DigestItem, error)
+	// ListRunDigests returns one run's digests ordered by topic_id ASC;
+	// runID=0 means «легаси, не прогон» and always yields an empty result.
+	ListRunDigests(ctx context.Context, runID int64) ([]Digest, error)
 	// GetMeta reads a scheduler/meta key; ok is false when the key is absent.
 	GetMeta(ctx context.Context, key string) (value string, ok bool, err error)
 	// SetMeta upserts a scheduler/meta key.

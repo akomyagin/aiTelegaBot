@@ -110,3 +110,38 @@ func Render(summary string, items []feed.Item, now time.Time) string {
 		len(items),
 	)
 }
+
+// TrackedSource couples a feed.Source with its storage identity (Stage 8 C,
+// plan §4.2). SourceID 0 = no DB row (e.g. a static source that failed to
+// upsert); TopicID 0 → «Без темы» (topic 1). C1: the type is defined but Run
+// does NOT use it yet — the SourceProvider signature switch lands in C2.
+type TrackedSource struct {
+	Src      feed.Source
+	SourceID int64
+	TopicID  int64
+}
+
+// taggedSource wraps a feed.Source and stamps SourceID/TopicID onto a COPY of
+// the collected items (§4.2). The originals are never mutated: static sources
+// are reused across runs. The inner error is returned as-is together with the
+// (possibly partial) stamped items — feed.Collect's partial-fail semantics
+// (items + err simultaneously). C1: not wired into Run yet (C2 does that).
+type taggedSource struct {
+	inner             feed.Source
+	sourceID, topicID int64
+}
+
+// Name delegates to the inner source.
+func (t taggedSource) Name() string { return t.inner.Name() }
+
+// Collect stamps provenance onto a copy of the inner items.
+func (t taggedSource) Collect(ctx context.Context) ([]feed.Item, error) {
+	items, err := t.inner.Collect(ctx)
+	stamped := make([]feed.Item, len(items))
+	copy(stamped, items)
+	for i := range stamped {
+		stamped[i].SourceID = t.sourceID
+		stamped[i].TopicID = t.topicID
+	}
+	return stamped, err
+}

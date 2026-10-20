@@ -31,8 +31,8 @@ func makeV2DB(t *testing.T, path string) {
 	}
 }
 
-// TestMigrate_V3OnTopOfV2: opening a v2 database applies migration v3
-// (user_version=3), legacy sources get origin='dynamic' and topic_id NULL
+// TestMigrate_V3OnTopOfV2: opening a v2 database applies migrations v3+v4
+// (user_version=4 — v4 applies on top of v3), legacy sources get origin='dynamic' and topic_id NULL
 // (read back as 1 via COALESCE), and the "Без темы" seed row exists.
 func TestMigrate_V3OnTopOfV2(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "v2.db")
@@ -48,8 +48,8 @@ func TestMigrate_V3OnTopOfV2(t *testing.T) {
 	if err := st.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatalf("read user_version: %v", err)
 	}
-	if version != 3 {
-		t.Errorf("user_version = %d, want 3", version)
+	if version != 4 {
+		t.Errorf("user_version = %d, want 4", version)
 	}
 
 	// Raw check: legacy row keeps its data, origin defaults, topic NULL.
@@ -100,8 +100,8 @@ func TestMigrate_V3OnTopOfV2(t *testing.T) {
 	if err := st2.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatalf("read user_version after reopen: %v", err)
 	}
-	if version != 3 {
-		t.Errorf("user_version after reopen = %d, want 3", version)
+	if version != 4 {
+		t.Errorf("user_version after reopen = %d, want 4", version)
 	}
 }
 

@@ -28,6 +28,11 @@ type Item struct {
 	Text      string // body / abstract / message text
 	Published time.Time
 	ID        string // message ID for Telegram sources (tg_botapi, tg_public)
+	// Stage 8 C (§4.2): provenance stamped by digest.taggedSource at collect
+	// time. 0 = «не проставлен»: SourceID 0 → no DB row, TopicID 0 → «Без
+	// темы» (topic 1). DedupKey deliberately does NOT use these fields.
+	SourceID int64
+	TopicID  int64
 }
 
 // DedupKey returns the stable key used to skip already-seen items across runs
