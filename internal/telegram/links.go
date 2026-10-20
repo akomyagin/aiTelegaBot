@@ -133,3 +133,36 @@ func validTmeUsername(s string) bool {
 	}
 	return true
 }
+
+// DeepLink builds the t.me deep link of a message from its stored tg_peer
+// (Stage 8 D, план §D) — the inverse of ParseTmeLink, kept symmetric to it.
+// tgPeer is the digest_items.tg_peer form: a username (with or without '@')
+// → public link https://t.me/<user>/<msgID>; the Bot-API "-100X" form →
+// private link https://t.me/c/<X>/<msgID> (the -100 prefix is stripped
+// locally, mirroring mtproto.ToMTProtoID WITHOUT importing mtproto).
+// Garbage yields "": empty peer, msgID <= 0, a non-numeric/zero/oversized
+// remainder after the -100 strip, or a peer that is not a valid username
+// (the same validTmeUsername check ParseTmeLink applies).
+func DeepLink(tgPeer string, msgID int64) string {
+	if msgID <= 0 {
+		return ""
+	}
+	peer := strings.TrimSpace(tgPeer)
+	if peer == "" {
+		return ""
+	}
+	if rest, ok := strings.CutPrefix(peer, "-100"); ok {
+		x, err := strconv.ParseInt(rest, 10, 64)
+		// The upper bound mirrors ParseTmeLink/mtproto.ToMTProtoID: X >= 1e12
+		// is not a valid channel id.
+		if err != nil || x <= 0 || x >= tmeChannelOffset {
+			return ""
+		}
+		return "https://t.me/c/" + strconv.FormatInt(x, 10) + "/" + strconv.FormatInt(msgID, 10)
+	}
+	user := strings.TrimPrefix(peer, "@")
+	if !validTmeUsername(user) {
+		return ""
+	}
+	return "https://t.me/" + user + "/" + strconv.FormatInt(msgID, 10)
+}

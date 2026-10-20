@@ -70,6 +70,11 @@ type Bot struct {
 	// (Stage 8 C, план §C — restart-safe: no in-memory run snapshots);
 	// nil => the view degrades to «Просмотр дайджеста недоступен.»
 	digestViewer DigestViewer
+	// drillDown resolves L2:/L3: drill-down callbacks (Stage 8 D, план §D);
+	// nil => the view degrades to ack + «Drill-down недоступен.» (seam
+	// опционален до wiring'а D-2). Аргументы data парсит сторона seam'а —
+	// telegram передаёт q.Data как есть, включая мусор.
+	drillDown DrillDown
 
 	// Dialogs snapshot + rate limit (plan §4.6: at most one real GetDialogs
 	// per 30s; repeated calls reuse the last successful snapshot).
@@ -282,6 +287,39 @@ type DigestViewer func(ctx context.Context, req DigestViewRequest) (view DigestV
 // WithDigestViewer wires the T:/TOC: callback views (Stage 8 C).
 func WithDigestViewer(fn DigestViewer) Option {
 	return func(b *Bot) { b.digestViewer = fn }
+}
+
+// EditMessage is the edit half of a drill-down result (Stage 8 D, план §D):
+// Text is ready HTML (the caller escapes; telegram does NOT re-escape),
+// Buttons replace the edited message's keyboard (empty Buttons → the old
+// keyboard is CLEARED, unlike the nil-markup «leave as is» of the A2/B/C
+// branches).
+type EditMessage struct {
+	Text    string
+	Buttons [][]InlineButton
+}
+
+// CallbackResult is what a DrillDown seam returns. AckText goes into
+// AnswerCallbackQuery (always — every callback is acked, план §4.7); Edit is
+// nil for «ack only» (nothing to edit).
+type CallbackResult struct {
+	AckText string
+	Edit    *EditMessage // nil → только ack, без edit
+}
+
+// DrillDown resolves an "L2:…" / "L3:…" callback (Stage 8 D). data is the raw
+// callback_data INCLUDING the prefix — parsing/validation of the arguments is
+// the seam's job (D-2: digest.NewDrillDown), telegram dispatches on the prefix
+// only. The owner-check, the ack-before-edit order and the inaccessible-message
+// guard live in the shared handleCallbackQuery contour.
+type DrillDown func(ctx context.Context, data string) (*CallbackResult, error)
+
+// WithDrillDown wires the L2:/L3: drill-down seam (Stage 8 D). Without it
+// those callbacks degrade to ack + «Drill-down недоступен.» — сборка и
+// поведение остальных префиксов не меняются. L1: is NOT routed here: it is an
+// alias of the T: viewer path.
+func WithDrillDown(fn DrillDown) Option {
+	return func(b *Bot) { b.drillDown = fn }
 }
 
 // DeliverWithButtons sends text with an inline keyboard built from buttons
