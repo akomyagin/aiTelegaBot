@@ -1159,7 +1159,9 @@ CallbackResult, DeepLink — D).
 2. *storage/digests_test.go:* InsertDigest — delivered=0, id последовательны;
    MarkDelivered — одна транзакция: delivered=1, строки digest_items,
    seen_items (последующий FilterUnseen возвращает пусто); SourceID=0 → NULL;
-   rollback при ошибке (битый item: пустой dedup_key нарушает NOT NULL);
+   rollback при ошибке (способ воспроизведения: DROP TABLE digest_items
+   внутри живой tx роняет prepared-insert; «пустой dedup_key» НЕ работает —
+   '' не нарушает NOT NULL в SQLite, поправка по факту реализации C1);
    GetDigest ok / not-ok (crafted id — без ошибки); ListDigestItems — порядок
    id ASC; ListRunDigests — два прогона не смешиваются, порядок topic_id ASC,
    runID=0 → пусто; restart-survival: Close → Open → GetDigest+ListDigestItems
