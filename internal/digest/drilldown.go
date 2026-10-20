@@ -31,8 +31,9 @@ const (
 	// l2BtnSuffix/l2BtnBudget — лейбл кнопки секции «<источник> → сообщения».
 	// УТОЧНЕНИЕ ПЛАНА: план писал «≤60 рун» ДО урока A2 H1 — лимит Bot API
 	// 64 БАЙТА, поэтому бюджет динамической части байтовый:
-	// 64 − len(" → сообщения") − len("…") (TruncateButtonLabelTo режет на
-	// границе рун и дописывает "…" только при обрезке).
+	// 64 − len(" → сообщения") − len("…") = 64 − 23 − 3 = 38 (worst-case
+	// лейбл 38+3+23 = ровно 64; TruncateButtonLabelTo режет на границе рун
+	// и дописывает "…" только при обрезке). Не «правь» 38 вверх — впритык.
 	l2BtnSuffix = " → сообщения"
 	l2BtnBudget = 64 - len(l2BtnSuffix) - len("…")
 	// drillBackLabel — кнопка «назад»: из L2 в L1, из L3 в L2 (§4.4).
@@ -230,7 +231,9 @@ func renderDrillL2(topicName string, sections []l2Section, digestID int64) *tele
 
 	if len(sections) > l2MaxSections {
 		return &telegram.CallbackResult{Edit: &telegram.EditMessage{
-			Text: header + "\n\n" + l2TooManyNote,
+			// Ревью D L3: ветка тоже проходит guard 4096 (гигантское имя
+			// темы + пометка теоретически могут выйти за лимит).
+			Text: fitDrillDownList(header, []string{l2TooManyNote}, "\n\n"),
 			Buttons: [][]telegram.InlineButton{
 				{{Text: "Общий список", Data: "L3:" + did + ":0"}},
 				back,
@@ -254,10 +257,16 @@ func renderDrillL2(topicName string, sections []l2Section, digestID int64) *tele
 			b.WriteString(telegram.EscapeHTML(line))
 		}
 		blocks = append(blocks, b.String())
-		buttons = append(buttons, []telegram.InlineButton{{
-			Text: telegram.TruncateButtonLabelTo(s.Name, l2BtnBudget) + l2BtnSuffix,
-			Data: "L3:" + did + ":" + strconv.FormatInt(s.SourceID, 10),
-		}})
+		// Ревью D M1: SourceID==0 — элементы с неизвестной принадлежностью
+		// (NULL source_id → COALESCE 0), а «L3:<did>:0» — сентинел «ВСЕ
+		// элементы». Кнопка секции обещала бы фильтр, открывая общий список,
+		// поэтому для 0-секции кнопки нет (текст секции остаётся).
+		if s.SourceID != 0 {
+			buttons = append(buttons, []telegram.InlineButton{{
+				Text: telegram.TruncateButtonLabelTo(s.Name, l2BtnBudget) + l2BtnSuffix,
+				Data: "L3:" + did + ":" + strconv.FormatInt(s.SourceID, 10),
+			}})
+		}
 	}
 	buttons = append(buttons, back)
 
@@ -283,7 +292,13 @@ func renderDrillL3(headerName string, items []storage.DigestItem, digestID int64
 	for _, it := range items {
 		var b strings.Builder
 		b.WriteString("• ")
-		title := telegram.EscapeHTML(it.Title)
+		// Ревью D L7: пустой title при живой ссылке дал бы пустой <a></a> —
+		// fallback на placeholder, строка остаётся кликабельной.
+		raw := strings.TrimSpace(it.Title)
+		if raw == "" {
+			raw = "(без заголовка)"
+		}
+		title := telegram.EscapeHTML(raw)
 		if link := l3Link(it); link != "" {
 			b.WriteString(`<a href="`)
 			b.WriteString(link)

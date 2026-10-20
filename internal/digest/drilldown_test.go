@@ -230,13 +230,63 @@ func TestRenderDrillL2_TooManySections(t *testing.T) {
 func TestRenderDrillL2_LongLabelTruncated(t *testing.T) {
 	// Урок A2 H1: бюджет лейбла БАЙТОВЫЙ — длинное имя режется на границе
 	// рун с «…», итог ≤64 байт.
-	long := strings.Repeat("я", 40) // 80 байт > бюджета 36
+	long := strings.Repeat("я", 40) // 80 байт > бюджета 38 (64−23−3)
 	label := telegram.TruncateButtonLabelTo(long, l2BtnBudget) + l2BtnSuffix
 	if len(label) > 64 {
 		t.Fatalf("label %d bytes > 64", len(label))
 	}
 	if !strings.HasSuffix(label, l2BtnSuffix) || !strings.Contains(label, "…") {
 		t.Fatalf("label %q: want truncation ellipsis before suffix", label)
+	}
+}
+
+// Ревью D M1: секция с SourceID==0 (NULL source_id → COALESCE 0) НЕ получает
+// кнопку — «L3:<did>:0» сентинел «все элементы», кнопка обещала бы фильтр.
+func TestRenderDrillL2_ZeroSourceNoButton(t *testing.T) {
+	res := renderDrillL2("Тема", []l2Section{
+		{SourceID: 0, Name: "источник #0", Items: []storage.DigestItem{{Title: "a"}}},
+		{SourceID: 7, Name: "habr", Items: []storage.DigestItem{{Title: "b"}}},
+	}, 42)
+	if res.Edit == nil {
+		t.Fatal("nil Edit")
+	}
+	if !strings.Contains(res.Edit.Text, "источник #0") {
+		t.Error("нулевая секция должна остаться в тексте")
+	}
+	for _, row := range res.Edit.Buttons {
+		for _, b := range row {
+			if b.Data == "L3:42:0" {
+				t.Errorf("кнопка-сентинел %q для нулевой секции недопустима", b.Data)
+			}
+		}
+	}
+	want := map[string]bool{"L3:42:7": false, "L1:42": false}
+	for _, row := range res.Edit.Buttons {
+		for _, b := range row {
+			if _, ok := want[b.Data]; ok {
+				want[b.Data] = true
+			}
+		}
+	}
+	for data, seen := range want {
+		if !seen {
+			t.Errorf("ожидалась кнопка %q", data)
+		}
+	}
+}
+
+// Ревью D L7: пустой title при живой ссылке → «(без заголовка)» внутри <a>,
+// а не пустая entity.
+func TestRenderDrillL3_EmptyTitlePlaceholder(t *testing.T) {
+	res := renderDrillL3("src", []storage.DigestItem{
+		{Title: "   ", URL: "https://x.dev/a", Snippet: "s"},
+		{Title: "", TgPeer: "durov", TgMsgID: 5},
+	}, 42)
+	if !strings.Contains(res.Edit.Text, `<a href="https://x.dev/a">(без заголовка)</a>`) {
+		t.Errorf("want placeholder anchor, got:\n%s", res.Edit.Text)
+	}
+	if !strings.Contains(res.Edit.Text, `<a href="https://t.me/durov/5">(без заголовка)</a>`) {
+		t.Errorf("want placeholder deep-link anchor, got:\n%s", res.Edit.Text)
 	}
 }
 
