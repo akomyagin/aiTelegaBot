@@ -34,8 +34,10 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	}
 	defer func() { _ = store.Close() }()
 
-	// LLM: BYOK — offline summarizer when no key is configured.
-	var summarizer llm.Summarizer
+	// LLM: BYOK — offline summarizer when no key is configured. Stage 8 C:
+	// типизируется TopicSummarizer (плоский Summarizer pipeline больше не
+	// нужен); *llm.Client и *llm.Offline реализуют оба интерфейса.
+	var summarizer llm.TopicSummarizer
 	if cfg.Offline {
 		slog.Info("no LLM API key configured; using offline summarizer")
 		summarizer = llm.NewOffline()
@@ -174,26 +176,18 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		slog.Info("pruned orphaned static sources", "removed", removed)
 	}
 
-	// sourceProvider returns the source set for each run: the static config layer
-	// plus a fresh snapshot of enabled DB-backed sources. Called once per Run, so
-	// sources added via /addsource are picked up without a restart.
-	sourceProvider := func(ctx context.Context) ([]feed.Source, error) {
-		dbRows, err := store.ListSources(ctx)
-		if err != nil {
-			return nil, err
-		}
-		dyn := buildDynamicSources(dbRows, hc, tgLimit, channelBuf, mtClient, mtLimit)
-		// Static first, then dynamic; order is cosmetic (dedup handles overlap).
-		all := make([]feed.Source, 0, len(staticSources)+len(dyn))
-		all = append(all, staticSources...)
-		all = append(all, dyn...)
-		return all, nil
-	}
+	// sourceProvider returns the tracked source set for each run: the static
+	// config layer (SourceID/TopicID из строк origin='static' по (kind, ref))
+	// plus a fresh snapshot of enabled DB-backed sources. Called once per Run,
+	// so sources added via /addsource are picked up without a restart. Stage 8
+	// C: одна выборка ListSources на прогон (newSourceProvider, тест-кейс 7).
+	sourceProvider := newSourceProvider(store, staticSources, staticRefs,
+		hc, tgLimit, channelBuf, mtClient, mtLimit)
 
 	pipeline := &digest.Pipeline{
 		SourceProvider: sourceProvider,
 		Store:          store,
-		Summarize:      summarizer,
+		TopicSummary:   summarizer,
 		ChatID:         cfg.TelegramChatID,
 	}
 
@@ -248,6 +242,10 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		telegram.WithTopicLister(newTopicLister(store)),
 		telegram.WithTopicCreator(newTopicCreator(store)),
 		telegram.WithTopicBinder(newTopicBinder(store)),
+		// Stage 8 C: T:/TOC:-навигация дайджеста — данные строго из SQLite
+		// (digest_nav.go), поэтому опция проводится всегда (store есть в
+		// любом режиме) и переживает рестарт бота.
+		telegram.WithDigestViewer(newDigestViewer(store)),
 	}
 	// Suggested-поток (§4.11, ревью M1): опция проводится ТОЛЬКО для
 	// сетевого LLM-клиента (*llm.Client). llm.Offline тоже реализует
@@ -274,7 +272,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	if err != nil {
 		return err
 	}
-	pipeline.Deliver = bot
+	pipeline.Poster = bot
 
 	// Bridge SQLite meta to the scheduler for slot idempotency across restarts.
 	getSlot := func(ctx context.Context) (string, error) {

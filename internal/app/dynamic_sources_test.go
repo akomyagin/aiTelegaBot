@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/akomyagin/aiTelegaBot/internal/digest"
 	"github.com/akomyagin/aiTelegaBot/internal/feed"
 	"github.com/akomyagin/aiTelegaBot/internal/mtproto"
 	"github.com/akomyagin/aiTelegaBot/internal/storage"
@@ -31,7 +32,7 @@ func TestBuildDynamicSources_Kinds(t *testing.T) {
 	mtClient := newTestMTClient(t)
 	rows := []storage.Source{
 		{ID: 1, Kind: "rss", Ref: "https://example.com/feed.xml", Enabled: true},
-		{ID: 2, Kind: "tg_public", Ref: "chan", Enabled: true},
+		{ID: 2, Kind: "tg_public", Ref: "chan", Enabled: true, TopicID: 5},
 		{ID: 3, Kind: "tg_botapi", Ref: "managed", Enabled: true},
 		{ID: 4, Kind: "tg_botapi", Ref: "-1001234567890", Enabled: true},  // private bot-admin chat
 		{ID: 5, Kind: "tg_mtproto", Ref: "-1001234567890", Enabled: true}, // numeric -> PeerSource
@@ -45,29 +46,36 @@ func TestBuildDynamicSources_Kinds(t *testing.T) {
 	if len(out) != 6 {
 		t.Fatalf("got %d sources, want 6 (disabled and unknown skipped): %v", len(out), names(out))
 	}
-	if _, ok := out[0].(*feed.RSSSource); !ok {
-		t.Errorf("rss row: got %T, want *feed.RSSSource", out[0])
+	if _, ok := out[0].Src.(*feed.RSSSource); !ok {
+		t.Errorf("rss row: got %T, want *feed.RSSSource", out[0].Src)
 	}
-	if _, ok := out[1].(*telegram.PublicSource); !ok {
-		t.Errorf("tg_public row: got %T, want *telegram.PublicSource", out[1])
+	// Stage 8 C: SourceID/TopicID приходят из строки БД.
+	if out[0].SourceID != 1 || out[0].TopicID != 0 {
+		t.Errorf("rss row tracked = (%d,%d), want (1,0)", out[0].SourceID, out[0].TopicID)
 	}
-	ms, ok := out[2].(*telegram.ManagedSource)
+	if _, ok := out[1].Src.(*telegram.PublicSource); !ok {
+		t.Errorf("tg_public row: got %T, want *telegram.PublicSource", out[1].Src)
+	}
+	if out[1].SourceID != 2 || out[1].TopicID != 5 {
+		t.Errorf("tg_public row tracked = (%d,%d), want (2,5)", out[1].SourceID, out[1].TopicID)
+	}
+	ms, ok := out[2].Src.(*telegram.ManagedSource)
 	if !ok {
-		t.Fatalf("tg_botapi row: got %T, want *telegram.ManagedSource", out[2])
+		t.Fatalf("tg_botapi row: got %T, want *telegram.ManagedSource", out[2].Src)
 	}
 	if ms.Name() != "@managed" {
 		t.Errorf("tg_botapi name = %q, want @managed", ms.Name())
 	}
-	if _, ok := out[3].(*telegram.ManagedSource); !ok {
-		t.Errorf("tg_botapi numeric row: got %T, want *telegram.ManagedSource", out[3])
-	} else if out[3].Name() != "-1001234567890" {
-		t.Errorf("tg_botapi numeric name = %q, want the numeric ref", out[3].Name())
+	if _, ok := out[3].Src.(*telegram.ManagedSource); !ok {
+		t.Errorf("tg_botapi numeric row: got %T, want *telegram.ManagedSource", out[3].Src)
+	} else if out[3].Src.Name() != "-1001234567890" {
+		t.Errorf("tg_botapi numeric name = %q, want the numeric ref", out[3].Src.Name())
 	}
-	if _, ok := out[4].(*mtproto.PeerSource); !ok {
-		t.Errorf("tg_mtproto numeric row: got %T, want *mtproto.PeerSource", out[4])
+	if _, ok := out[4].Src.(*mtproto.PeerSource); !ok {
+		t.Errorf("tg_mtproto numeric row: got %T, want *mtproto.PeerSource", out[4].Src)
 	}
-	if _, ok := out[5].(*mtproto.ChannelSource); !ok {
-		t.Errorf("tg_mtproto @username row: got %T, want *mtproto.ChannelSource", out[5])
+	if _, ok := out[5].Src.(*mtproto.ChannelSource); !ok {
+		t.Errorf("tg_mtproto @username row: got %T, want *mtproto.ChannelSource", out[5].Src)
 	}
 }
 
@@ -82,8 +90,8 @@ func TestBuildDynamicSources_NilMTClientSkipsMTProto(t *testing.T) {
 	if len(out) != 1 {
 		t.Fatalf("got %d sources, want 1 (tg_mtproto skipped): %v", len(out), names(out))
 	}
-	if _, ok := out[0].(*telegram.PublicSource); !ok {
-		t.Errorf("got %T, want *telegram.PublicSource", out[0])
+	if _, ok := out[0].Src.(*telegram.PublicSource); !ok {
+		t.Errorf("got %T, want *telegram.PublicSource", out[0].Src)
 	}
 }
 
@@ -105,10 +113,10 @@ func TestManagedSourceNameKey(t *testing.T) {
 	}
 }
 
-func names(srcs []feed.Source) []string {
+func names(srcs []digest.TrackedSource) []string {
 	out := make([]string, 0, len(srcs))
 	for _, s := range srcs {
-		out = append(out, s.Name())
+		out = append(out, s.Src.Name())
 	}
 	return out
 }

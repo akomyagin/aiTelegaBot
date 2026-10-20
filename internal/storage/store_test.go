@@ -85,12 +85,8 @@ func TestSQLiteStore(t *testing.T) {
 		t.Fatalf("mixed filter wrong: %+v", got)
 	}
 
-	// 5. SaveDigest.
-	if err := store.SaveDigest(ctx, "body text", 3); err != nil {
-		t.Fatalf("SaveDigest: %v", err)
-	}
-
-	// 6. GetMeta/SetMeta round-trip.
+	// 5. GetMeta/SetMeta round-trip. (SaveDigest удалён в Stage 8 C2: дайджесты
+	// пишутся InsertDigest/MarkDelivered — покрыто digests_test.go.)
 	if _, ok, err := store.GetMeta(ctx, "last_run"); err != nil || ok {
 		t.Fatalf("GetMeta absent: ok=%v err=%v", ok, err)
 	}

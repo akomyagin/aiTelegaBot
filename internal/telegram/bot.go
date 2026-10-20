@@ -66,6 +66,10 @@ type Bot struct {
 	// (ad:/dp:) — the skeleton Stage 8 D extends into the drill-down/topic
 	// dispatcher. It must answer the callback itself.
 	callbackHandler func(ctx context.Context, q *models.CallbackQuery)
+	// digestViewer resolves T:/TOC: callbacks into rendered views from SQLite
+	// (Stage 8 C, план §C — restart-safe: no in-memory run snapshots);
+	// nil => the view degrades to «Просмотр дайджеста недоступен.»
+	digestViewer DigestViewer
 
 	// Dialogs snapshot + rate limit (plan §4.6: at most one real GetDialogs
 	// per 30s; repeated calls reuse the last successful snapshot).
@@ -246,6 +250,97 @@ func (b *Bot) Deliver(ctx context.Context, chatID, text string) error {
 
 // InlineButton is one inline-keyboard button: Text is the label (Bot API
 // limit — 64 BYTES, урок A2 H1), Data is callback_data (≤64 bytes, план §4.4).
-// Stage 8 C1: produced by digest.TOCButtons; DeliverWithButtons wiring and
-// the rest of the view types land in C2 (plan §C).
+// Produced by digest.TOCButtons; delivered by DeliverWithButtons.
 type InlineButton struct{ Text, Data string }
+
+// View kinds of the digest navigation (plan §C): a topic L1 view keyed by
+// digestID, or the run's table of contents keyed by runID.
+const (
+	ViewKindTopic = "topic"
+	ViewKindTOC   = "toc"
+)
+
+// DigestView is a rendered digest navigation view. Text is ready HTML (the
+// caller escapes; telegram does NOT re-escape).
+type DigestView struct {
+	Text    string
+	Buttons [][]InlineButton
+}
+
+// DigestViewRequest identifies the view to render: Kind is ViewKindTopic
+// (ID = digestID) or ViewKindTOC (ID = runID).
+type DigestViewRequest struct {
+	Kind string
+	ID   int64
+}
+
+// DigestViewer resolves a view request from SQLite (app wires it over
+// storage + digest renders — restart-safe, no in-memory snapshots).
+// ok=false → «не найдено» (NOT an error); err → «не удалось открыть».
+type DigestViewer func(ctx context.Context, req DigestViewRequest) (view DigestView, ok bool, err error)
+
+// WithDigestViewer wires the T:/TOC: callback views (Stage 8 C).
+func WithDigestViewer(fn DigestViewer) Option {
+	return func(b *Bot) { b.digestViewer = fn }
+}
+
+// DeliverWithButtons sends text with an inline keyboard built from buttons
+// (one InlineButton row per keyboard row). chatID semantics match Deliver
+// ("" → the owner chat). The transport is the existing sendFn test seam; with
+// neither sendFn nor api set it returns an error (NOT a silent no-op — the
+// pipeline must learn that the delivery failed). ParseMode HTML; empty
+// buttons → no ReplyMarkup.
+func (b *Bot) DeliverWithButtons(ctx context.Context, chatID, text string,
+	buttons [][]InlineButton) error {
+	target := b.chatID
+	if chatID != "" {
+		id, err := strconv.ParseInt(chatID, 10, 64)
+		if err != nil {
+			return fmt.Errorf("telegram deliver: invalid chat id: %w", err)
+		}
+		target = id
+	}
+	kb := inlineKeyboard(buttons)
+
+	if b.sendFn != nil {
+		if err := b.sendFn(ctx, target, text, kb); err != nil {
+			return fmt.Errorf("telegram deliver: %w", err)
+		}
+		return nil
+	}
+	if b.api == nil {
+		return fmt.Errorf("telegram deliver: no transport (neither api nor test seam)")
+	}
+	params := &bot.SendMessageParams{
+		ChatID:    target,
+		Text:      text,
+		ParseMode: models.ParseModeHTML,
+	}
+	if kb != nil {
+		params.ReplyMarkup = kb
+	}
+	if _, err := b.api.SendMessage(ctx, params); err != nil {
+		return fmt.Errorf("telegram deliver: %w", err)
+	}
+	return nil
+}
+
+// inlineKeyboard converts InlineButton rows to the Bot API markup; nil/empty
+// input → nil (message without a keyboard).
+func inlineKeyboard(buttons [][]InlineButton) *models.InlineKeyboardMarkup {
+	if len(buttons) == 0 {
+		return nil
+	}
+	rows := make([][]models.InlineKeyboardButton, 0, len(buttons))
+	for _, row := range buttons {
+		btns := make([]models.InlineKeyboardButton, 0, len(row))
+		for _, b := range row {
+			btns = append(btns, models.InlineKeyboardButton{
+				Text:         b.Text,
+				CallbackData: b.Data,
+			})
+		}
+		rows = append(rows, btns)
+	}
+	return &models.InlineKeyboardMarkup{InlineKeyboard: rows}
+}

@@ -459,7 +459,7 @@ func renderTopicPickerPage(topics []TopicView, sourceID int64, offset int) (stri
 			label = "Тема #" + strconv.FormatInt(t.ID, 10)
 		}
 		rows = append(rows, []models.InlineKeyboardButton{{
-			Text:         truncateButtonLabelTo(label, topicLabelBudget),
+			Text:         TruncateButtonLabelTo(label, topicLabelBudget),
 			CallbackData: cbPrefixTopicSet + sid + ":" + strconv.FormatInt(t.ID, 10),
 		}})
 	}
