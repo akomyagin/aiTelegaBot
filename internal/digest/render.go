@@ -39,6 +39,10 @@ const (
 	// topicBodyFallbackTitles caps the fallback title bullets of
 	// RenderTopicBody (plan C: first 10 items when the headline is empty).
 	topicBodyFallbackTitles = 10
+	// topicHeadlineRunes caps the headline stored in digests.body (review C1
+	// M2). Matches the llm JSON-path cap; the Summarize-fallback and offline
+	// headlines pass through RenderTopicBody, which enforces it for all.
+	topicHeadlineRunes = 800
 )
 
 // RenderTopicBody renders the per-topic L1 header stored verbatim in
@@ -58,6 +62,12 @@ const (
 // изменений; C2 SHOULD передать до 10 заголовков элементов, чтобы ветка
 // работала в проде.
 func RenderTopicBody(topicName, headline string, itemCount int, now time.Time, fallbackTitles ...string) string {
+	// Review C1 M2: digests.body feeds RenderTopicL1 whose guard cuts (or, on
+	// the pre-fix code, panicked near) Telegram's 4096-rune limit — cap the
+	// dynamic parts HERE so the stored body stays well below it: headline to
+	// topicHeadlineRunes (the llm JSON path caps at 800 too, but the
+	// Summarize-fallback and offline paths do not), fallback titles to
+	// topicTitleRunes each (same cap as the L1 item lines).
 	middle := strings.TrimSpace(headline)
 	if middle == "" {
 		lines := make([]string, 0, topicBodyFallbackTitles)
@@ -69,11 +79,11 @@ func RenderTopicBody(topicName, headline string, itemCount int, now time.Time, f
 			if title == "" {
 				continue
 			}
-			lines = append(lines, "• "+telegram.EscapeHTML(title))
+			lines = append(lines, "• "+telegram.EscapeHTML(truncateRunes(title, topicTitleRunes)))
 		}
 		middle = strings.Join(lines, "\n")
 	} else {
-		middle = telegram.EscapeHTML(middle)
+		middle = telegram.EscapeHTML(truncateRunes(middle, topicHeadlineRunes))
 	}
 
 	var b strings.Builder
@@ -125,8 +135,15 @@ func RenderTopicL1(body string, items []storage.DigestItem) string {
 			return full
 		}
 	}
-	// Even the body alone is too long: cut the body on a rune boundary.
+	// The loop above never tests the body ALONE (the last iteration still
+	// appends the «…и ещё N» marker), so body ≤ maxBodyRunes can reach here.
+	// Return it as is; otherwise cut on a rune boundary (review C1 M1: the
+	// previous unconditional r[:maxBodyRunes-1] panicked for bodies in the
+	// ~4081–4094-rune band).
 	r := []rune(body)
+	if len(r) <= maxBodyRunes {
+		return body
+	}
 	return string(r[:maxBodyRunes-1]) + "…"
 }
 
@@ -146,7 +163,9 @@ func RenderTOC(entries []TOCEntry, date string) string {
 	b.WriteString("📋 Дайджест")
 	if date != "" {
 		b.WriteString(" — ")
-		b.WriteString(date)
+		// date comes from time.Format (run time) or a parsed CreatedAt
+		// (restore, C2/D) — escaped defensively (review C1 L4).
+		b.WriteString(telegram.EscapeHTML(date))
 	}
 	b.WriteString("\n\nТем: ")
 	b.WriteString(strconv.Itoa(len(entries)))

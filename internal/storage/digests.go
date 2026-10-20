@@ -79,9 +79,12 @@ func NewDigestItem(it feed.Item, summary string) DigestItem {
 // (plan §4.3: delivery gates persistence).
 func (s *SQLiteStore) InsertDigest(ctx context.Context, runID, topicID int64, body string, itemCount int) (int64, error) {
 	now := time.Now().UTC().Format(time.RFC3339)
+	// topicID 0 → NULL (review C1 L2): reads COALESCE(topic_id,1), so a
+	// literal 0 would bypass the «Без темы» normalization — defense even
+	// though pipeline Run maps 0→1 itself.
 	res, err := s.db.ExecContext(ctx,
 		"INSERT INTO digests(created_at, item_count, body, delivered, topic_id, run_id) VALUES(?,?,?,0,?,?)",
-		now, itemCount, body, topicID, runID)
+		now, itemCount, body, nilIfZero(topicID), runID)
 	if err != nil {
 		return 0, fmt.Errorf("insert digest: %w", err)
 	}
@@ -103,8 +106,14 @@ func (s *SQLiteStore) MarkDelivered(ctx context.Context, digestID int64, items [
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if _, err := tx.ExecContext(ctx, "UPDATE digests SET delivered=1 WHERE id=?", digestID); err != nil {
+	res, err := tx.ExecContext(ctx, "UPDATE digests SET delivered=1 WHERE id=?", digestID)
+	if err != nil {
 		return fmt.Errorf("mark delivered: %w", err)
+	}
+	// Defense (review C1 L1): a missing digest row would silently no-op the
+	// UPDATE and still insert digest_items "nowhere" (FK not enforced).
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return fmt.Errorf("mark delivered: digest %d does not exist", digestID)
 	}
 
 	itemStmt, err := tx.PrepareContext(ctx,

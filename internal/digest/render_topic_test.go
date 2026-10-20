@@ -107,6 +107,55 @@ func TestRenderTopicL1_Overflow(t *testing.T) {
 			t.Error("body cut must end with …")
 		}
 	})
+	// Review C1 M1 regression: bodies in the ~4081–4094-rune band made the
+	// old code panic (slice r[:4095] on a shorter body) when even the
+	// marker-only tail did not fit. The body alone fits → returned as is.
+	t.Run("body_in_panic_band_returned_as_is", func(t *testing.T) {
+		for _, n := range []int{4085, 4090, 4094, 4095, 4096} {
+			body := strings.Repeat("в", n)
+			got := RenderTopicL1(body, []storage.DigestItem{{Title: "Длинный тайтл"}})
+			if r := utf8.RuneCountInString(got); r > 4096 {
+				t.Errorf("n=%d: rune count = %d, want ≤4096", n, r)
+			}
+			if !strings.HasPrefix(got, body) {
+				t.Errorf("n=%d: body must survive verbatim when it fits", n)
+			}
+		}
+	})
+}
+
+// Review C1 M2: RenderTopicBody caps the stored body — headline to 800 runes,
+// fallback titles to 120 each — so digests.body cannot approach the 4096
+// message limit (the Summarize-fallback and offline headlines are uncapped
+// upstream).
+func TestRenderTopicBody_Caps(t *testing.T) {
+	now := time.Date(2024, 1, 15, 10, 0, 0, 0, time.UTC)
+	t.Run("long_headline_capped", func(t *testing.T) {
+		headline := strings.Repeat("x", 900)
+		got := RenderTopicBody("Тема", headline, 3, now)
+		if strings.Contains(got, strings.Repeat("x", 801)) {
+			t.Error("headline must be capped at 800 runes")
+		}
+		if !strings.Contains(got, strings.Repeat("x", 800)) {
+			t.Error("the first 800 headline runes must survive the cap")
+		}
+		if n := utf8.RuneCountInString(got); n > 4096 {
+			t.Errorf("body rune count = %d, want ≤4096", n)
+		}
+	})
+	t.Run("long_fallback_titles_capped", func(t *testing.T) {
+		titles := make([]string, 10)
+		for i := range titles {
+			titles[i] = strings.Repeat("ы", 200)
+		}
+		got := RenderTopicBody("Тема", "", 10, now, titles...)
+		if strings.Contains(got, strings.Repeat("ы", 121)) {
+			t.Error("fallback titles must be capped at 120 runes each")
+		}
+		if n := utf8.RuneCountInString(got); n > 4096 {
+			t.Errorf("body rune count = %d, want ≤4096", n)
+		}
+	})
 }
 
 func TestRenderTOC_Golden(t *testing.T) {
