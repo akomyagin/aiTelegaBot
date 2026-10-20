@@ -16,7 +16,9 @@
    приватные `t.me/c/<id>/<msg>`.
 2. **Темы**: источник принадлежит теме (привязка при добавлении и командами);
    LLM предлагает тему для нового источника, пользователь подтверждает кнопкой.
-3. **Дайджест — отдельное сообщение на каждую тему** (один прогон = N сообщений).
+3. **Дайджест — одно сообщение-оглавление** (§4.11a, решение 2026-10-20):
+   список тем с кнопками «открыть тему»; тема открывается edit'ом того же
+   сообщения (один прогон = одно сообщение).
 4. **Трёхуровневая детализация** у сообщения темы: L1 (сводка темы, кнопка
    «Подробнее») → L2 (саммари по каналам темы) → L3 (список исходных сообщений
    с переходами в чат/канал через t.me deep links, для приватных — `t.me/c/<id>/<msg>`).
@@ -59,8 +61,10 @@
 - `/topics`, `/newtopic`, `/settopic` работают; при добавлении источника LLM
   предлагает тему, подтверждение кнопкой привязывает её; без LLM-ключа —
   детерминированный offline-fallback без падения.
-- Дневной прогон шлёт по одному сообщению на тему (пустые темы пропускаются);
-  сбой доставки одной темы не теряет элементы других и не блокирует слот.
+- Дневной прогон шлёт **одно сообщение-оглавление** (§4.11a): непустые темы
+  списком с кнопками «открыть тему»; сбой темы = её пропуск в оглавлении
+  (элементы не теряются — не seen), сбой доставки оглавления = слот не
+  отмечается.
 - Кнопка «Подробнее» на сообщении темы ведёт L1→L2→L3 и обратно через edit
   того же сообщения; L3 содержит рабочие ссылки на оригиналы; всё переживает
   рестарт процесса (данные в SQLite).
@@ -113,7 +117,9 @@ telegram message_id в БД не нужен.
 ### 4.4. callback_data: формат и лимит 64 байта
 
 ```
-L1-кнопка «Подробнее» на сообщении темы:  "L2:<digestID>"
+Открыть тему из оглавления (C):           "T:<digestID>"
+Назад к оглавлению (C):                   "TOC:<runID>"     (runID = Unix-секунды старта прогона)
+L1-кнопка «Подробнее» в L1-view темы (D): "L2:<digestID>"
 L2-кнопка источника:                      "L3:<digestID>:<sourceID>"
 L2-кнопка «Назад»:                        "L1:<digestID>"
 L3-кнопка «Назад»:                        "L2:<digestID>"
@@ -124,8 +130,13 @@ L3-кнопка «Назад»:                        "L2:<digestID>"
 Пагинация /dialogs:                       "dp:<offset>"
 ```
 
-Худший случай `L3:` + 19 + `:` + 19 = 42 байта < 64. Все id — десятичные, без
-имён/строк. Парсер — `strings.CutPrefix` + `strings.Cut`, не regex.
+Худший случай `L3:` + 19 + `:` + 19 = 42 байта < 64; `TOC:` + 19 = 23 байта
+< 64. Все id — десятичные, без имён/строк. Парсер — `strings.CutPrefix` +
+`strings.Cut`, не regex. Префиксы `T:` и `TOC:` не пересекаются (второй символ
+различается), CutPrefix регистрозависим; в диспетчере `TOC:` проверяется раньше
+`T:` (фиксированный порядок, подэтап C). Отдельный лимит — **текст** кнопки:
+64 БАЙТА (урок A2 H1) — динамические лейблы режутся `TruncateButtonLabelTo`
+по байтовому бюджету на границе рун.
 
 ### 4.5. Per-key ChannelBuffer (закрываем техдолг в A1)
 
@@ -290,6 +301,10 @@ type TopicSummarizer interface {
   не отмечается выполненным.
 
 Решение принято пользователем 2026-10-20 — не переоткрывать без его слова.
+Перепланирование выполнено 2026-10-20 — раздел «Подэтап C» актуализирован
+(решения планировщика зафиксированы в самом разделе: формат восстановления
+оглавления `TOC:<runID>`, колонка `digests.run_id` в миграции v4, отказ от
+нового telegram-транспорта в C в пользу механик A2/B, разбиение на PR C1→C2).
 
 ### 4.11. Поток добавления источника с темой (подэтап B)
 
@@ -685,105 +700,542 @@ ts/tl/tn от owner и не-owner; addSource без LLM-ключа не пада
 
 ---
 
-### Подэтап C — дайджест по темам
+### Подэтап C — дайджест по темам: оглавление одним сообщением
 
-> **Внимание (решение 2026-10-20):** модель доставки — не «N сообщений по
-> темам», а **одно сообщение-оглавление** (§4.11a). Раздел ниже описывает
-> исходный замысел и перед стартом C подлежит переработке планировщиком
-> (Agent `model: "opus"`): запись digests на тему сохраняется, доставка и
-> RenderTopic заменяются рендером оглавления + кнопками `T:<digestID>`.
+> **Раздел перепланирован 2026-10-20** по §4.11a (решение пользователя, не
+> переоткрывать): **одно сообщение-оглавление вместо N сообщений по темам**;
+> каждая тема открывается кнопкой через edit того же сообщения. Ниже — конечная
+> спецификация для холодного Opus-исполнителя (самодостаточная); исходный
+> замысел «сообщение на тему + RenderTopic + кнопка L2: при доставке» полностью
+> заменён. Вопрос §4.11a «тянуть ли EditMessage/AnswerCallback в C» решён:
+> **нового telegram-транспорта в C нет** — используются механики A2/B
+> (`handleCallbackQuery`-цепочка CutPrefix, `answerCallback`,
+> `editCallbackMessage`, `callbackMessage`, seams `sendFn/ackFn/editFn`);
+> абстракция `CallbackResult` и единый диспетчер остаются в D (решение
+> планировщика).
 
-**Файлы:** `digest/pipeline.go` (переписывается Run по §4.9; `TrackedSource`,
-`taggedSource`), `digest/render.go`-часть (Render → `RenderTopic`),
-`llm/topicdigest.go` (новый), `llm/client.go`, `llm/offline.go`,
-`storage/migrate.go` (v4), `storage/digests.go` (новый: InsertDigest,
-MarkDelivered+items, выборки для D), `store.go` (интерфейс: SaveDigest уходит —
-заменяется на InsertDigest/MarkDelivered; `SaveDigest` удалить, обновив вызовы),
-`telegram/bot.go` (`DeliverWithButtons`, тип `InlineButton`),
-`internal/app/app.go` (SourceProvider → TrackedSource; wiring TopicSummarizer),
-golden-файлы `internal/digest/testdata/`.
+**Граница C/D (зафиксирована, не разъезжается; раздел D не правится):**
 
-**Миграция v4:**
+- **В C:** миграция v4; `storage/digests.go` (InsertDigest/MarkDelivered/
+  GetDigest/ListDigestItems/ListRunDigests); удаление `SaveDigest`; поля
+  `feed.Item.SourceID/TopicID` + `digest.TrackedSource`/`taggedSource` (§4.2);
+  перепись `Pipeline.Run` (группировка по темам → оглавление → MarkDelivered
+  по темам); `llm.TopicSummarizer` (client + offline, §4.10); рендеры
+  `RenderTopicBody`/`RenderTopicL1`/`RenderTOC`/`TOCButtons`; telegram:
+  `InlineButton`, `DeliverWithButtons`, callback'и `T:` (L1-view темы) и
+  `TOC:` (назад к оглавлению), seam `WithDigestViewer`; wiring в app; строка
+  /start,/help про дайджест по темам.
+- **В D:** префиксы `L1:`/`L2:`/`L3:`, рендеры L2 (по источникам) и L3 (ссылки
+  на оригиналы), `ListDigestItemsBySource`, `DeepLink`, расширение диспетчера до
+  `CallbackResult`. Выборки `GetDigest`/`ListDigestItems`, перечисленные в
+  разделе D, **создаются в C**; D добавляет только `ListDigestItemsBySource`.
+- **Общий хелпер (дублирование L1-рендера запрещено):** `L1:<digestID>`-
+  восстановление в D ОБЯЗАНО переиспользовать `digest.RenderTopicL1` из C; D
+  лишь добавляет в кнопочный ряд кнопку «Подробнее →» (`L2:<digestID>`) рядом с
+  «◀ К оглавлению» (композиция кнопок — слой D/telegram, сигнатуру хелпера не
+  менять).
+
+**Модель доставки — один прогон Run (§4.11a):**
+
+1. `SourceProvider` → `[]TrackedSource`; collect через обёртки `taggedSource`
+   (stamp'ят `SourceID/TopicID`, §4.2); частичные ошибки collect — Warn, не
+   фатальны (как сейчас).
+2. `FilterUnseen`; **нет свежих элементов → log + `return nil`**: ни
+   оглавления, ни строк digests — семантика текущего шага 3 Run сохраняется.
+3. `ListTopics` один раз → map `id→name`; группировка fresh-элементов по
+   `TopicID` (**0 → 1 «Без темы»**); порядок тем — **id asc** (`slices.Sort`);
+   порядок элементов внутри темы — порядок collect (стабильный, никакой
+   map-итерации). Имя темы отсутствует в map (FK не enforcement'ится) →
+   `Тема #<id>` (решение планировщика).
+4. `runID := now.Unix()` (now — через `p.Now`; один на весь прогон). Решение
+   планировщика: коллизия двух прогонов в одну секунду при single-user и
+   LLM-вызовах практически невозможна, в тестах Now фиксирован.
+5. На каждую тему (последовательный цикл):
+   a. `SummarizeTopic(topicName, items)` (§4.10). Ошибка → `log.Error`,
+      **тема пропускается в оглавлении** (её элементы НЕ seen — подберёт
+      следующий прогон; строка digests не создаётся), цикл продолжается.
+   b. `body := RenderTopicBody(topicName, ts.Headline, len(items), now)`;
+      `InsertDigest(ctx, runID, topicID, body, len(items))` → `digestID`
+      (delivered=0). Ошибка → log, пропуск темы, continue.
+   c. `pending += {digestID, []DigestItem}` (строки — `storage.NewDigestItem`,
+      summary сопоставляется по `ItemSummary.Index`); `entries += TOCEntry`.
+6. **Все темы упали** (fresh есть, entries пуст) → `Run` возвращает ошибку —
+   сохранена семантика текущего pipeline (сегодня fresh + ошибка summarize =
+   ошибка Run) и §4.9 «не доставлена ни одна тема при их наличии». Слот
+   планировщика не отмечается (runJob вызывает setSlot только при успехе —
+   существующее поведение, не трогать).
+7. `text := RenderTOC(entries, date)`, `buttons := TOCButtons(entries)`,
+   `Poster.DeliverWithButtons(ctx, ChatID, text, buttons)`. **Ошибка доставки →
+   `Run` возвращает ошибку** (`deliver toc: %w`): все строки delivered=0,
+   элементы не seen, слот не отмечен; повтор (/digest или catch-up
+   планировщика) собирает новое оглавление.
+8. После успешной доставки — на каждую тему `MarkDelivered(digestID, items)`
+   (одна транзакция: delivered=1 + digest_items + seen_items). Ошибка здесь →
+   **только `log.Error`** (оглавление уже у пользователя; элементы темы
+   останутся unseen и задвоятся в следующем прогоне — принимаемый сценарий,
+   аналог текущего шага 7 Run). `Run` возвращает nil — частичный сбой наверх не
+   уходит (§4.9).
+9. `log.Info("digest delivered", "topics", len(entries), "run_id", runID)`.
+
+Инвариант §4.3 **«доставка гейтит персистенцию»** сохранён: InsertDigest
+(delivered=0) → доставка (оглавление с кнопками `T:<digestID>`) →
+MarkDelivered; «L1-сообщение с кнопкой» из §4.3 в новой модели — кнопка
+оглавления. Формулировки §4.9 про «одно сообщение на тему» устарели —
+каноническая семантика сбоя для C — шаги 5–8 выше (по духу §4.11a).
+
+**Рестарт (rest-семантика, §4.3):** сообщение-оглавление и его кнопки живут в
+чате Telegram; данные для клика `T:`/`TOC:` берутся **из SQLite, не из памяти**
+— после рестарта бота `T:<digestID>` → `GetDigest` + `ListDigestItems` →
+`RenderTopicL1`; `TOC:<runID>` → `ListRunDigests` + `ListTopics` → `RenderTOC`.
+In-memory снапшотов прогона telegram-пакет не хранит. Крайний случай: crash
+между шагами 7 и 8 → строки delivered=0 без digest_items: `T:` рендерит body из
+`digests` без items-блока (решение планировщика: допустимо), элементы подбирает
+следующий прогон в новое оглавление; старое оглавление не обновляется
+(single-user, принимаем).
+
+**Callback-данные C (внесены в §4.4):** открытие темы `T:<digestID>`; назад к
+оглавлению `TOC:<runID>`. Решение планировщика: в `TOC:` несём runID, а не
+digestID, — оглавление это view всего прогона, а digestID потребовал бы
+индиректа через GetDigest и ломался бы на crash-кейсе шага 7–8. Худший случай:
+`TOC:` + 19 цифр = 23 байта < 64. Префиксы `T:`/`TOC:` не пересекаются (второй
+символ различается), CutPrefix регистрозависим; порядок фиксирован: `TOC:`
+проверяется раньше `T:` (читаемость). Конфликтов с ad:/dp:/ts:/tl:/tn: и
+будущими L1:/L2:/L3: нет.
+
+**Миграция v4** (append в конец `migrations` в `internal/storage/migrate.go`;
+v1–v3 не правим никогда):
 
 ```sql
 ALTER TABLE digests ADD COLUMN topic_id INTEGER REFERENCES topics(id);
+ALTER TABLE digests ADD COLUMN run_id   INTEGER NOT NULL DEFAULT 0;
 CREATE TABLE IF NOT EXISTS digest_items (
     id           INTEGER PRIMARY KEY,
     digest_id    INTEGER NOT NULL REFERENCES digests(id),
-    source_id    INTEGER,
+    source_id    INTEGER,                      -- NULL = источник неизвестен (Go 0 → NULL)
     dedup_key    TEXT NOT NULL,
     title        TEXT NOT NULL DEFAULT '',
     url          TEXT NOT NULL DEFAULT '',
-    tg_peer      TEXT NOT NULL DEFAULT '', -- username или -100X
+    tg_peer      TEXT NOT NULL DEFAULT '',     -- username (без @) или "-100X"
     tg_msg_id    INTEGER NOT NULL DEFAULT 0,
-    published_at TEXT NOT NULL DEFAULT '',
-    snippet      TEXT NOT NULL DEFAULT '', -- первые ~200 рун Text
-    summary      TEXT NOT NULL DEFAULT ''  -- LLM-строка элемента (L2)
+    published_at TEXT NOT NULL DEFAULT '',     -- RFC3339 UTC
+    snippet      TEXT NOT NULL DEFAULT '',     -- первые 200 рун Text
+    summary      TEXT NOT NULL DEFAULT ''      -- LLM-строка элемента (для L2 в D)
 );
 CREATE INDEX IF NOT EXISTS digest_items_digest ON digest_items(digest_id);
 ```
 
-**Новые Store-методы:**
+`run_id` — дополнение к исходному плану C (решение планировщика: нужен для
+восстановления оглавления по `TOC:`); в комментарии к блоку v4 повторить стиль
+v3 (ALTER ADD COLUMN с REFERENCES легален — default NULL; FK не enforcement'ится).
+Старые строки digests: `topic_id` NULL, `run_id` 0. **`run_id=0` = «не прогон»**:
+`ListRunDigests(0)` возвращает пустой результат, viewer для такого дайджеста
+кнопку «◀ К оглавлению» не рисует.
+
+**`internal/storage/digests.go` (новый файл) — структуры и точные сигнатуры:**
 
 ```go
-InsertDigest(ctx context.Context, topicID int64, body string, itemCount int) (digestID int64, err error) // delivered=0
-MarkDelivered(ctx context.Context, digestID int64, items []DigestItem) error // tx: delivered=1 + insert digest_items
+type Digest struct {
+    ID        int64
+    RunID     int64
+    TopicID   int64  // читается COALESCE(topic_id, 1)
+    CreatedAt string // RFC3339 UTC
+    ItemCount int
+    Body      string // готовый HTML L1-шапки темы (RenderTopicBody), сохранён при вставке
+    Delivered bool
+}
+
+type DigestItem struct {
+    ID          int64  // 0 при записи; заполняется при чтении
+    SourceID    int64  // 0 ↔ NULL (писать nil-аргументом)
+    DedupKey    string
+    Title       string
+    URL         string
+    TgPeer      string
+    TgMsgID     int64
+    PublishedAt string
+    Snippet     string
+    Summary     string
+}
+
+// Пополнение интерфейса Store (store.go):
+InsertDigest(ctx context.Context, runID, topicID int64, body string, itemCount int) (digestID int64, err error)
+MarkDelivered(ctx context.Context, digestID int64, items []DigestItem) error
+GetDigest(ctx context.Context, digestID int64) (d Digest, ok bool, err error) // ok=false при sql.ErrNoRows — НЕ ошибка (решение планировщика)
+ListDigestItems(ctx context.Context, digestID int64) ([]DigestItem, error)    // ORDER BY id ASC
+ListRunDigests(ctx context.Context, runID int64) ([]Digest, error)            // ORDER BY topic_id ASC; runID=0 → пусто
+
+// Конструктор строки из feed.Item (storage уже импортирует feed):
+func NewDigestItem(it feed.Item, summary string) DigestItem
 ```
 
-`storage.DigestItem` — зеркало строки digest_items (без id). Заполнение из
-`feed.Item`: tg_peer/tg_msg_id — для Kind `tg_*` (Source как username/`-100X`,
-ID → int), snippet — `truncateRunes(Text, 200)`, url — Item.URL.
+- `InsertDigest`: `INSERT INTO digests(created_at, item_count, body, delivered,
+  topic_id, run_id) VALUES(?,?,?,0,?,?)`, created_at — RFC3339 UTC now;
+  возвращает `LastInsertId`.
+- `MarkDelivered` — **одна транзакция**: `UPDATE digests SET delivered=1 WHERE
+  id=?`; prepared-insert строк `digest_items`; prepared
+  `INSERT OR IGNORE INTO seen_items(dedup_key, source_id, seen_at) VALUES(?,?,?)`
+  с source_id = `DigestItem.SourceID` (0 → NULL — решение планировщика:
+  информативнее текущего NULL в MarkSeen). Любая ошибка → rollback, ошибка
+  наружу. `rows.Close()`, ctx везде (§6).
+- `NewDigestItem`: `DedupKey = it.DedupKey()`; `TgPeer`/`TgMsgID` — только для
+  `Kind` с префиксом `tg_`: `TgPeer = strings.TrimPrefix(it.Source, "@")`
+  (у tg_mtproto `Item.Source` уже в форме `-100X` — A1),
+  `TgMsgID = strconv.ParseInt(it.ID, 10, 64)` (ошибка парсинга → 0);
+  `PublishedAt = it.Published.UTC().Format(time.RFC3339)`; `Snippet` — первые
+  200 рун `it.Text` (локальный helper `truncateRunes` в storage — llm-версия
+  неэкспортирована, дублирование 5 строк приемлемо); `Summary` — из аргумента.
+- **`SaveDigest` удалить** из интерфейса `Store` и из `SQLiteStore`; вызовы:
+  `pipeline.go` (переписывается) и `store_test.go` (заменить тестами новых
+  методов). `MarkSeen` в интерфейсе остаётся (используется тестами; новый Run
+  его не вызывает — отметка seen живёт внутри MarkDelivered).
 
-**Новый Run (pipeline.go):**
+**Перепись pipeline (`internal/digest/pipeline.go`) — точные типы:**
 
 ```go
-type TrackedSource struct { Src feed.Source; SourceID, TopicID int64 }
-type Pipeline struct {
-    SourceProvider func(ctx context.Context) ([]TrackedSource, error)
-    Store storage.Store
-    Summarize llm.TopicSummarizer   // замена llm.Summarizer
-    Poster  MessagePoster           // ниже
-    ChatID string; Log; Now
+// internal/feed/source.go: Item получает поля SourceID, TopicID int64
+// (0 = «не проставлен»; DedupKey() НЕ меняется; поля аддитивны — остальные
+// пакеты не ломаются).
+
+type TrackedSource struct {
+    Src      feed.Source
+    SourceID int64 // 0 — строки БД нет (например static не upsert'нулся)
+    TopicID  int64 // 0 → «Без темы» (1)
 }
-type MessagePoster interface {     // удовлетворяется *telegram.Bot
-    Deliver(ctx context.Context, chatID, text string) error
+
+type taggedSource struct { // не экспортируется, pipeline.go (§4.2)
+    inner             feed.Source
+    sourceID, topicID int64
+}
+// Name() — делегирование inner. Collect() — вызывает inner, КОПИРУЕТ срез и
+// stamp'ит SourceID/TopicID на копии (исходные Item источника не мутируются:
+// статические источники переиспользуются между прогонами), ошибку inner
+// возвращает как есть вместе с частичными items (семантика partial-fail у
+// feed.Collect сохраняется: items + err одновременно).
+
+type MessagePoster interface { // удовлетворяется *telegram.Bot
     DeliverWithButtons(ctx context.Context, chatID, text string,
         buttons [][]telegram.InlineButton) error
 }
+
+type Pipeline struct {
+    SourceProvider func(ctx context.Context) ([]TrackedSource, error) // был []feed.Source
+    Store          storage.Store
+    TopicSummary   llm.TopicSummarizer // замена Summarize llm.Summarizer
+    Poster         MessagePoster       // замена Deliver telegram.Deliverer
+    ChatID         string
+    Log            *slog.Logger
+    Now            func() time.Time
+}
 ```
 
-Шаги: collect (через taggedSource-обёртки) → FilterUnseen → group by TopicID
-(0→1) → для каждой темы (порядок: topics.id asc, имя берётся запросом/кешем
-ListTopics): SummarizeTopic → RenderTopic → InsertDigest → DeliverWithButtons
-(кнопка «Подробнее» = `L2:<digestID>`) → MarkSeen(элементы темы) →
-MarkDelivered(digestID, items). Ошибка Summarize одной темы — как ошибка
-доставки темы (лог, skip, остальные живут); ошибка шага 1–3 (до цикла) — фатальна.
+`Run` — ровно шаги 1–9 «Модели доставки» выше; ошибки шагов 1–2 и 6–7 фатальны,
+шаг 5 — skip темы, шаг 8 — log-only. `feed.Collect` не трогать: Run сам
+оборачивает каждый `TrackedSource` в `taggedSource` и собирает `[]feed.Source`.
+Плоский `llm.Summarizer` pipeline больше не нужен (fallback живёт внутри
+`llm.Client.SummarizeTopic`); интерфейс `telegram.Deliverer` сохраняется
+(`Bot.Deliver`/`reply` в telegram), но pipeline им больше не пользуется.
+Сопоставление summary: `map[int]string` из `ts.Items` по Index; элемент без
+summary → `DigestItem.Summary = ""` (L2 в D деградирует на title — §4.10).
 
-**RenderTopic** (детерминирован, golden):
+**LLM — `internal/llm/topicdigest.go` (новый файл), §4.10:**
 
+```go
+type ItemSummary struct { Index int; Summary string } // Index — 1-based позиция в items
+type TopicSummary struct {
+    Headline string        // plain text; экранируется слоем рендера, не здесь
+    Items    []ItemSummary
+}
+type TopicSummarizer interface {
+    SummarizeTopic(ctx context.Context, topicName string, items []feed.Item) (TopicSummary, error)
+}
+
+func buildTopicDigestPrompt(topicName string, items []feed.Item) []message // детерминирован
+func parseTopicSummary(content string, n int) (TopicSummary, error)        // n = len(items)
 ```
-📋 <EscapeHTML(topicName)> — <date>
 
-<EscapeHTML(Headline)>
+- System-prompt: требуем **строго JSON**
+  `{"headline":"…","items":[{"index":1,"summary":"…"}]}` — по одному summary на
+  элемент (index — 1-based порядковый номер из списка), headline ≤2–3
+  предложения, **plain text без HTML/маркдауна** (§4.8). User-часть: имя темы +
+  пронумерованные элементы (Title + Text, обрезанный `truncateRunes` до 200) —
+  паттерн `buildTopicPrompt` из topic.go.
+- `parseTopicSummary`: `stripCodeFence` (уже есть) → `json.Unmarshal`; headline
+  trim + **обрезка до 800 рун** (решение планировщика: защита от body >4096);
+  items с Index вне 1..n и дубли Index **отбрасываются** (первый выигрыш);
+  пропущенные индексы — не ошибка. Пустой Headline — не ошибка (у рендера есть
+  fallback-ветка).
+- `Client.SummarizeTopic` (client.go) — паттерн `SuggestTopic` один в один
+  (`maxParseAttempts = 2`): транспортная/HTTP-ошибка из `doWithRetry` → сразу
+  error (после фатальных 400/401 не перезапрашиваем); непарсящийся ответ →
+  Warn-лог + ровно один повтор; **оба непарсящиеся → fallback**:
+  `s, err := c.Summarize(ctx, items)`; err → error наружу; успех →
+  `TopicSummary{Headline: s}` (Items пуст — деградация, не падение, §4.10).
+  API-ключ никогда не логируется.
+- `Offline.SummarizeTopic` (offline.go) — детерминированно (без time/random/
+  map-итерации): Headline = до 3 первых элементов списка `- <Title>` (через
+  "\n", в порядке входа); Items = на каждый элемент `{i+1, extractLead(it.Text)}`,
+  при пустом Text → `it.Title`.
+- **Техдолг B L4 закрывается здесь же:** `Client.Summarize` переводится с
+  инлайн-декода ответа на существующий `extractContent(resp)` (единый путь
+  парсинга; поведение не меняется, client-тесты проходят как раньше).
 
-— N материалов
+**Рендеры — `internal/digest/render.go` (новый файл; старый `Render` из
+pipeline.go удаляется вместе с render_test.go):**
+
+```go
+type TOCEntry struct {
+    DigestID  int64
+    TopicName string
+    ItemCount int
+}
+
+// Сохраняется в digests.body при прогоне (готовый HTML под ParseMode):
+func RenderTopicBody(topicName, headline string, itemCount int, now time.Time) string
+// Формат (golden):
+//   📋 <EscapeHTML(topicName)> — <now.Format("02 Jan 2006")>
+//   (пустая строка)
+//   <EscapeHTML(headline)>       ← при пустом Headline: строки "• <EscapeHTML(title)>"
+//   (пустая строка)                 первых 10 элементов (fallback-ветка, решение
+//   — N материалов                    планировщика; склонения нет — стиль старого Render)
+
+// L1-view темы (клик T: в C, восстановление L1: в D — функция общая):
+func RenderTopicL1(body string, items []storage.DigestItem) string
+// body берётся КАК ЕСТЬ (уже готовый HTML — не экранировать повторно!) +
+// "\n\n" + по элементу "• <EscapeHTML(truncateRunes(Title, 120))>\n"
+// (truncateRunes — локальный helper digest). Items пуст → только body
+// (crash-кейс delivered=0). Guard: итог > 4096 рун → items-блок режется
+// с хвоста по границе рун с пометкой "…и ещё K"; если всё ещё больше —
+// режется body ("…"). Пагинации L1 нет (триггер пересмотра — регулярно
+// режущиеся темы > ~50 элементов).
+
+// Оглавление (golden):
+func RenderTOC(entries []TOCEntry, date string) string
+//   📋 Дайджест — <date>      ← date="" → строка без "— <date>"
+//   (пустая строка)
+//   Тем: N
+//   (пустая строка)
+//   • <b>EscapeHTML(TopicName)</b> — <ItemCount> материалов   ← по теме, порядок entries
+// date при прогоне = now.Format("02 Jan 2006"); при восстановлении = CreatedAt
+// первой строки ListRunDigests, распарсенный RFC3339 и отформатированный так же
+// (ошибка парсинга → date="" — решение планировщика).
+
+// Кнопки оглавления — по одной в ряд:
+func TOCButtons(entries []TOCEntry) [][]telegram.InlineButton
+// {Text: "Открыть: " + telegram.TruncateButtonLabelTo(TopicName, topicOpenBudget),
+//  Data: "T:" + strconv.FormatInt(DigestID, 10)}
+// topicOpenBudget = 64 − len("Открыть: ") − len("…") — БАЙТОВЫЙ бюджет
+// (урок A2 H1: лимит Bot API на текст кнопки — 64 байта, не руны).
 ```
 
-Если `Headline` пуст (fallback без Items) — рендер из заголовков элементов.
-L2/L3-рендеры — в подэтапе D (тот же пакет).
+Решение планировщика: строка оглавления — **имя темы + count**, без headline
+(имя стабильно и коротко, headline — внутри L1; «headline или имя» из §4.11a
+разрешено в пользу имени).
 
-**Тексты /start,/help (C):** «Дайджест приходит отдельным сообщением на каждую
-тему; кнопка «Подробнее» раскрывает детали».
+**Telegram — `bot.go`, `dialogs.go`, `topic_view.go` (новый):**
 
-**Тест-кейсы C:** миграция v4; группировка по темам (фейковый Poster записывает
-порядок и кнопки): 2 темы → 2 сообщения, пустая тема → 0 сообщений, элементы с
-TopicID=0 → «Без темы»; сбой доставки темы 1 → элементы темы 1 не seen, тема 2
-доставлена и seen, `Run` вернул nil; InsertDigest/MarkDelivered roundtrip +
-restart-survival (закрыть/открыть БД, digest_items на месте); golden RenderTopic
-(обычная тема, «Без темы», пустой Headline-fallback); taggedSource stamp'ит
-SourceID/TopicID и не мутирует исходные Item; llm client SummarizeTopic —
-httptest JSON ok/fence/мусор-fallback; offline SummarizeTopic детерминирован
-(два вызова — байт-в-байт); `-race` на параллельный Collect.
+```go
+// bot.go:
+type InlineButton struct{ Text, Data string }
+
+type DigestView struct {
+    Text    string           // готовый HTML (экранирует вызывающий, telegram повторно не экранирует)
+    Buttons [][]InlineButton
+}
+type DigestViewRequest struct {
+    Kind string // ViewKindTopic = "topic" | ViewKindTOC = "toc"
+    ID   int64  // topic → digestID; toc → runID
+}
+// ok=false → «не найдено» (не ошибка); err → «не удалось открыть»:
+type DigestViewer func(ctx context.Context, req DigestViewRequest) (view DigestView, ok bool, err error)
+func WithDigestViewer(fn DigestViewer) Option // поле digestViewer в Bot
+
+func (b *Bot) DeliverWithButtons(ctx context.Context, chatID, text string,
+    buttons [][]InlineButton) error
+// chatID-семантика Deliver ("" → owner-chat); test-seam — СУЩЕСТВУЮЩИЙ sendFn
+// (в его сигнатуре уже есть kb); sendFn==nil && api==nil → error (НЕ тихий
+// no-op: Run обязан узнать о сбое доставки); ParseMode HTML;
+// InlineButton → models.InlineKeyboardButton{Text, CallbackData};
+// len(buttons)==0 → без ReplyMarkup.
+```
+
+- `dialogs.go`: в `handleCallbackQuery` добавить две CutPrefix-ветки **после**
+  ts:/tl:/tn: и **до** fallback `callbackHandler`: сначала
+  `cbPrefixTOC = "TOC:"`, затем `cbPrefixTopicOpen = "T:"`. Существующий
+  `truncateButtonLabelTo` переименовать в экспортируемый
+  **`TruncateButtonLabelTo(s string, budget int) string`** (поведение то же:
+  байтовый бюджет, граница рун, суффикс "…"); `truncateButtonLabel` и
+  `buttonLabelBudget` остаются обёртками над ним.
+- `topic_view.go`: `handleTopicOpen(ctx, q, arg)` и `handleTOC(ctx, q, arg)` —
+  механика A2/B один в один: **сначала `answerCallback(q.ID, "")`** (ack на
+  каждый callback); `callbackMessage(q)` — inaccessible (nil Message) →
+  **ack-only, return**; `strconv.ParseInt(arg, 10, 64)` — ошибка → edit
+  `digestViewBadIDText`; `b.digestViewer == nil` → edit
+  `digestViewUnavailableText`; вызов viewer: err → log.Error + edit
+  `digestViewErrorText`; !ok → edit `digestViewNotFoundText`; ok →
+  `editCallbackMessage(msg, view.Text, kb)` (kb из view.Buttons; пуст → nil).
+  Owner-чек уже есть в общем контуре `handleCallbackQuery` — не дублировать.
+  Константы текстов: `digestViewUnavailableText = "Просмотр дайджеста
+  недоступен."`, `digestViewBadIDText = "❌ Некорректный запрос."`,
+  `digestViewNotFoundText = "ℹ️ Дайджест не найден или устарел."`,
+  `digestViewErrorText = "❌ Не удалось открыть."`.
+  `WithCallbackHandler` не трогать и в app не проводить (это работа D).
+
+**App — `app.go`, `dynamic_sources.go`, `digest_nav.go` (новый):**
+
+- `sourceProvider` возвращает `[]digest.TrackedSource`; **одна выборка
+  `ListSources` на вызов** (уже так — сохранить):
+  - статики: `byRef := map[storage.StaticRef]storage.Source` из dbRows по
+    (Kind, Ref); zip параллельных срезов `staticSources[i]` + `staticRefs[i]` →
+    `TrackedSource{Src, row.ID, row.TopicID}`; строки нет (upsert не
+    сработал/pruning-гонка) → `SourceID=0, TopicID=0` → «Без темы» (решение
+    планировщика: прогон не останавливается); `enabled` static-строки
+    игнорируется, как и раньше (§4.1 — решает config).
+  - динамики: `buildDynamicSources` (dynamic_sources.go) — **сигнатура →
+    `[]digest.TrackedSource`**: `SourceID = ds.ID`, `TopicID = ds.TopicID` из
+    строки; фильтры (disabled, origin='static') не меняются (инвариант B).
+- `pipeline`: поля `SourceProvider` (новая сигнатура), `TopicSummary`
+  (переменная `summarizer` типизируется шире: offline → `llm.NewOffline()`,
+  иначе `*llm.Client` — оба реализуют `TopicSummarizer`), после `NewBot`:
+  `pipeline.Poster = bot` (вместо `pipeline.Deliver = bot`). Wiring
+  `WithTopicSuggestion` (итог B: только для `*llm.Client`) не трогать.
+- `botOpts += telegram.WithDigestViewer(newDigestViewer(store))` — всегда
+  (store есть в любом режиме).
+- `internal/app/digest_nav.go`:
+
+```go
+func newDigestViewer(store *storage.SQLiteStore) telegram.DigestViewer
+```
+
+  - `Kind == ViewKindTopic`: `GetDigest(ID)`; !ok → `(…, false, nil)`;
+    `ListDigestItems(ID)` → `Text = digest.RenderTopicL1(d.Body, items)`;
+    Buttons — один ряд `{Text: "◀ К оглавлению", Data: "TOC:<d.RunID>"}`
+    **только при `d.RunID != 0`** (у легаси-строк оглавления нет — кнопки
+    нет, решение планировщика).
+  - `Kind == ViewKindTOC`: `ID == 0` → `(…, false, nil)`; `ListRunDigests(ID)`
+    (пусто → false); `ListTopics` → map id→name (нет имени → `Тема #<id>`) →
+    `[]digest.TOCEntry` → `Text = digest.RenderTOC(entries, date)` (date из
+    CreatedAt первой строки) + `Buttons = digest.TOCButtons(entries)`.
+  - Ошибки storage → `(DigestView{}, false, err)`; crafted-id не роняют viewer.
+
+**Тексты /start,/help (C — подэтап B обещал добавить строку именно здесь):**
+дописать в оба статических текста (router.go) строку
+`«Дайджест приходит оглавлением: один список тем, каждая открывается кнопкой»`.
+Плейсхолдеры по-прежнему только в квадратных скобках; тексты статические —
+экранирование не требуется (§4.8).
+
+**Файлы C (точный список):**
+
+| Файл | Роль |
+|---|---|
+| `internal/feed/source.go` | Item.SourceID/TopicID (аддитивно) |
+| `internal/storage/migrate.go` | миграция v4 |
+| `internal/storage/digests.go` (новый) | Digest/DigestItem, InsertDigest, MarkDelivered, GetDigest, ListDigestItems, ListRunDigests, NewDigestItem |
+| `internal/storage/store.go` | интерфейс: +5 методов, −SaveDigest (реализация удаляется) |
+| `internal/llm/topicdigest.go` (новый) | TopicSummarizer, TopicSummary/ItemSummary, prompt + парсер |
+| `internal/llm/client.go` | SummarizeTopic; Summarize через extractContent (техдолг B L4) |
+| `internal/llm/offline.go` | Offline.SummarizeTopic |
+| `internal/digest/pipeline.go` | TrackedSource, taggedSource, MessagePoster, новый Run; −Render |
+| `internal/digest/render.go` (новый) | TOCEntry, RenderTopicBody, RenderTopicL1, RenderTOC, TOCButtons |
+| `internal/telegram/bot.go` | InlineButton, DeliverWithButtons, DigestViewer/DigestView/DigestViewRequest, WithDigestViewer |
+| `internal/telegram/dialogs.go` | ветки TOC:/T: в handleCallbackQuery; экспорт TruncateButtonLabelTo |
+| `internal/telegram/topic_view.go` (новый) | handleTopicOpen/handleTOC + константы |
+| `internal/telegram/router.go` | строка /start,/help про дайджест-оглавление |
+| `internal/app/app.go` | sourceProvider → TrackedSource; pipeline.TopicSummary/Poster; WithDigestViewer |
+| `internal/app/dynamic_sources.go` | buildDynamicSources → []digest.TrackedSource |
+| `internal/app/digest_nav.go` (новый) | newDigestViewer(store) |
+| тесты + `internal/digest/testdata/` (создать) | кейсы ниже; render_test.go и pipeline_test.go заменяются |
+
+**Не трогать:** scheduler; `internal/mtproto/*`; config; Dockerfile/compose;
+`topics_admin.go`, `forward.go`, `source_admin.go`, `links.go`; legacy-опции и
+seams A1/A2/B (их «Итоги» — инварианты); файлы раздела D (drilldown.go,
+CallbackResult, DeepLink — D).
+
+**Тест-кейсы C (обязательный перечень; table-driven + golden + temp SQLite +
+`-race`; распределение по C1/C2 — в «Оценке размера» ниже):**
+
+1. *Миграция v4:* поверх v3 → user_version=4, повторный Open идемпотентен;
+   старая строка digests получает topic_id NULL/run_id 0; digest_items и индекс
+   существуют.
+2. *storage/digests_test.go:* InsertDigest — delivered=0, id последовательны;
+   MarkDelivered — одна транзакция: delivered=1, строки digest_items,
+   seen_items (последующий FilterUnseen возвращает пусто); SourceID=0 → NULL;
+   rollback при ошибке (битый item: пустой dedup_key нарушает NOT NULL);
+   GetDigest ok / not-ok (crafted id — без ошибки); ListDigestItems — порядок
+   id ASC; ListRunDigests — два прогона не смешиваются, порядок topic_id ASC,
+   runID=0 → пусто; restart-survival: Close → Open → GetDigest+ListDigestItems
+   на месте.
+3. *pipeline_test.go — реальный Run поверх фейков* (Poster записывает вызовы;
+   Store — настоящая temp SQLite; TopicSummarizer — записывающий фейк; Now
+   фиксирован):
+   - группировка: темы 1 и 5 + элементы TopicID=0 → **одно** сообщение
+     оглавления, entries в порядке 1,5, нули слиты в «Без темы»; кнопки
+     `T:<id1>`, `T:<id5>`; пустая тема (нет fresh-элементов) в оглавление не
+     попадает;
+   - taggedSource: stamp на копии (исходные Item источника не изменены);
+     частичная ошибка источника → items+err оба возвращены;
+   - нет fresh → Poster не вызван, Run=nil, строк digests нет;
+   - частичный сбой: SummarizeTopic темы 1 → error → в оглавлении только тема
+     2; элементы темы 1 НЕ seen (FilterUnseen их видит), темы 2 — seen;
+     Run=nil; строки digests темы 1 нет;
+   - все темы упали → Run вернул ошибку, оглавления нет, элементы не seen
+     (слот не отмечается: runJob ставит setSlot только при успехе —
+     существующее поведение scheduler, нового теста не требует);
+   - DeliverWithButtons → error → Run error, все строки delivered=0, все
+     элементы не seen, MarkDelivered не вызван;
+   - сбой MarkDelivered после успешной доставки → Run=nil, оглавление отправлено;
+   - `-race`: параллельный Collect нескольких taggedSource.
+4. *llm/topicdigest_test.go (httptest):* валидный JSON; JSON в ``` fence;
+   мусор → ровно 2 запроса → fallback Headline=Summarize, Items пуст (сервер
+   считает вызовы); мусор + Summarize-мусор → ошибка; index вне диапазона и
+   дубли → отброшены; headline >800 рун → обрезан; offline: два вызова
+   байт-в-байт; Headline ≤3 строк `- Title`; ItemSummary — первое предложение
+   Text, пустой Text → Title.
+5. *Рендеры (golden, internal/digest/testdata/):* RenderTopicBody — обычная
+   тема, «Без темы», пустой Headline (fallback заголовков); RenderTopicL1 —
+   обычный, пустой items, overflow >4096 («…и ещё K», затем резка body);
+   RenderTOC — 1 тема, 10 тем, date="" и date задан; TOCButtons — data-формат.
+   *Байт-лимит кнопок:* кириллическое имя темы 30 рун и emoji-имя →
+   `len(button.Text) ≤ 64` БАЙТА (урок A2 H1).
+6. *telegram (seams ackFn/editFn/sendFn):* DeliverWithButtons — chatID ""→
+   owner, невалидный chatID → error, конвертация кнопок в markup, ошибка seam →
+   error наружу, api==nil && sendFn==nil → error; callback T:/TOC: — owner
+   (ack→edit порядок на счётчиках), не-owner (ack «Не ваш бот», без edit),
+   inaccessible (ack-only), нечисловой arg → badID, viewer nil → unavailable,
+   ok=false → notFound, err → errorText, успех → editCallbackMessage c
+   view.Text/Buttons; **после «рестарта»** — тот же store на temp SQLite,
+   новый Bot: T: рендерит из БД (данные не из памяти).
+7. *app:* newDigestViewer — topic (RunID≠0 → TOC-кнопка; RunID=0 → без
+   кнопки), toc (date из CreatedAt; битый CreatedAt → date=""), miss → ok=false;
+   sourceProvider — ListSources вызван ОДИН раз (счётчик фейка), статики
+   получают SourceID/TopicID из строк, отсутствующая строка → нули, динамики —
+   из своих строк (buildDynamicSources-тест обновить под TrackedSource).
+
+**Критерий готовности C:** `go build ./... && go vet ./... && gofmt -l .` (пусто)
+`&& go test -race ./...` зелёные; golden обновлены осознанно; кейсы 1–7
+покрыты; ручной сценарий минимум один раз до PR (реальный токен): `/digest` →
+оглавление → `T:` открывает тему → `TOC:` возвращает → **рестарт бота** →
+`T:`/`TOC:` работают из БД; offline-режим (без LLM_API_KEY) — детерминированный
+headline без падений. Docs: TECHNICAL_PLAN.md §7 (schema: digests.topic_id/
+run_id, digest_items) и §9 (статус C) — только своя часть.
+
+**Оценка reviewable-размера и разбиение (§8):** оценка ~1800–2200 строк с
+тестами — выше порога ~1500, поэтому **обязательное разбиение на два PR**
+(решение планировщика), порядок сдачи **C1 → C2**:
+
+- **C1 — данные и рендеры, ноль изменения поведения:** feed.Item-поля;
+  миграция v4; storage/digests.go + интерфейс (**SaveDigest пока жив** — старый
+  pipeline компилируется и работает); llm/topicdigest.go + client/offline +
+  техдолг L4; digest/render.go (Render пока жив); типы TrackedSource/
+  taggedSource (не подключены). Тесты: кейсы 1, 2, 4, 5 (golden рендеров).
+  Сборка зелёная, поведение бота не меняется — ревьюится SQL/транзакции/LLM.
+- **C2 — доставка и навигация:** перепись Run (SourceProvider→TrackedSource,
+  Poster, TopicSummary); удаление SaveDigest и старого Render/render_test.go;
+  telegram (InlineButton, DeliverWithButtons, TOC:/T:-ветки,
+  TruncateButtonLabelTo, topic_view.go); app (sourceProvider,
+  dynamic_sources, digest_nav, wiring); тексты /start,/help. Тесты: кейсы 3,
+  6, 7 + restart-survival из кейса 2 на уровне pipeline. Фокус ревью —
+  семантика частичного сбоя (шаги 5–8 модели доставки) и байтовые лимиты
+  кнопок.
 
 ---
 
@@ -894,8 +1346,11 @@ router_test; иначе — на уровне handler-возврата).
    миграцию v2 несёт первый.
 2. **PR A2** — dialogs (небольшой, переиспользует A1).
 3. **PR B** — topics schema+commands+suggestion.
-4. **PR C** — per-topic digest (переписывает pipeline — ревью особенно внимательно
-   к семантике частичного сбоя §4.9).
+4. **PR C1 + PR C2** — per-topic digest: разбиение по разделу подэтапа C
+   «Оценка reviewable-размера и разбиение» (C1 — схема/storage/llm/рендеры без
+   изменения поведения; C2 — перепись pipeline + доставка оглавлением +
+   навигация T:/TOC:; ревью особенно внимательно к семантике частичного сбоя
+   §4.9/§4.11a).
 5. **PR D** — drill-down (только чтение + edit, низкий риск).
 
 Между PR — финальный зелёный прогон в основной сессии и пункт 7 пайплайна
