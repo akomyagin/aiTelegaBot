@@ -246,6 +246,12 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		// (digest_nav.go), поэтому опция проводится всегда (store есть в
 		// любом режиме) и переживает рестарт бота.
 		telegram.WithDigestViewer(newDigestViewer(store)),
+		// Stage 8 D: L2:/L3: drill-down — данные строго из SQLite, как у
+		// C-viewer (digest_nav.go), поэтому опция проводится всегда.
+		// sources-снапшот = store.ListSources: один вызов на рендер
+		// drill-down, БЕЗ кэша — сервис single-user, таблица sources
+		// маленькая, свежее имя важнее экономии запроса.
+		telegram.WithDrillDown(digest.NewDrillDown(store, store.ListSources)),
 	}
 	// Suggested-поток (§4.11, ревью M1): опция проводится ТОЛЬКО для
 	// сетевого LLM-клиента (*llm.Client). llm.Offline тоже реализует
