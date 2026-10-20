@@ -69,6 +69,33 @@ var migrations = []string{
 	ALTER TABLE sources ADD COLUMN origin   TEXT NOT NULL DEFAULT 'dynamic';
 	ALTER TABLE sources ADD COLUMN topic_id INTEGER REFERENCES topics(id);
 	`,
+	// v4 (Stage 8 C): topic digests — one TOC message per run. digests gain
+	// topic_id (NULL on legacy rows ≡ topic 1 — all reads go through
+	// COALESCE(topic_id, 1)) and run_id (Unix seconds of the run; 0 = «легаси,
+	// не прогон»: ListRunDigests(0) always returns nothing). digest_items
+	// stores the per-item drill-down rows rendered on demand (L1/L2/L3 views
+	// are not persisted as messages); source_id NULL = source unknown (Go 0 →
+	// NULL). ALTER TABLE ADD COLUMN with REFERENCES is legal in SQLite
+	// because the column defaults to NULL; FK enforcement is not enabled in
+	// Open, consistent with the rest of the schema.
+	`
+	ALTER TABLE digests ADD COLUMN topic_id INTEGER REFERENCES topics(id);
+	ALTER TABLE digests ADD COLUMN run_id   INTEGER NOT NULL DEFAULT 0;
+	CREATE TABLE IF NOT EXISTS digest_items (
+	    id           INTEGER PRIMARY KEY,
+	    digest_id    INTEGER NOT NULL REFERENCES digests(id),
+	    source_id    INTEGER,
+	    dedup_key    TEXT NOT NULL,
+	    title        TEXT NOT NULL DEFAULT '',
+	    url          TEXT NOT NULL DEFAULT '',
+	    tg_peer      TEXT NOT NULL DEFAULT '',
+	    tg_msg_id    INTEGER NOT NULL DEFAULT 0,
+	    published_at TEXT NOT NULL DEFAULT '',
+	    snippet      TEXT NOT NULL DEFAULT '',
+	    summary      TEXT NOT NULL DEFAULT ''
+	);
+	CREATE INDEX IF NOT EXISTS digest_items_digest ON digest_items(digest_id);
+	`,
 }
 
 // migrate applies pending migrations starting from the current PRAGMA

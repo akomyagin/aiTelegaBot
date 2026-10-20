@@ -58,6 +58,32 @@ func (o *Offline) SuggestTopic(ctx context.Context, existing []string, sample []
 	return "", nil
 }
 
+// SummarizeTopic implements TopicSummarizer offline, deterministically
+// (plan §4.10): Headline — up to 3 first "- <Title>" lines joined by "\n"
+// (input order); Items — the first sentence of Text per item (Title when
+// Text is empty). No time/random/map iteration.
+func (o *Offline) SummarizeTopic(ctx context.Context, topicName string, items []feed.Item) (TopicSummary, error) {
+	_ = ctx
+	_ = topicName
+	const maxHeadlineLines = 3
+	lines := make([]string, 0, maxHeadlineLines)
+	for i, it := range items {
+		if i >= maxHeadlineLines {
+			break
+		}
+		lines = append(lines, "- "+it.Title)
+	}
+	ts := TopicSummary{Headline: strings.Join(lines, "\n")}
+	for i, it := range items {
+		summary := extractLead(it.Text)
+		if summary == "" {
+			summary = it.Title
+		}
+		ts.Items = append(ts.Items, ItemSummary{Index: i + 1, Summary: summary})
+	}
+	return ts, nil
+}
+
 // extractLead takes the first ~leadRunes runes of text, or everything up to the
 // first ". " sentence boundary, whichever is shorter. Deterministic.
 func extractLead(text string) string {

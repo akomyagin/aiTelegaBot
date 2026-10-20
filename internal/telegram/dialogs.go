@@ -440,3 +440,12 @@ func (b *Bot) editCallbackMessage(ctx context.Context, msg *models.Message, text
 		b.log.Error("editing callback message failed", "error", err)
 	}
 }
+
+// TruncateButtonLabelTo is truncateButtonLabelTo exported for the digest
+// renders (plan Stage 8 C: digest.TOCButtons cuts labels to the same byte
+// budget — 64-BYTE Bot API limit, rune-boundary cut, "…" suffix). Behavior is
+// identical; the unexported call sites keep working (full rename per plan
+// happens in C2).
+func TruncateButtonLabelTo(s string, budget int) string {
+	return truncateButtonLabelTo(s, budget)
+}

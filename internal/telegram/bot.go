@@ -243,3 +243,9 @@ func (b *Bot) Deliver(ctx context.Context, chatID, text string) error {
 	}
 	return nil
 }
+
+// InlineButton is one inline-keyboard button: Text is the label (Bot API
+// limit — 64 BYTES, урок A2 H1), Data is callback_data (≤64 bytes, план §4.4).
+// Stage 8 C1: produced by digest.TOCButtons; DeliverWithButtons wiring and
+// the rest of the view types land in C2 (plan §C).
+type InlineButton struct{ Text, Data string }
