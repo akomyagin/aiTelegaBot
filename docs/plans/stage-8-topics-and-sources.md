@@ -635,6 +635,54 @@ offline SuggestTopic == ""; роутер: /topics рендер (golden), /newtop
 ts/tl/tn от owner и не-owner; addSource без LLM-ключа не падает и не шлёт кнопки
 предложения.
 
+**Итог B (реализован 2026-10-20, сдан одним PR):**
+
+- Прогон: build/vet/gofmt чистые, `go test -race` 8/8 пакетов ok; все 18
+  плановых тест-кейсов покрыты (85 новых RUN/PASS, 0 skip) + сверх плана
+  (64-байтовые лейблы кнопок, tl-пагинация goldens, static-фильтры, pruning).
+  Ревью (Opus): 0 high, 4 medium — M1/M3/M4 закрыты фиксами, M2 принят как
+  плановая синхронность; 6 low — L1/L2 исправлены, L3–L6 техдолг/приняты.
+- **Подтверждённые отклонения от плана** (не переоткрывать):
+  - Пагинация пикера тем — свой префикс `tl:<sourceID>:<offset>`, НЕ `dp:`
+    (dp: перерисовывает диалоги A2); механика (кламп, 8/страница, ◀/▶) та же.
+  - Suggested-кнопки только при `SourceID != 0` (created/reactivated);
+    «уже добавлен»/ошибки → старый ответ без кнопок.
+  - kind/ref статиков: rss/arxiv = (вид по «arxiv.org» в URL, полный URL),
+    hn = (hn, "frontpage"), tg_* = username без @; `MTPROTO_CHANNELS` без
+    mtClient НЕ регистрируются, но в pruning keep-set входят (см. ниже).
+  - CreateTopic — INSERT OR IGNORE + SELECT в транзакции (переносимее RETURNING).
+  - Sample для SuggestTopic = trial-элементы пути добавления (фикс M3):
+    `SourceAddResult{ID,Fresh,Sample}` / `ForwardResult.Sample` / seam
+    `TopicSuggester(+sample []feed.Item)`; tg_botapi — всегда пусто (Collect
+    дренировал бы production channelBuf), tg_mtproto — 1 элемент из
+    валидационного GetHistoryByPeer через `mtproto.TrialItem` (второй запрос
+    не делается); `collectTopicSample` удалён.
+  - `WithTopicSuggestion` проводится только для `*llm.Client` (фикс M1):
+    offline — опция не проводится, ноль дополнительных сетевых вызовов.
+  - Pruning осиротевших static-строк при старте (`PruneStaticSources`, фикс
+    M4); keep-set включает `MTPROTO_CHANNELS` даже при mtClient==nil —
+    деградный запуск не теряет привязку topic_id (правка диспетчера сверх
+    рекомендации ревью).
+  - Legacy-опции (WithSourceRemover/WithForwardRegistrar/старый sourceAdder)
+    в telegram сохранены для совместимости, app переведён на V2.
+- **Техдолг B** (триггеры пересмотра):
+  1. M2 принят: suggested-поток синхронен в обработчике апдейта (план §4.11 —
+     одно сообщение «текст+кнопки»); худший случай с LLM-ключом ≈ trial 20с +
+     suggest 15с, апдейты в это время стоят; триггер: таймауты spinner/кнопок
+     в живом использовании → асинхронный вариант (базовый ответ сразу, кнопки
+     edit'ом из горутины).
+  2. L3: TOCTOU newTopicCreator (ListTopics→CreateTopic не атомарны) —
+     single-user, задокументирован в коде.
+  3. L4: extractContent дублирует инлайн-парсинг ответа в Summarize —
+     унифицировать при следующей правке llm (в C).
+  4. L5: `tn:`-callback не валидирует формат sourceID — безвредно (ack-only,
+     состояние не меняется); прикрыть в D при общем диспетчере.
+  5. Неподтверждённые suggested-темы остаются пустыми строками (§4.11 —
+     принимаемый сценарий); авто-prune пустых тем — триггер: >5 пустых тем
+     в /topics.
+- Граница C соблюдена: digest.Pipeline / feed.Item / SourceProvider не
+  тронуты; TopicSummarizer/topicdigest.go не создавались.
+
 ---
 
 ### Подэтап C — дайджест по темам
