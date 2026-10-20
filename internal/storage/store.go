@@ -34,6 +34,14 @@ type Store interface {
 	SetMeta(ctx context.Context, key, value string) error
 	// AddSource inserts an enabled source and returns its new id.
 	AddSource(ctx context.Context, kind, ref string) (int64, error)
+	// AddSourceIfNotExists inserts a source unless (kind, ref) already exists;
+	// a disabled existing row is re-enabled (reactivated=true). Returns the row
+	// id in all cases.
+	AddSourceIfNotExists(ctx context.Context, kind, ref string) (id int64, created bool, reactivated bool, err error)
+	// UpsertPeer inserts or refreshes cached MTProto peer metadata.
+	UpsertPeer(ctx context.Context, peerID, accessHash int64, title, username string) error
+	// GetPeer reads cached MTProto peer metadata; ok=false when unknown.
+	GetPeer(ctx context.Context, peerID int64) (p Peer, ok bool, err error)
 	// ListSources returns all sources ordered by id (enabled and disabled).
 	ListSources(ctx context.Context) ([]Source, error)
 	// DisableSource sets enabled=0 for the given id. Returns (false, nil) when no

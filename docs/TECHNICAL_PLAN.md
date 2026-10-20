@@ -217,6 +217,17 @@ CREATE TABLE IF NOT EXISTS meta (
     key         TEXT PRIMARY KEY,
     value       TEXT NOT NULL
 );
+
+-- v2 (Этап 8, подэтап A1): кеш access_hash приватных пиров MTProto
+-- и гарантия уникальности динамических источников.
+CREATE TABLE IF NOT EXISTS mtproto_peers (
+    peer_id     INTEGER PRIMARY KEY,          -- MTProto id (X из -100X)
+    access_hash INTEGER NOT NULL,
+    title       TEXT NOT NULL DEFAULT '',
+    username    TEXT NOT NULL DEFAULT '',
+    updated_at  TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS sources_kind_ref ON sources(kind, ref);
 ```
 
 Дедуп-ключ (`internal/feed` / `internal/storage`): для веб-источников — канонический

@@ -33,8 +33,13 @@ type Bot struct {
 	listSources  func(ctx context.Context) (string, error)
 	addSource    func(ctx context.Context, kind, ref string) (id int64, freshCount int, err error)
 	removeSource func(ctx context.Context, id int64) (found bool, err error)
-	channelBuf   *ChannelBuffer // nil if no managed channels configured
-	log          *slog.Logger
+	// forwardRegistrar registers a source from a forwarded message (Stage 8
+	// A1); nil => forwards get the "unavailable" refusal.
+	forwardRegistrar ForwardRegistrar
+	channelBuf       *ChannelBuffer // nil if no managed channels configured
+	// deliverFn is a test seam overriding Deliver's transport; nil => b.api.
+	deliverFn func(ctx context.Context, chatID, text string) error
+	log       *slog.Logger
 }
 
 // Option configures the Bot.
@@ -62,10 +67,17 @@ func WithSourceRemover(fn func(ctx context.Context, id int64) (bool, error)) Opt
 	return func(b *Bot) { b.removeSource = fn }
 }
 
-// WithChannelBuffer wires managed-channel posts into a shared buffer drained by
-// ManagedSource. When nil, channel posts are ignored.
+// WithChannelBuffer wires managed-channel posts into a shared per-key buffer
+// drained by ManagedSource. When nil, channel posts are ignored.
 func WithChannelBuffer(buf *ChannelBuffer) Option {
 	return func(b *Bot) { b.channelBuf = buf }
+}
+
+// WithForwardRegistrar wires forwarded messages from the owner to a
+// source-registration closure (Stage 8 A1). The closure receives the
+// extracted origin and returns the reply text shown to the owner.
+func WithForwardRegistrar(fn ForwardRegistrar) Option {
+	return func(b *Bot) { b.forwardRegistrar = fn }
 }
 
 // NewBot builds the Telegram bot over the go-telegram/bot library. The chatID
@@ -103,6 +115,9 @@ func (b *Bot) Run(ctx context.Context) error {
 // Deliver sends text to the given chat. An empty chatID targets the owner chat
 // configured on the bot. Errors are wrapped without exposing the token.
 func (b *Bot) Deliver(ctx context.Context, chatID, text string) error {
+	if b.deliverFn != nil {
+		return b.deliverFn(ctx, chatID, text)
+	}
 	target := b.chatID
 	if chatID != "" {
 		id, err := strconv.ParseInt(chatID, 10, 64)

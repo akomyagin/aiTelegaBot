@@ -10,7 +10,7 @@ import (
 )
 
 func TestChannelPostToItem(t *testing.T) {
-	item := channelPostToItem("mychan", 42, "Hello world\nsecond", 1705309200)
+	item := channelPostToItem("mychan", "mychan", 42, "Hello world\nsecond", 1705309200)
 
 	if item.Kind != "tg_botapi" {
 		t.Errorf("Kind = %q, want tg_botapi", item.Kind)
@@ -26,6 +26,23 @@ func TestChannelPostToItem(t *testing.T) {
 	}
 }
 
+// TestChannelPostToItem_PrivateChat covers the key/username split (Stage 8):
+// a private chat post has no username, so Source is the numeric key and no
+// public t.me URL exists.
+func TestChannelPostToItem_PrivateChat(t *testing.T) {
+	item := channelPostToItem("-1001234567890", "", 7, "Private post", 1705309200)
+
+	if item.Source != "-1001234567890" {
+		t.Errorf("Source = %q, want numeric key", item.Source)
+	}
+	if item.URL != "" {
+		t.Errorf("URL = %q, want empty for private chat", item.URL)
+	}
+	if got := item.DedupKey(); got != "tg:-1001234567890:7" {
+		t.Errorf("DedupKey() = %q", got)
+	}
+}
+
 func TestChannelBuffer_Concurrent(t *testing.T) {
 	buf := &ChannelBuffer{}
 	var wg sync.WaitGroup
@@ -36,18 +53,18 @@ func TestChannelBuffer_Concurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < perGoroutine; i++ {
-				buf.Push(feed.Item{Kind: "tg_botapi", Source: "c", ID: "x"})
+				buf.Push("c", feed.Item{Kind: "tg_botapi", Source: "c", ID: "x"})
 			}
 		}()
 	}
 	wg.Wait()
 
-	got := buf.Drain()
+	got := buf.Drain("c")
 	want := goroutines * perGoroutine
 	if len(got) != want {
 		t.Fatalf("Drain() len = %d, want %d", len(got), want)
 	}
-	if len(buf.Drain()) != 0 {
+	if len(buf.Drain("c")) != 0 {
 		t.Errorf("second Drain() should be empty")
 	}
 }
@@ -59,10 +76,10 @@ func TestChannelBuffer_CapsAtMaxBufferedItems(t *testing.T) {
 	buf := &ChannelBuffer{}
 	total := maxBufferedItems + 50
 	for i := 0; i < total; i++ {
-		buf.Push(feed.Item{ID: fmt.Sprintf("%d", i)})
+		buf.Push("k", feed.Item{ID: fmt.Sprintf("%d", i)})
 	}
 
-	got := buf.Drain()
+	got := buf.Drain("k")
 	if len(got) != maxBufferedItems {
 		t.Fatalf("Drain() len = %d, want %d (capped)", len(got), maxBufferedItems)
 	}
@@ -75,8 +92,8 @@ func TestChannelBuffer_CapsAtMaxBufferedItems(t *testing.T) {
 
 func TestManagedSource_Collect(t *testing.T) {
 	buf := &ChannelBuffer{}
-	buf.Push(feed.Item{Kind: "tg_botapi", ID: "1"})
-	src := NewManagedSource("@chan", buf)
+	buf.Push("chan", feed.Item{Kind: "tg_botapi", ID: "1"})
+	src := NewManagedSource("@chan", "chan", buf)
 
 	items, err := src.Collect(context.Background())
 	if err != nil {
