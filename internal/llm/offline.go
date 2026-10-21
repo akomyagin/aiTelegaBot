@@ -84,6 +84,18 @@ func (o *Offline) SummarizeTopic(ctx context.Context, topicName string, items []
 	return ts, nil
 }
 
+// ClassifySummarize implements ClassifySummarizer offline (план §4.1):
+// детерминированная деградация без сети — все элементы class=other (реклама
+// НЕ фильтруется — осознанно: ложное срабатывание эвристики хуже пропуска),
+// summary = extractLead(Text), при пустом Text — Title. Degraded=true для
+// всех: выход не LLM-качества, pipeline не должен фиксировать его как
+// окончательный (status=done) — см. ClassifyResult. Два вызова на одном входе
+// байт-в-байт одинаковы: нет сети, random, time.Now и map-итерации.
+func (o *Offline) ClassifySummarize(ctx context.Context, items []ClassifyItem) (ClassifyResult, error) {
+	_ = ctx
+	return degradedClassifyResult(items), nil
+}
+
 // extractLead takes the first ~leadRunes runes of text, or everything up to the
 // first ". " sentence boundary, whichever is shorter. Deterministic.
 func extractLead(text string) string {

@@ -96,6 +96,53 @@ var migrations = []string{
 	);
 	CREATE INDEX IF NOT EXISTS digest_items_digest ON digest_items(digest_id);
 	`,
+	// v5 (Этап 9, план §4.2): состояние обработки сообщений, кеш ссылок и их
+	// привязка к сообщениям, общее саммари прогона, полный текст/класс/медиа у
+	// digest_items. message_state — кеш обработки: упавший прогон не теряет
+	// LLM-работу, а следующий не переспрашивает LLM о том же (ключ = dedup_key,
+	// тот же, что в seen_items — «эволюция»: seen_items остаётся таблицей
+	// ДОСТАВКИ (что уже было показано), message_state — таблицей ОБРАБОТКИ (что
+	// уже классифицировано/саммаризовано). digest_items остаётся per-run
+	// снапшотом для навигации. Новые колонки digest_items имеют DEFAULT '' —
+	// legacy-строки читаются как «нет полного текста/класса/медиа».
+	`
+	CREATE TABLE IF NOT EXISTS message_state (
+	    dedup_key  TEXT PRIMARY KEY,
+	    source_id  INTEGER,
+	    topic_id   INTEGER,
+	    class      TEXT NOT NULL DEFAULT '',        -- §4.1; '' = не классифицировано
+	    cluster_id TEXT NOT NULL DEFAULT '',        -- '<runID>:<n>'; '' = не в кластере
+	    is_primary INTEGER NOT NULL DEFAULT 1,      -- 0 = дубль, не показывается
+	    summary    TEXT NOT NULL DEFAULT '',        -- саммари сообщения (1–2 предложения)
+	    media_kind TEXT NOT NULL DEFAULT '',        -- '' | 'photo'
+	    media_ref  TEXT NOT NULL DEFAULT '',        -- tg file_id ИЛИ http(s) URL картинки
+	    status     TEXT NOT NULL DEFAULT 'new',     -- new|done|dropped_ad|dropped_dup|failed
+	    updated_at TEXT NOT NULL
+	);
+	CREATE TABLE IF NOT EXISTS link_cache (
+	    url        TEXT PRIMARY KEY,
+	    kind       TEXT NOT NULL DEFAULT '',        -- article|course|ad|other|unavailable
+	    title      TEXT NOT NULL DEFAULT '',
+	    summary    TEXT NOT NULL DEFAULT '',
+	    fetched_at TEXT NOT NULL
+	);
+	CREATE TABLE IF NOT EXISTS item_links (
+	    dedup_key TEXT NOT NULL,
+	    url       TEXT NOT NULL,
+	    kind      TEXT NOT NULL DEFAULT '',         -- класс ссылки (§4.3)
+	    ord       INTEGER NOT NULL DEFAULT 0,       -- порядок в сообщении
+	    PRIMARY KEY (dedup_key, url)
+	);
+	CREATE TABLE IF NOT EXISTS runs (
+	    run_id     INTEGER PRIMARY KEY,             -- Unix-секунды, как digests.run_id
+	    summary    TEXT NOT NULL DEFAULT '',        -- общее саммари выпуска (L0)
+	    created_at TEXT NOT NULL
+	);
+	ALTER TABLE digest_items ADD COLUMN full_text TEXT NOT NULL DEFAULT '';  -- до 8000 рун
+	ALTER TABLE digest_items ADD COLUMN class     TEXT NOT NULL DEFAULT '';
+	ALTER TABLE digest_items ADD COLUMN media_kind TEXT NOT NULL DEFAULT '';
+	ALTER TABLE digest_items ADD COLUMN media_ref  TEXT NOT NULL DEFAULT '';
+	`,
 }
 
 // migrate applies pending migrations starting from the current PRAGMA

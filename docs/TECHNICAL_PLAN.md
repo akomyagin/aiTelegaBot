@@ -256,6 +256,49 @@ CREATE TABLE IF NOT EXISTS digest_items (
     summary      TEXT NOT NULL DEFAULT ''  -- LLM-строка элемента (L2)
 );
 CREATE INDEX IF NOT EXISTS digest_items_digest ON digest_items(digest_id);
+
+-- v5 (Этап 9A): кеш обработки сообщений + задел под 9B/9C/9D/9E — ВСЯ схема
+-- Этапа 9 одной миграцией (подэтапы 9B–9E схему не правят). seen_items
+-- остаётся таблицей ДОСТАВКИ (что показано), message_state — таблица
+-- ОБРАБОТКИ (что классифицировано/саммаризовано): упавший прогон не теряет
+-- LLM-работу. link_cache/item_links используются с 9B, runs — с 9D,
+-- media-колонки — с 9E; созданы здесь.
+CREATE TABLE IF NOT EXISTS message_state (
+    dedup_key  TEXT PRIMARY KEY,
+    source_id  INTEGER,
+    topic_id   INTEGER,
+    class      TEXT NOT NULL DEFAULT '',        -- §4.1 Этапа 9; '' = не классифицировано
+    cluster_id TEXT NOT NULL DEFAULT '',        -- '<runID>:<n>'; '' = не в кластере (9C)
+    is_primary INTEGER NOT NULL DEFAULT 1,      -- 0 = дубль, не показывается (9C)
+    summary    TEXT NOT NULL DEFAULT '',        -- саммари сообщения (1–2 предложения)
+    media_kind TEXT NOT NULL DEFAULT '',        -- '' | 'photo' (9E)
+    media_ref  TEXT NOT NULL DEFAULT '',        -- tg file_id ИЛИ http(s) URL картинки (9E)
+    status     TEXT NOT NULL DEFAULT 'new',     -- new|done|dropped_ad|dropped_dup|failed
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS link_cache (
+    url        TEXT PRIMARY KEY,
+    kind       TEXT NOT NULL DEFAULT '',        -- article|course|ad|other|unavailable (9B)
+    title      TEXT NOT NULL DEFAULT '',
+    summary    TEXT NOT NULL DEFAULT '',
+    fetched_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS item_links (
+    dedup_key TEXT NOT NULL,
+    url       TEXT NOT NULL,
+    kind      TEXT NOT NULL DEFAULT '',         -- класс ссылки (9B)
+    ord       INTEGER NOT NULL DEFAULT 0,       -- порядок в сообщении
+    PRIMARY KEY (dedup_key, url)
+);
+CREATE TABLE IF NOT EXISTS runs (
+    run_id     INTEGER PRIMARY KEY,             -- Unix-секунды, как digests.run_id
+    summary    TEXT NOT NULL DEFAULT '',        -- общее саммари выпуска L0 (9D)
+    created_at TEXT NOT NULL
+);
+ALTER TABLE digest_items ADD COLUMN full_text TEXT NOT NULL DEFAULT '';  -- до 8000 рун
+ALTER TABLE digest_items ADD COLUMN class     TEXT NOT NULL DEFAULT '';
+ALTER TABLE digest_items ADD COLUMN media_kind TEXT NOT NULL DEFAULT '';
+ALTER TABLE digest_items ADD COLUMN media_ref  TEXT NOT NULL DEFAULT '';
 ```
 
 Дедуп-ключ (`internal/feed` / `internal/storage`): для веб-источников — канонический
@@ -376,6 +419,17 @@ URL или `<guid>`; для Telegram — `tg:<channel>:<messageID>`. Ретен�
 - *Критерий:* зелёные build/vet/gofmt/test -race; golden-рендеры оглавления и
   L1; частичный сбой темы = пропуск в оглавлении (элементы не seen); сбой
   доставки = слот планировщика не выполнен.
+
+**Этап 9 — Дайджест снизу вверх** (детальный план — `docs/plans/stage-9-bottom-up-digest.md`)
+- *Статус подэтапов (2026-10-22):* **9A** (схема v5: message_state/link_cache/
+  item_links/runs + 4 колонки digest_items; вызов A — классификация §4.1 +
+  саммари сообщения вместо SummarizeTopic в Run; кеш обработки: крах не теряет
+  LLM-работу, повторный прогон не переспрашивает; ad-фильтр с seen до доставки;
+  course — одна фраза; Degraded-результаты не кэшируются) — **сделан по коду**;
+  9B (ссылки статей: вызовы E/F, link_cache/item_links), 9C (дедуп/кластеры),
+  9D (4-уровневая навигация: вызовы C/D, runs), 9E (медиа) — **впереди**.
+  Навигация в 9A не менялась: тело темы — fallback-ветка RenderTopicBody
+  (headline появится с вызовом C в 9D); `llm/topicdigest.go` жив до 9D.
 
 ## 10. Тестовая стратегия
 

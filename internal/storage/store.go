@@ -26,6 +26,15 @@ type Store interface {
 	FilterUnseen(ctx context.Context, items []feed.Item) ([]feed.Item, error)
 	// MarkSeen records items so they are skipped on future runs.
 	MarkSeen(ctx context.Context, items []feed.Item) error
+	// GetMessageStates returns cached processing states (message_state) for
+	// the given dedup keys; missing keys are absent from the map (Stage 9A).
+	GetMessageStates(ctx context.Context, keys []string) (map[string]MessageState, error)
+	// UpsertMessageState writes a batch of processing states in ONE
+	// transaction; updated_at is stamped internally (Stage 9A, план §6).
+	UpsertMessageState(ctx context.Context, states []MessageState) error
+	// MarkSeenBatch marks dedup keys seen in ONE transaction — for ad/dup
+	// drops at classification time, before delivery (Stage 9A, план §4.2).
+	MarkSeenBatch(ctx context.Context, keys []string) error
 	// InsertDigest creates a digests row with delivered=0 and returns its id
 	// (Stage 8 C, plan §4.3 — delivery gates persistence).
 	InsertDigest(ctx context.Context, runID, topicID int64, body string, itemCount int) (digestID int64, err error)
