@@ -34,16 +34,14 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	}
 	defer func() { _ = store.Close() }()
 
-	// LLM: BYOK — offline summarizer when no key is configured. Stage 8 C:
-	// типизируется TopicSummarizer (плоский Summarizer pipeline больше не
-	// нужен); *llm.Client и *llm.Offline реализуют оба интерфейса.
-	var summarizer llm.TopicSummarizer
+	// LLM: BYOK — offline summarizer when no key is configured. Stage 9A:
+	// pipeline потребляет вызов A (ClassifySummarizer); *llm.Client и
+	// *llm.Offline реализуют его (SummarizeTopic в llm/topicdigest.go живёт
+	// до 9D, но в Run больше не подключается).
 	if cfg.Offline {
 		slog.Info("no LLM API key configured; using offline summarizer")
-		summarizer = llm.NewOffline()
-	} else {
-		summarizer = llm.NewClient(cfg.LLMAPIKey, cfg.LLMBaseURL, cfg.LLMModel, cfg.LLMMaxRetries)
 	}
+	summarizer := newSummarizer(cfg)
 
 	// Static sources from config. Built once at startup: some carry per-run
 	// state (channelBuf, mtClient), so they are reused across runs. Dynamic,
@@ -187,7 +185,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	pipeline := &digest.Pipeline{
 		SourceProvider: sourceProvider,
 		Store:          store,
-		TopicSummary:   summarizer,
+		Classify:       summarizer,
 		ChatID:         cfg.TelegramChatID,
 	}
 
@@ -310,6 +308,17 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	<-errCh
 	<-errCh
 	return nil
+}
+
+// newSummarizer выбирает реализацию вызова A (Этап 9A, план §4.8):
+// cfg.Offline → детерминированный *llm.Offline (без сети), иначе сетевой
+// *llm.Client. Паттерн прежнего выбора TopicSummarizer (Stage 8 C); вынесено
+// из Run ради тест-кейса 7 (wiring проверяется без подъёма бота/планировщика).
+func newSummarizer(cfg *config.Config) llm.ClassifySummarizer {
+	if cfg.Offline {
+		return llm.NewOffline()
+	}
+	return llm.NewClient(cfg.LLMAPIKey, cfg.LLMBaseURL, cfg.LLMModel, cfg.LLMMaxRetries)
 }
 
 // sourceAdder validates and persists a candidate source; the signature

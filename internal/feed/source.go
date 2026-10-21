@@ -33,6 +33,13 @@ type Item struct {
 	// темы» (topic 1). DedupKey deliberately does NOT use these fields.
 	SourceID int64
 	TopicID  int64
+	// Stage 9 (§4.5, подэтап 9E заполнит): медиа-вложения поста. MediaKind —
+	// '' | 'photo'; MediaFileID — Telegram file_id (приоритет в media_ref);
+	// MediaURL — http(s) URL картинки, когда file_id недоступен. DedupKey их
+	// НЕ использует.
+	MediaKind   string
+	MediaFileID string
+	MediaURL    string
 }
 
 // DedupKey returns the stable key used to skip already-seen items across runs

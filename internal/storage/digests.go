@@ -23,6 +23,10 @@ import (
 // digestItemSnippetRunes caps the stored snippet (first N runes of Text).
 const digestItemSnippetRunes = 200
 
+// digestItemFullTextRunes caps the stored full_text (Этап 9, план §4.2: до
+// 8000 рун).
+const digestItemFullTextRunes = 8000
+
 // digestSelect is the shared column list for digests reads. topic_id is read
 // through COALESCE(topic_id, 1): legacy NULL ≡ «Без темы».
 const digestSelect = "SELECT id, run_id, COALESCE(topic_id, 1), created_at, item_count, body, delivered"
@@ -50,13 +54,22 @@ type DigestItem struct {
 	PublishedAt string // RFC3339 UTC
 	Snippet     string // first 200 runes of Text
 	Summary     string // LLM per-item line (for L2 in Stage 8 D)
+	// Этап 9 (§4.2): legacy-строки читаются с '' (DEFAULT) и рендерятся
+	// деградированно (snippet вместо full_text).
+	FullText  string // first 8000 runes of Text
+	Class     string // §4.1 taxonomy; '' = не классифицировано
+	MediaKind string // '' | 'photo'
+	MediaRef  string // tg file_id ИЛИ http(s) URL картинки
 }
 
 // NewDigestItem builds a digest_items row from a feed item. TgPeer/TgMsgID
 // are filled only for tg_* kinds (Item.Source of tg_mtproto is already in
 // "-100X" form — A1); an unparseable message id yields 0. SourceID is the
 // provenance stamped by digest.taggedSource (§4.2); 0 = unknown → NULL.
-func NewDigestItem(it feed.Item, summary string) DigestItem {
+// Этап 9: class приходит из message_state (пустая строка = не
+// классифицировано), full_text — Text, обрезанный до 8000 рун, media_ref —
+// MediaFileID, при пустом — MediaURL (план §4.5).
+func NewDigestItem(it feed.Item, summary, class string) DigestItem {
 	di := DigestItem{
 		SourceID:    it.SourceID,
 		DedupKey:    it.DedupKey(),
@@ -65,6 +78,15 @@ func NewDigestItem(it feed.Item, summary string) DigestItem {
 		PublishedAt: it.Published.UTC().Format(time.RFC3339),
 		Snippet:     truncateRunes(it.Text, digestItemSnippetRunes),
 		Summary:     summary,
+		FullText:    truncateRunes(it.Text, digestItemFullTextRunes),
+		Class:       class,
+		MediaKind:   it.MediaKind,
+	}
+	switch {
+	case it.MediaFileID != "":
+		di.MediaRef = it.MediaFileID
+	case it.MediaURL != "":
+		di.MediaRef = it.MediaURL
 	}
 	if strings.HasPrefix(it.Kind, "tg_") {
 		di.TgPeer = strings.TrimPrefix(it.Source, "@")
@@ -117,8 +139,8 @@ func (s *SQLiteStore) MarkDelivered(ctx context.Context, digestID int64, items [
 	}
 
 	itemStmt, err := tx.PrepareContext(ctx,
-		`INSERT INTO digest_items(digest_id, source_id, dedup_key, title, url, tg_peer, tg_msg_id, published_at, snippet, summary)
-		 VALUES(?,?,?,?,?,?,?,?,?,?)`)
+		`INSERT INTO digest_items(digest_id, source_id, dedup_key, title, url, tg_peer, tg_msg_id, published_at, snippet, summary, full_text, class, media_kind, media_ref)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		return fmt.Errorf("prepare digest_items insert: %w", err)
 	}
@@ -134,7 +156,8 @@ func (s *SQLiteStore) MarkDelivered(ctx context.Context, digestID int64, items [
 	now := time.Now().UTC().Format(time.RFC3339)
 	for _, it := range items {
 		if _, err := itemStmt.ExecContext(ctx, digestID, nilIfZero(it.SourceID), it.DedupKey,
-			it.Title, it.URL, it.TgPeer, it.TgMsgID, it.PublishedAt, it.Snippet, it.Summary); err != nil {
+			it.Title, it.URL, it.TgPeer, it.TgMsgID, it.PublishedAt, it.Snippet, it.Summary,
+			it.FullText, it.Class, it.MediaKind, it.MediaRef); err != nil {
 			return fmt.Errorf("insert digest_item %q: %w", it.DedupKey, err)
 		}
 		if _, err := seenStmt.ExecContext(ctx, it.DedupKey, nilIfZero(it.SourceID), now); err != nil {
@@ -164,7 +187,7 @@ func (s *SQLiteStore) GetDigest(ctx context.Context, digestID int64) (Digest, bo
 
 // digestItemSelect is the shared column list for digest_items reads
 // (source_id through COALESCE(…, 0): NULL ↔ «0 = unknown»).
-const digestItemSelect = `SELECT id, COALESCE(source_id, 0), dedup_key, title, url, tg_peer, tg_msg_id, published_at, snippet, summary
+const digestItemSelect = `SELECT id, COALESCE(source_id, 0), dedup_key, title, url, tg_peer, tg_msg_id, published_at, snippet, summary, full_text, class, media_kind, media_ref
 	 FROM digest_items`
 
 // ListDigestItems returns a digest's drill-down rows ordered by id ASC.
@@ -204,7 +227,8 @@ func scanDigestItems(rows *sql.Rows) ([]DigestItem, error) {
 	for rows.Next() {
 		var it DigestItem
 		if err := rows.Scan(&it.ID, &it.SourceID, &it.DedupKey, &it.Title, &it.URL,
-			&it.TgPeer, &it.TgMsgID, &it.PublishedAt, &it.Snippet, &it.Summary); err != nil {
+			&it.TgPeer, &it.TgMsgID, &it.PublishedAt, &it.Snippet, &it.Summary,
+			&it.FullText, &it.Class, &it.MediaKind, &it.MediaRef); err != nil {
 			return nil, fmt.Errorf("scan digest_item: %w", err)
 		}
 		out = append(out, it)

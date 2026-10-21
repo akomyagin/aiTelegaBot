@@ -241,3 +241,92 @@ func extractContent(resp *http.Response) (string, error) {
 	}
 	return strings.TrimSpace(parsed.Choices[0].Message.Content), nil
 }
+
+// ClassifySummarize implements ClassifySummarizer (вызов A плана §4.8) over
+// the chat-completions API. Элементы чанкуются по classifyChunkSize на один
+// HTTP-запрос (план, строки 555–557); индексы в результате — глобальные
+// (1..len(items)). На чанк — паттерн SummarizeTopic: fence-strip, строгий
+// JSON, ровно ОДИН повтор при мусорном ответе (максимум 2 запроса на чанк),
+// существующий retry/backoff транспорта (doWithRetry).
+//
+// Ошибка транспорта/API → error немедленно (тема в pipeline пропускается
+// целиком, план §4.9); при этом возвращается ЧАСТИЧНЫЙ результат — успешно
+// обработанные чанки с глобальными индексами (вызывающий кэширует не-Degraded
+// часть до обработки сбоя, чтобы следующий прогон не переспрашивал LLM).
+// Двойной мусор на чанк → НЕ ошибка: fallback (план,
+// строки 480–484) — все элементы чанка получают class=other,
+// summary=extractLead, Degraded=true (вызывающий не пишет им status=done).
+// API-ключ никогда не логируется.
+func (c *Client) ClassifySummarize(ctx context.Context, items []ClassifyItem) (ClassifyResult, error) {
+	if len(items) == 0 {
+		return ClassifyResult{}, nil
+	}
+	var out ClassifyResult
+	for start := 0; start < len(items); start += classifyChunkSize {
+		end := min(start+classifyChunkSize, len(items))
+		res, err := c.classifyChunk(ctx, items[start:end])
+		if err != nil {
+			// Частичный результат: уже обработанные чанки не теряются (M1).
+			return out, err
+		}
+		for i := range res.Items {
+			res.Items[i].Index += start // локальный индекс чанка → глобальный
+		}
+		out.Items = append(out.Items, res.Items...)
+		out.Degraded = append(out.Degraded, res.Degraded...)
+	}
+	return out, nil
+}
+
+// classifyChunk — один HTTP-запрос вызова A на чанк ≤classifyChunkSize
+// элементов: SummarizeTopic-паттерн (2 попытки парсинга максимум, затем
+// детерминированный fallback без ошибки).
+func (c *Client) classifyChunk(ctx context.Context, chunk []ClassifyItem) (ClassifyResult, error) {
+	msgs := buildClassifyPrompt(chunk)
+	body, err := json.Marshal(chatRequest{
+		Model:       c.model,
+		Messages:    msgs,
+		Temperature: 0.2,
+	})
+	if err != nil {
+		return ClassifyResult{}, fmt.Errorf("llm: marshal request: %w", err)
+	}
+
+	url := c.baseURL + "/chat/completions"
+	makeReq := func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+c.apiKey) // apiKey never logged
+		return req, nil
+	}
+
+	const maxParseAttempts = 2 // initial request + one repeat on an unparseable answer
+	var lastErr error
+	for attempt := 0; attempt < maxParseAttempts; attempt++ {
+		resp, err := c.doWithRetry(ctx, makeReq)
+		if err != nil {
+			// HTTP-level failures were already retried inside doWithRetry;
+			// fatal errors (400/401) must not be re-requested.
+			return ClassifyResult{}, err
+		}
+		content, err := extractContent(resp)
+		if err != nil {
+			return ClassifyResult{}, err
+		}
+		res, perr := parseClassifyResponse(content, chunk)
+		if perr == nil {
+			return res, nil
+		}
+		lastErr = perr
+		c.log.Warn("llm classify response unparseable", "attempt", attempt, "err", perr)
+	}
+	// Fallback (§4.8): оба ответа мусорные — тема НЕ пропускается, весь чанк
+	// деградирует детерминированно; Degraded=true не даёт вызывающему написать
+	// status=done (следующий прогон переспросит LLM).
+	c.log.Warn("llm classify falling back to deterministic summaries",
+		"chunk_items", len(chunk), "err", lastErr)
+	return degradedClassifyResult(chunk), nil
+}

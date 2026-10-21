@@ -36,7 +36,7 @@ func makeV3DB(t *testing.T, path string) {
 	}
 }
 
-func TestMigrate_V4OnTopOfV3(t *testing.T) {
+func TestMigrate_FromV3ReachesLatest(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "v3.db")
 	ctx := context.Background()
 	makeV3DB(t, path)
@@ -50,8 +50,8 @@ func TestMigrate_V4OnTopOfV3(t *testing.T) {
 	if err := st.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatalf("read user_version: %v", err)
 	}
-	if version != 4 {
-		t.Errorf("user_version = %d, want 4", version)
+	if version != 5 {
+		t.Errorf("user_version = %d, want 5", version)
 	}
 
 	// digest_items table and its index exist.
@@ -100,8 +100,8 @@ func TestMigrate_V4OnTopOfV3(t *testing.T) {
 	if err := st2.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatalf("read user_version after reopen: %v", err)
 	}
-	if version != 4 {
-		t.Errorf("user_version after reopen = %d, want 4", version)
+	if version != 5 {
+		t.Errorf("user_version after reopen = %d, want 5", version)
 	}
 }
 
@@ -159,8 +159,8 @@ func TestMarkDelivered(t *testing.T) {
 		t.Fatalf("InsertDigest: %v", err)
 	}
 	if err := st.MarkDelivered(ctx, digestID, []DigestItem{
-		NewDigestItem(rssItem, "sum1"),
-		NewDigestItem(tgItem, ""),
+		NewDigestItem(rssItem, "sum1", ""),
+		NewDigestItem(tgItem, "", ""),
 	}); err != nil {
 		t.Fatalf("MarkDelivered: %v", err)
 	}
@@ -236,7 +236,7 @@ func TestMarkDelivered_Rollback(t *testing.T) {
 	}
 
 	item := feed.Item{Kind: "rss", Title: "X", URL: "https://x.example"}
-	if err := st.MarkDelivered(ctx, digestID, []DigestItem{NewDigestItem(item, "")}); err == nil {
+	if err := st.MarkDelivered(ctx, digestID, []DigestItem{NewDigestItem(item, "", "")}); err == nil {
 		t.Fatal("MarkDelivered over a dropped table succeeded, want error")
 	}
 
@@ -307,25 +307,30 @@ func TestListRunDigests(t *testing.T) {
 func TestNewDigestItem(t *testing.T) {
 	pub := time.Date(2026, 3, 4, 5, 6, 7, 0, time.FixedZone("X", 3*3600))
 	long := strings.Repeat("а", 250)
+	huge := strings.Repeat("б", 8001)
 
 	tests := []struct {
-		name string
-		in   feed.Item
-		sum  string
-		want DigestItem
+		name  string
+		in    feed.Item
+		sum   string
+		class string
+		want  DigestItem
 	}{
 		{
-			name: "rss: no tg fields, snippet cut to 200 runes, SourceID copied",
-			in:   feed.Item{Kind: "rss", Source: "HN", Title: "T", URL: "https://u", Text: long, Published: pub, SourceID: 9},
-			sum:  "s",
+			name:  "rss: no tg fields, snippet cut to 200 runes, full_text kept, SourceID copied",
+			in:    feed.Item{Kind: "rss", Source: "HN", Title: "T", URL: "https://u", Text: long, Published: pub, SourceID: 9},
+			sum:   "s",
+			class: "news",
 			want: DigestItem{SourceID: 9, DedupKey: "https://u", Title: "T", URL: "https://u",
-				PublishedAt: "2026-03-04T02:06:07Z", Snippet: strings.Repeat("а", 200), Summary: "s"},
+				PublishedAt: "2026-03-04T02:06:07Z", Snippet: strings.Repeat("а", 200), Summary: "s",
+				FullText: long, Class: "news"},
 		},
 		{
-			name: "tg_botapi: peer without @, numeric msg id",
-			in:   feed.Item{Kind: "tg_botapi", Source: "@chan", ID: "42", Title: "P"},
+			name:  "tg_botapi: peer without @, numeric msg id",
+			in:    feed.Item{Kind: "tg_botapi", Source: "@chan", ID: "42", Title: "P"},
+			class: "media",
 			want: DigestItem{DedupKey: "tg:@chan:42", Title: "P", TgPeer: "chan", TgMsgID: 42,
-				PublishedAt: "0001-01-01T00:00:00Z"},
+				PublishedAt: "0001-01-01T00:00:00Z", Class: "media"},
 		},
 		{
 			name: "tg_mtproto: -100X peer kept, unparseable id → 0",
@@ -333,10 +338,32 @@ func TestNewDigestItem(t *testing.T) {
 			want: DigestItem{DedupKey: "tg:-100123:abc", Title: "M", TgPeer: "-100123", TgMsgID: 0,
 				PublishedAt: "0001-01-01T00:00:00Z"},
 		},
+		{
+			name: "full_text >8000 runes cut to 8000",
+			in:   feed.Item{Kind: "rss", Title: "F", URL: "https://f", Text: huge},
+			want: DigestItem{DedupKey: "https://f", Title: "F", URL: "https://f",
+				PublishedAt: "0001-01-01T00:00:00Z", Snippet: strings.Repeat("б", 200),
+				FullText: strings.Repeat("б", 8000)},
+		},
+		{
+			name: "media: MediaFileID wins over MediaURL",
+			in: feed.Item{Kind: "tg_botapi", Source: "@chan", ID: "7", Title: "Ph",
+				MediaKind: "photo", MediaFileID: "AgACAgIAAxk", MediaURL: "https://img"},
+			class: "media",
+			want: DigestItem{DedupKey: "tg:@chan:7", Title: "Ph", TgPeer: "chan", TgMsgID: 7,
+				PublishedAt: "0001-01-01T00:00:00Z", Class: "media", MediaKind: "photo", MediaRef: "AgACAgIAAxk"},
+		},
+		{
+			name: "media: empty MediaFileID → MediaURL",
+			in: feed.Item{Kind: "rss", Title: "Img", URL: "https://i",
+				MediaKind: "photo", MediaURL: "https://i/pic.png"},
+			want: DigestItem{DedupKey: "https://i", Title: "Img", URL: "https://i",
+				PublishedAt: "0001-01-01T00:00:00Z", MediaKind: "photo", MediaRef: "https://i/pic.png"},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := NewDigestItem(tt.in, tt.sum); !reflect.DeepEqual(got, tt.want) {
+			if got := NewDigestItem(tt.in, tt.sum, tt.class); !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("NewDigestItem:\n got: %+v\nwant: %+v", got, tt.want)
 			}
 		})
@@ -356,7 +383,7 @@ func TestDigests_RestartSurvival(t *testing.T) {
 		t.Fatalf("InsertDigest: %v", err)
 	}
 	item := feed.Item{Kind: "rss", Title: "R", URL: "https://r.example", Text: "snippet", SourceID: 3}
-	if err := st.MarkDelivered(ctx, digestID, []DigestItem{NewDigestItem(item, "sum")}); err != nil {
+	if err := st.MarkDelivered(ctx, digestID, []DigestItem{NewDigestItem(item, "sum", "")}); err != nil {
 		t.Fatalf("MarkDelivered: %v", err)
 	}
 	if err := st.Close(); err != nil {
