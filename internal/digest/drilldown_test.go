@@ -1,13 +1,14 @@
-// Тесты D-2 (план §D, тест-кейсы D): парсер callback_data (мусор/overflow →
-// error, не паника), golden-рендеры L2/L3, guard 4096 («…и ещё K», полоса
-// M1), несуществующий digestID → error. Golden — compareGolden-паттерн
-// render_topic_test.go (`go test ./internal/digest -update`).
+// Тесты 9D-2a (план §4.6, «Подэтап 9D» тест-кейсы 5 и 7): диспетчер
+// S:/M:/P:/PDEL + legacy-alias'ы L2:/L3:, парсеры (мусор/не-числа/overflow →
+// error, не паника), бюджет callback_data ≤64 байт на 19-значных id,
+// sections_json (деградация на битом JSON), peer-Title fallback имён,
+// M:-view (GetDigestItem miss → error, блок «Ссылки:»), P:-заглушка
+// «Медиа недоступно», крайний случай «digest без items».
 
 package digest
 
 import (
 	"context"
-	"strconv"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -16,15 +17,21 @@ import (
 	"github.com/akomyagin/aiTelegaBot/internal/telegram"
 )
 
-// drillStore — фейк storage.Store для drill-down: используются только
-// GetDigest/ListDigestItems/ListDigestItemsBySource/ListTopics, остальное
-// паникует через nil-embedding (осознанно: seam их вызывать не должен).
+// drillStore — фейк storage.Store для диспетчера 9D: используются только
+// GetDigest/ListDigestItems/ListDigestItemsBySource/ListTopics/GetDigestItem/
+// ListItemLinks/GetLinkCache/GetPeer, остальное паникует через nil-embedding
+// (осознанно: seam их вызывать не должен).
 type drillStore struct {
 	storage.Store
 	digestRow storage.Digest
 	hasDigest bool
 	items     []storage.DigestItem
 	topics    []storage.Topic
+	item      storage.DigestItem
+	hasItem   bool
+	links     []storage.ItemLink
+	cache     map[string]storage.LinkCacheRow
+	peers     map[int64]storage.Peer
 }
 
 func (s *drillStore) GetDigest(ctx context.Context, digestID int64) (storage.Digest, bool, error) {
@@ -49,79 +56,278 @@ func (s *drillStore) ListTopics(ctx context.Context) ([]storage.Topic, error) {
 	return s.topics, nil
 }
 
+func (s *drillStore) GetDigestItem(ctx context.Context, itemID int64) (storage.DigestItem, bool, error) {
+	return s.item, s.hasItem, nil
+}
+
+func (s *drillStore) ListItemLinks(ctx context.Context, dedupKey string) ([]storage.ItemLink, error) {
+	return s.links, nil
+}
+
+func (s *drillStore) GetLinkCache(ctx context.Context, urls []string) (map[string]storage.LinkCacheRow, error) {
+	if s.cache == nil {
+		return map[string]storage.LinkCacheRow{}, nil
+	}
+	return s.cache, nil
+}
+
+func (s *drillStore) GetPeer(ctx context.Context, peerID int64) (storage.Peer, bool, error) {
+	p, ok := s.peers[peerID]
+	return p, ok, nil
+}
+
 func staticSources(rows ...storage.Source) func(context.Context) ([]storage.Source, error) {
 	return func(context.Context) ([]storage.Source, error) { return rows, nil }
 }
 
-func TestParseDrillDownData(t *testing.T) {
+// --- парсеры (тест-кейс 5 плана) ---
+
+func TestParseSourceData(t *testing.T) {
 	valid := []struct {
-		data     string
-		level    int
-		digestID int64
-		sourceID int64
+		data   string
+		prefix string
+		did    int64
+		sid    int64
 	}{
-		{"L2:42", 2, 42, 0},
-		{"L2:1", 2, 1, 0},
-		{"L3:42:7", 3, 42, 7},
-		{"L3:42:0", 3, 42, 0},
-		{"L3:9007199254740991:9007199254740991", 3, 9007199254740991, 9007199254740991},
+		{"S:42:7", "S:", 42, 7},
+		{"S:42:0", "S:", 42, 0},
+		{"L3:42:7", "L3:", 42, 7},
+		{"L3:42:0", "L3:", 42, 0},
+		{"S:9223372036854775807:9223372036854775807", "S:", 9223372036854775807, 9223372036854775807},
 	}
 	for _, tt := range valid {
 		t.Run("ok/"+tt.data, func(t *testing.T) {
-			level, did, sid, err := parseDrillDownData(tt.data)
+			did, sid, err := parseSourceData(tt.data, tt.prefix)
 			if err != nil {
-				t.Fatalf("parseDrillDownData(%q): %v", tt.data, err)
+				t.Fatalf("parseSourceData(%q): %v", tt.data, err)
 			}
-			if level != tt.level || did != tt.digestID || sid != tt.sourceID {
-				t.Errorf("parseDrillDownData(%q) = (%d,%d,%d), want (%d,%d,%d)",
-					tt.data, level, did, sid, tt.level, tt.digestID, tt.sourceID)
+			if did != tt.did || sid != tt.sid {
+				t.Errorf("parseSourceData(%q) = (%d,%d), want (%d,%d)", tt.data, did, sid, tt.did, tt.sid)
 			}
 		})
 	}
 
 	bad := []string{
-		"",                          // пустая строка
-		"L2:",                       // пустой id
-		"L2:abc",                    // не число
-		"L2:42:7",                   // лишний сегмент
-		"L2:-1",                     // отрицательный digestID
-		"L2:0",                      // нулевой digestID
-		"L3:1",                      // нет sourceID
-		"L3:1:x",                    // нечисловой sourceID
-		"L3:1:-2",                   // отрицательный sourceID
-		"L3::1",                     // пустой digestID
-		"L4:1",                      // неизвестный префикс
-		"l2:42",                     // регистрозависимый CutPrefix
-		"T:42",                      // чужой префикс (диспетчер C)
-		"L2:99999999999999999999",   // overflow int64
-		"L3:99999999999999999999:1", // overflow digestID
-		"L3:1:99999999999999999999", // overflow sourceID
-		"L2: 42",                    // пробел
+		"", "S:", "S:1", "S:1:", "S:abc:1", "S:1:x", "S:0:1", "S:-1:1", "S:1:-2",
+		"S:1:2:3", "S::1", "S: 1:2", "S:99999999999999999999:1", "S:1:99999999999999999999",
+		"L3:1", "L3:1:x", "L3:1:-2", "L3:99999999999999999999:1", "T:42",
 	}
 	for _, data := range bad {
 		t.Run("err/"+data, func(t *testing.T) {
-			if _, _, _, err := parseDrillDownData(data); err == nil {
-				t.Fatalf("parseDrillDownData(%q): want error, got nil", data)
+			prefix := data
+			if i := strings.Index(data, ":"); i >= 0 {
+				prefix = data[:i+1]
+			}
+			if _, _, err := parseSourceData(data, prefix); err == nil {
+				t.Fatalf("parseSourceData(%q): want error, got nil", data)
 			}
 		})
 	}
 }
 
-func TestNewDrillDown_ParseAndNotFoundErrors(t *testing.T) {
+func TestParseMessageData(t *testing.T) {
+	for _, tt := range []struct {
+		data   string
+		prefix string
+		want   int64
+	}{
+		{"M:42", "M:", 42},
+		{"P:1", "P:", 1},
+		{"L2:9223372036854775807", "L2:", 9223372036854775807},
+	} {
+		got, err := parseMessageData(tt.data, tt.prefix)
+		if err != nil || got != tt.want {
+			t.Errorf("parseMessageData(%q) = (%d,%v), want (%d,nil)", tt.data, got, err, tt.want)
+		}
+	}
+	for _, data := range []string{
+		"M:", "M:abc", "M:0", "M:-1", "M:1:2", "M:99999999999999999999",
+		"L2:", "L2:abc", "L2:99999999999999999999", "P:x",
+	} {
+		prefix := data
+		if i := strings.Index(data, ":"); i >= 0 {
+			prefix = data[:i+1]
+		}
+		if _, err := parseMessageData(data, prefix); err == nil {
+			t.Errorf("parseMessageData(%q): want error, got nil", data)
+		}
+	}
+}
+
+// Property-тест бюджетов (тест-кейс 5 плана): все префиксы навигации с
+// 19-значными id (worst case int64) укладываются в 64 БАЙТА callback_data.
+func TestCallbackDataBudget9D(t *testing.T) {
+	const big = "9223372036854775807" // 19 знаков = math.MaxInt64
+	for _, d := range []string{
+		"S:" + big + ":" + big,  // 41
+		"M:" + big,              // 21
+		"P:" + big,              // 21
+		"PDEL",                  // 4 — константа
+		"T:" + big,              // 21
+		"TOC:" + big,            // 23
+		"L1:" + big,             // 22
+		"L2:" + big,             // 22
+		"L3:" + big + ":" + big, // 42
+	} {
+		if len(d) > 64 {
+			t.Errorf("callback_data %q = %d байт > 64", d, len(d))
+		}
+	}
+}
+
+// --- диспетчер (тест-кейсы 5, 7 плана) ---
+
+func TestNewDrillDown_Dispatch9D(t *testing.T) {
+	ctx := context.Background()
+	store := &drillStore{
+		hasDigest: true,
+		digestRow: storage.Digest{ID: 42, RunID: 500, TopicID: 2, Body: "<b>Шапка темы</b>",
+			SectionsJSON: `[{"source_id":3,"summary":"Саммари топика C"}]`},
+		topics: []storage.Topic{{ID: 2, Name: "AI"}},
+		items: []storage.DigestItem{
+			{ID: 11, SourceID: 3, DedupKey: "k1", Title: "Title A", Summary: "Первая сводка", URL: "https://a.example/1"},
+			{ID: 12, SourceID: 4, Title: "Title B", Summary: "Вторая"},
+			{ID: 13, SourceID: 3, DedupKey: "k3", Title: "Title C", Summary: "Третья"},
+		},
+		peers: map[int64]storage.Peer{1234567890: {MTProtoID: 1234567890, Title: "Приватный канал"}},
+	}
+	dd := NewDrillDown(store, staticSources(
+		storage.Source{ID: 3, Kind: "rss", Ref: "Habr <b>&</b>"},
+		storage.Source{ID: 4, Kind: "tg_mtproto", Ref: "-1001234567890"},
+	))
+
+	// Legacy «L2:<did>» → как «T:<did>»: RenderTopicView — body + «Топики:» +
+	// саммари из sections_json + peer-Title fallback + кнопки S:/TOC:.
+	res, err := dd(ctx, "L2:42")
+	if err != nil || res == nil || res.Edit == nil {
+		t.Fatalf("L2:42 = %+v, %v", res, err)
+	}
+	for _, want := range []string{"<b>Шапка темы</b>", "Топики:", "Саммари топика C",
+		"Habr &lt;b&gt;&amp;&lt;/b&gt;", "Приватный канал", "2 сообщ."} {
+		if !strings.Contains(res.Edit.Text, want) {
+			t.Errorf("L2 text lacks %q:\n%s", want, res.Edit.Text)
+		}
+	}
+	assertButtons(t, "L2→TopicView", res.Edit.Buttons, [][]telegram.InlineButton{
+		{{Text: "Habr <b>&</b>", Data: "S:42:3"}},
+		{{Text: "Приватный канал", Data: "S:42:4"}},
+		{{Text: "◀ К оглавлению", Data: "TOC:500"}},
+	})
+
+	// Legacy «L3:<did>:<sid>» → S:-view: шапка «📰 AI / <имя>» + саммари топика.
+	res, err = dd(ctx, "L3:42:3")
+	if err != nil || res == nil || res.Edit == nil {
+		t.Fatalf("L3:42:3 = %+v, %v", res, err)
+	}
+	for _, want := range []string{"📰 AI / Habr &lt;b&gt;&amp;&lt;/b&gt;", "Саммари топика C", "Первая сводка"} {
+		if !strings.Contains(res.Edit.Text, want) {
+			t.Errorf("L3 text lacks %q:\n%s", want, res.Edit.Text)
+		}
+	}
+	assertButtons(t, "L3→SourceView", res.Edit.Buttons, [][]telegram.InlineButton{
+		{{Text: "Читать ▸", Data: "M:11"}},
+		{{Text: "Читать ▸", Data: "M:13"}},
+		{{Text: "◀ Назад", Data: "T:42"}},
+	})
+
+	// «S:<did>:0» → все топики с подзаголовками.
+	res, err = dd(ctx, "S:42:0")
+	if err != nil || res == nil || res.Edit == nil {
+		t.Fatalf("S:42:0 = %+v, %v", res, err)
+	}
+	for _, want := range []string{"<b>Habr &lt;b&gt;&amp;&lt;/b&gt;</b>", "<b>Приватный канал</b>", "Вторая"} {
+		if !strings.Contains(res.Edit.Text, want) {
+			t.Errorf("S:42:0 text lacks %q:\n%s", want, res.Edit.Text)
+		}
+	}
+	if len(res.Edit.Buttons) != 4 { // M:11, M:12, M:13, «◀ Назад»
+		t.Errorf("S:42:0 buttons = %+v, want 4 rows", res.Edit.Buttons)
+	}
+
+	// «P:» → ack-заглушка «Медиа недоступно», БЕЗ edit (фото в 9E).
+	res, err = dd(ctx, "P:11")
+	if err != nil || res == nil {
+		t.Fatalf("P:11 = %+v, %v", res, err)
+	}
+	if res.AckText != "Медиа недоступно" || res.Edit != nil || res.Send != nil {
+		t.Errorf("P:11 = %+v, want ack «Медиа недоступно» без Edit/Send", res)
+	}
+	// «PDEL» → ack-only (deleteMessage в 9E).
+	res, err = dd(ctx, "PDEL")
+	if err != nil || res == nil || res.AckText != "" || res.Edit != nil {
+		t.Errorf("PDEL = %+v, %v, want empty ack-only", res, err)
+	}
+	// Неизвестный префикс и мусор → error, не паника.
+	for _, data := range []string{"", "X:1", "S:abc:1", "S:1", "M:abc", "M:99999999999999999999",
+		"L2:", "L3:1", "S:99999999999999999999:1", "P:garbage"} {
+		if res, err := dd(ctx, data); err == nil {
+			t.Errorf("%q: want error, got %+v", data, res)
+		}
+	}
+}
+
+func TestNewDrillDown_MessageView(t *testing.T) {
+	ctx := context.Background()
+	store := &drillStore{
+		hasItem: true,
+		item: storage.DigestItem{ID: 11, DigestID: 42, SourceID: 3, DedupKey: "dk1",
+			Title: "Заголовок", FullText: "Полный текст", URL: "https://a.example/1",
+			MediaRef: "AgADBAAD", MediaKind: "photo"},
+		links: []storage.ItemLink{{DedupKey: "dk1", URL: "https://article.example/x", Kind: "article", Ord: 0}},
+		cache: map[string]storage.LinkCacheRow{
+			"https://article.example/x": {URL: "https://article.example/x", Kind: "article", Title: "Статья", Summary: "Саммари статьи"},
+		},
+	}
+	dd := NewDrillDown(store, nil)
+	res, err := dd(ctx, "M:11")
+	if err != nil || res == nil || res.Edit == nil {
+		t.Fatalf("M:11 = %+v, %v", res, err)
+	}
+	for _, want := range []string{"<b>Заголовок</b>", "Полный текст", "Ссылки:", "📄 Статья", "— Саммари статьи"} {
+		if !strings.Contains(res.Edit.Text, want) {
+			t.Errorf("M: text lacks %q:\n%s", want, res.Edit.Text)
+		}
+	}
+	// Кнопки (§4.6): «🖼 Фото» P: → URL-кнопка «↗ Перейти в источник» →
+	// «◀ Назад» S:<did>:<sid> (did/sid из строки digest_items).
+	if len(res.Edit.Buttons) != 3 {
+		t.Fatalf("M: buttons = %+v, want 3 rows", res.Edit.Buttons)
+	}
+	if res.Edit.Buttons[0][0].Data != "P:11" || res.Edit.Buttons[0][0].Text != "🖼 Фото" {
+		t.Errorf("row0 = %+v, want 🖼 Фото P:11", res.Edit.Buttons[0])
+	}
+	url := res.Edit.Buttons[1][0]
+	if url.Text != "↗ Перейти в источник" || url.URL != "https://a.example/1" || url.Data != "" {
+		t.Errorf("row1 = %+v, want URL-кнопку ↗", url)
+	}
+	if res.Edit.Buttons[2][0].Data != "S:42:3" {
+		t.Errorf("row2 = %+v, want ◀ Назад S:42:3", res.Edit.Buttons[2])
+	}
+
+	// Отсутствующий id → error (ack «Не получилось открыть»), не паника.
+	miss := NewDrillDown(&drillStore{hasItem: false}, nil)
+	if res, err := miss(ctx, "M:777"); err == nil || res != nil {
+		t.Errorf("M:777 = %+v, %v, want error/nil", res, err)
+	}
+}
+
+func TestNewDrillDown_Errors(t *testing.T) {
 	ctx := context.Background()
 	// Мусорные data → error даже без обращения к store (nil-store не паникует:
-	// парсер отказывает раньше).
+	// парсер отказывает раньше). PDEL — единственное, что работает без store.
 	ddNoStore := NewDrillDown(nil, nil)
-	for _, data := range []string{"", "L4:1", "L2:abc", "L3:1", "L2:99999999999999999999"} {
+	for _, data := range []string{"", "X:1", "S:abc:1", "M:abc", "L2:99999999999999999999", "L3:1"} {
 		if res, err := ddNoStore(ctx, data); err == nil {
 			t.Errorf("NewDrillDown(nil,nil)(%q) = %+v, want error", data, res)
 		}
 	}
+	if res, err := ddNoStore(ctx, "PDEL"); err != nil || res == nil || res.Edit != nil {
+		t.Errorf("PDEL без store = %+v, %v, want ack-only", res, err)
+	}
 
-	// Несуществующий digestID (L2 и L3) → error, не паника (ack-ошибка
-	// диспетчера D-1 «Не получилось открыть»).
+	// Несуществующий digestID (S: и legacy L2:/L3:) → error, не паника.
 	missing := NewDrillDown(&drillStore{hasDigest: false}, staticSources())
-	for _, data := range []string{"L2:7", "L3:7:0", "L3:7:3"} {
+	for _, data := range []string{"S:7:0", "S:7:3", "L2:7", "L3:7:0"} {
 		res, err := missing(ctx, data)
 		if err == nil {
 			t.Errorf("%q: want error for unknown digest, got %+v", data, res)
@@ -134,210 +340,87 @@ func TestNewDrillDown_ParseAndNotFoundErrors(t *testing.T) {
 	// Ошибка снапшота источников → error (не глотаем).
 	boom := NewDrillDown(
 		&drillStore{hasDigest: true, digestRow: storage.Digest{ID: 1, TopicID: 2}},
-		func(context.Context) ([]storage.Source, error) {
-			return nil, context.DeadlineExceeded
-		})
-	if _, err := boom(ctx, "L2:1"); err == nil {
-		t.Error("sources snapshot error: want error, got nil")
+		func(context.Context) ([]storage.Source, error) { return nil, context.DeadlineExceeded })
+	for _, data := range []string{"L2:1", "S:1:0"} {
+		if _, err := boom(ctx, data); err == nil {
+			t.Errorf("%q: sources snapshot error: want error, got nil", data)
+		}
 	}
-}
 
-func TestRenderDrillL2_Golden(t *testing.T) {
-	ctx := context.Background()
-	store := &drillStore{
+	// Крайний случай §4.6: digest без items → «Материалов нет» + «◀ Назад».
+	empty := NewDrillDown(&drillStore{
 		hasDigest: true,
-		digestRow: storage.Digest{ID: 42, TopicID: 2, Body: "body"},
-		topics:    []storage.Topic{{ID: 2, Name: "AI <новости> & ML"}},
-		items: []storage.DigestItem{
-			{SourceID: 3, Title: "Title A", Summary: "Первая сводка"},
-			{SourceID: 4, Title: "Заголовок <2>", Summary: ""}, // пустой summary → title
-			{SourceID: 3, Title: "Title B", Summary: "Вторая сводка & <b>"},
-		},
-	}
-	dd := NewDrillDown(store, staticSources(
-		storage.Source{ID: 3, Ref: "Habr <b>&</b>"},
-		storage.Source{ID: 4, Ref: "arxiv.org/list/cs.AI"},
-		// ID 7 ниже не встречается — срез «источник #N» в отдельном кейсе.
-	))
-	res, err := dd(ctx, "L2:42")
-	if err != nil {
-		t.Fatalf("drill L2: %v", err)
-	}
-	if res == nil || res.Edit == nil {
-		t.Fatal("L2: want Edit, got nil")
-	}
-	compareGolden(t, "drill_l2_sections", res.Edit.Text)
-
-	// Кнопки: секция 3, секция 4, затем «◀ Назад» (L1:42). Порядок секций —
-	// первое появление в items, НЕ map-итерация.
-	wantButtons := [][]telegram.InlineButton{
-		{{Text: "Habr <b>&</b> → сообщения", Data: "L3:42:3"}},
-		{{Text: "arxiv.org/list/cs.AI → сообщения", Data: "L3:42:4"}},
-		{{Text: "◀ Назад", Data: "L1:42"}},
-	}
-	assertButtons(t, "L2 sections", res.Edit.Buttons, wantButtons)
-}
-
-func TestRenderDrillL2_UnknownSourceAndTopic(t *testing.T) {
-	ctx := context.Background()
-	store := &drillStore{
-		hasDigest: true,
-		digestRow: storage.Digest{ID: 5, TopicID: 99}, // темы 99 нет → «Тема #99»
-		topics:    []storage.Topic{{ID: 2, Name: "AI"}},
-		items: []storage.DigestItem{
-			{SourceID: 7, Title: "T", Summary: "S"},
-		},
-	}
-	dd := NewDrillDown(store, staticSources()) // снапшот пуст → «источник #7»
-	res, err := dd(ctx, "L2:5")
-	if err != nil {
-		t.Fatalf("drill L2: %v", err)
-	}
-	compareGolden(t, "drill_l2_unknown", res.Edit.Text)
-	assertButtons(t, "L2 unknown", res.Edit.Buttons, [][]telegram.InlineButton{
-		{{Text: "источник #7 → сообщения", Data: "L3:5:7"}},
-		{{Text: "◀ Назад", Data: "L1:5"}},
-	})
-}
-
-func TestRenderDrillL2_TooManySections(t *testing.T) {
-	ctx := context.Background()
-	items := make([]storage.DigestItem, 0, 16)
-	sources := make([]storage.Source, 0, 16)
-	for i := int64(1); i <= 16; i++ {
-		items = append(items, storage.DigestItem{SourceID: i, Title: "T", Summary: "S"})
-		sources = append(sources, storage.Source{ID: i, Ref: "src" + strconv.FormatInt(i, 10)})
-	}
-	store := &drillStore{
-		hasDigest: true,
-		digestRow: storage.Digest{ID: 6, TopicID: 2},
+		digestRow: storage.Digest{ID: 8, TopicID: 2},
 		topics:    []storage.Topic{{ID: 2, Name: "Тема"}},
-		items:     items,
+	}, staticSources())
+	res, err := empty(ctx, "S:8:0")
+	if err != nil || res == nil || res.Edit == nil {
+		t.Fatalf("S:8:0 = %+v, %v", res, err)
 	}
-	dd := NewDrillDown(store, staticSources(sources...))
-	res, err := dd(ctx, "L2:6")
-	if err != nil {
-		t.Fatalf("drill L2: %v", err)
+	if !strings.Contains(res.Edit.Text, "Материалов нет") {
+		t.Errorf("empty digest text = %q, want «Материалов нет»", res.Edit.Text)
 	}
-	compareGolden(t, "drill_l2_toomany", res.Edit.Text)
-	// План §D (1333–1336): >15 секций → только «Общий список» + «◀ Назад».
-	assertButtons(t, "L2 toomany", res.Edit.Buttons, [][]telegram.InlineButton{
-		{{Text: "Общий список", Data: "L3:6:0"}},
-		{{Text: "◀ Назад", Data: "L1:6"}},
+	assertButtons(t, "empty S:", res.Edit.Buttons, [][]telegram.InlineButton{
+		{{Text: "◀ Назад", Data: "T:8"}},
 	})
 }
 
-func TestRenderDrillL2_LongLabelTruncated(t *testing.T) {
-	// Урок A2 H1: бюджет лейбла БАЙТОВЫЙ — длинное имя режется на границе
-	// рун с «…», итог ≤64 байт.
-	long := strings.Repeat("я", 40) // 80 байт > бюджета 38 (64−23−3)
-	label := telegram.TruncateButtonLabelTo(long, l2BtnBudget) + l2BtnSuffix
-	if len(label) > 64 {
-		t.Fatalf("label %d bytes > 64", len(label))
-	}
-	if !strings.HasSuffix(label, l2BtnSuffix) || !strings.Contains(label, "…") {
-		t.Fatalf("label %q: want truncation ellipsis before suffix", label)
-	}
-}
+// --- sections_json и имена источников ---
 
-// Ревью D M1: секция с SourceID==0 (NULL source_id → COALESCE 0) НЕ получает
-// кнопку — «L3:<did>:0» сентинел «все элементы», кнопка обещала бы фильтр.
-func TestRenderDrillL2_ZeroSourceNoButton(t *testing.T) {
-	res := renderDrillL2("Тема", []l2Section{
-		{SourceID: 0, Name: "источник #0", Items: []storage.DigestItem{{Title: "a"}}},
-		{SourceID: 7, Name: "habr", Items: []storage.DigestItem{{Title: "b"}}},
-	}, 42)
-	if res.Edit == nil {
-		t.Fatal("nil Edit")
+func TestParseTopicSections(t *testing.T) {
+	got := ParseTopicSections(`[{"source_id":3,"summary":"s3"},{"source_id":4,"summary":"s4"},{"source_id":3,"summary":"dup"},{"source_id":5,"summary":"  "},{"source_id":6,"summary":"s6"}]`)
+	want := map[int64]string{3: "s3", 4: "s4", 6: "s6"}
+	if len(got) != len(want) {
+		t.Fatalf("sections = %v, want %v", got, want)
 	}
-	if !strings.Contains(res.Edit.Text, "источник #0") {
-		t.Error("нулевая секция должна остаться в тексте")
-	}
-	for _, row := range res.Edit.Buttons {
-		for _, b := range row {
-			if b.Data == "L3:42:0" {
-				t.Errorf("кнопка-сентинел %q для нулевой секции недопустима", b.Data)
-			}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("sections[%d] = %q, want %q", k, got[k], v)
 		}
 	}
-	want := map[string]bool{"L3:42:7": false, "L1:42": false}
-	for _, row := range res.Edit.Buttons {
-		for _, b := range row {
-			if _, ok := want[b.Data]; ok {
-				want[b.Data] = true
-			}
-		}
-	}
-	for data, seen := range want {
-		if !seen {
-			t.Errorf("ожидалась кнопка %q", data)
+	// Пусто/битый JSON → пустая map (деградация, не ошибка).
+	for _, s := range []string{"", "   ", "не json", `[{"source_id":1`, `{"source_id":1}`} {
+		if m := ParseTopicSections(s); len(m) != 0 {
+			t.Errorf("ParseTopicSections(%q) = %v, want empty", s, m)
 		}
 	}
 }
 
-// Ревью D L7: пустой title при живой ссылке → «(без заголовка)» внутри <a>,
-// а не пустая entity.
-func TestRenderDrillL3_EmptyTitlePlaceholder(t *testing.T) {
-	res := renderDrillL3("src", []storage.DigestItem{
-		{Title: "   ", URL: "https://x.dev/a", Snippet: "s"},
-		{Title: "", TgPeer: "durov", TgMsgID: 5},
-	}, 42)
-	if !strings.Contains(res.Edit.Text, `<a href="https://x.dev/a">(без заголовка)</a>`) {
-		t.Errorf("want placeholder anchor, got:\n%s", res.Edit.Text)
-	}
-	if !strings.Contains(res.Edit.Text, `<a href="https://t.me/durov/5">(без заголовка)</a>`) {
-		t.Errorf("want placeholder deep-link anchor, got:\n%s", res.Edit.Text)
-	}
-}
-
-func TestRenderDrillL3_Golden(t *testing.T) {
+func TestSourceDisplayNames_PeerFallback(t *testing.T) {
 	ctx := context.Background()
-	longSnippet := strings.Repeat("с", 200) // 200 рун → обрезка до 120
-	items := []storage.DigestItem{
-		{SourceID: 3, Title: "RSS <материал>", URL: "https://example.com/a?x=1&y=2", Snippet: "Короткий snippet"},
-		{SourceID: 3, Title: "JS-схема", URL: "javascript:alert(1)", TgPeer: "", TgMsgID: 0}, // без ссылки!
-		{SourceID: 4, Title: "Публичный пост", TgPeer: "durov", TgMsgID: 42},
-		{SourceID: 4, Title: "Приватный пост", TgPeer: "-1001234567890", TgMsgID: 7},
-		{SourceID: 4, Title: "Без ссылки", URL: "", TgPeer: "", TgMsgID: 0, Snippet: ""},
-		{SourceID: 5, Title: "Длинный snippet", URL: "http://plain.example/x", Snippet: longSnippet},
-	}
-	store := &drillStore{
-		hasDigest: true,
-		digestRow: storage.Digest{ID: 9, TopicID: 2},
-		items:     items,
-	}
-	dd := NewDrillDown(store, staticSources(
-		storage.Source{ID: 3, Ref: "Habr"},
-		storage.Source{ID: 4, Ref: "@telegram"},
+	store := &drillStore{peers: map[int64]storage.Peer{
+		123: {MTProtoID: 123, Title: "Название канала"},
+		456: {MTProtoID: 456, Title: "   "}, // пустой Title → Ref
+	}}
+	names, err := SourceDisplayNames(ctx, store, staticSources(
+		storage.Source{ID: 1, Kind: "tg_mtproto", Ref: "-100123"},
+		storage.Source{ID: 2, Kind: "tg_mtproto", Ref: "-100456"},
+		storage.Source{ID: 3, Kind: "tg_mtproto", Ref: "-100999"}, // нет peer-строки → Ref
+		storage.Source{ID: 4, Kind: "rss", Ref: "-100123"},        // не tg_* → Ref как есть
+		storage.Source{ID: 5, Kind: "tg_public", Ref: "durov"},    // username → Ref (GetPeer keyed by id)
 	))
-
-	// sourceID=0 → ВСЕ элементы, заголовок «Все сообщения».
-	all, err := dd(ctx, "L3:9:0")
 	if err != nil {
-		t.Fatalf("drill L3 all: %v", err)
+		t.Fatalf("SourceDisplayNames: %v", err)
 	}
-	compareGolden(t, "drill_l3_all", all.Edit.Text)
-	assertButtons(t, "L3 all", all.Edit.Buttons, [][]telegram.InlineButton{
-		{{Text: "◀ Назад", Data: "L2:9"}},
-	})
-	if strings.Contains(all.Edit.Text, "javascript:") {
-		t.Error("javascript: URL must never reach href (план §4.8)")
+	want := map[int64]string{1: "Название канала", 2: "-100456", 3: "-100999", 4: "-100123", 5: "durov"}
+	for id, w := range want {
+		if names[id] != w {
+			t.Errorf("names[%d] = %q, want %q", id, names[id], w)
+		}
 	}
-
-	// sourceID=4 → только его элементы, имя из снапшота.
-	bySrc, err := dd(ctx, "L3:9:4")
-	if err != nil {
-		t.Fatalf("drill L3 by source: %v", err)
+	// sources == nil → пустой снапшот (деградация «источник #N» в рендерах).
+	if m, err := SourceDisplayNames(ctx, store, nil); err != nil || len(m) != 0 {
+		t.Errorf("nil sources = %v, %v, want empty", m, err)
 	}
-	compareGolden(t, "drill_l3_bysource", bySrc.Edit.Text)
-
-	// Неизвестный sourceID → «источник #77», пусто без ошибки.
-	unknown, err := dd(ctx, "L3:9:77")
-	if err != nil {
-		t.Fatalf("drill L3 unknown source: %v", err)
+	// Ошибка снапшота → error.
+	if _, err := SourceDisplayNames(ctx, store, func(context.Context) ([]storage.Source, error) {
+		return nil, context.DeadlineExceeded
+	}); err == nil {
+		t.Error("snapshot error: want error, got nil")
 	}
-	compareGolden(t, "drill_l3_unknown_source", unknown.Edit.Text)
 }
+
+// --- сохранённые тесты живых хелперов (l3Link, fitDrillDownList) ---
 
 func TestL3Link_SchemeAndQuotes(t *testing.T) {
 	tests := []struct {
@@ -398,33 +481,30 @@ func TestFitDrillDownList(t *testing.T) {
 	})
 
 	t.Run("header-over-limit", func(t *testing.T) {
-		header := strings.Repeat("h", 5000)
-		got := fitDrillDownList(header, nil, "\n")
-		if utf8.RuneCountInString(got) != maxBodyRunes || !strings.HasSuffix(got, "…") {
-			t.Fatalf("want %d runes ending with …, got %d", maxBodyRunes, utf8.RuneCountInString(got))
+		got := fitDrillDownList(strings.Repeat("z", 5000), nil, "\n")
+		if n := utf8.RuneCountInString(got); n != maxBodyRunes {
+			t.Errorf("rune count = %d, want exactly %d", n, maxBodyRunes)
 		}
-	})
-
-	t.Run("fits-as-is", func(t *testing.T) {
-		got := fitDrillDownList("H", []string{"a", "b"}, "\n")
-		if got != "H\n\na\nb" {
-			t.Fatalf("got %q", got)
+		if !strings.HasSuffix(got, "…") {
+			t.Error("header cut must end with …")
 		}
 	})
 }
 
+// assertButtons — побайтовое сравнение клавиатуры (образец из старых
+// drilldown-тестов Этапа 8 D).
 func assertButtons(t *testing.T, label string, got, want [][]telegram.InlineButton) {
 	t.Helper()
 	if len(got) != len(want) {
-		t.Fatalf("%s: %d button rows, want %d: %+v", label, len(got), len(want), got)
+		t.Fatalf("%s: %d rows, want %d: %+v", label, len(got), len(want), got)
 	}
-	for i := range got {
+	for i := range want {
 		if len(got[i]) != len(want[i]) {
-			t.Fatalf("%s row %d: %d buttons, want %d", label, i, len(got[i]), len(want[i]))
+			t.Fatalf("%s row %d: %+v, want %+v", label, i, got[i], want[i])
 		}
-		for j := range got[i] {
+		for j := range want[i] {
 			if got[i][j] != want[i][j] {
-				t.Errorf("%s row %d col %d: got %+v, want %+v", label, i, j, got[i][j], want[i][j])
+				t.Errorf("%s row %d btn %d: %+v, want %+v", label, i, j, got[i][j], want[i][j])
 			}
 		}
 	}

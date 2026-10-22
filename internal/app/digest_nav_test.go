@@ -30,7 +30,7 @@ func TestNewDigestViewer_Topic(t *testing.T) {
 	viewer := newDigestViewer(st)
 
 	// RunID != 0 → кнопка «◀ К оглавлению» (TOC:<runID>).
-	id, err := st.InsertDigest(ctx, 777, 1, "STORED BODY", 2)
+	id, err := st.InsertDigest(ctx, 777, 1, "STORED BODY", 2, "")
 	if err != nil {
 		t.Fatalf("InsertDigest: %v", err)
 	}
@@ -45,7 +45,7 @@ func TestNewDigestViewer_Topic(t *testing.T) {
 		t.Fatalf("viewer(topic) = ok:%v err:%v", ok, err)
 	}
 	if !strings.Contains(view.Text, "STORED BODY") ||
-		!strings.Contains(view.Text, "Item One") || !strings.Contains(view.Text, "Item Two") {
+		!strings.Contains(view.Text, "Топики:") || !strings.Contains(view.Text, "источник #0") {
 		t.Errorf("L1 text unexpected:\n%s", view.Text)
 	}
 	if len(view.Buttons) != 1 || len(view.Buttons[0]) != 1 ||
@@ -54,7 +54,7 @@ func TestNewDigestViewer_Topic(t *testing.T) {
 	}
 
 	// Легаси run_id=0 → оглавления нет → кнопки нет.
-	legacyID, err := st.InsertDigest(ctx, 0, 1, "LEGACY", 1)
+	legacyID, err := st.InsertDigest(ctx, 0, 1, "LEGACY", 1, "")
 	if err != nil {
 		t.Fatalf("InsertDigest(legacy): %v", err)
 	}
@@ -86,11 +86,11 @@ func TestNewDigestViewer_TOC(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateTopic: %v", err)
 	}
-	id1, err := st.InsertDigest(ctx, 888, 1, "B1", 2)
+	id1, err := st.InsertDigest(ctx, 888, 1, "B1", 2, "")
 	if err != nil {
 		t.Fatalf("InsertDigest: %v", err)
 	}
-	id5, err := st.InsertDigest(ctx, 888, fiveID, "B5", 1)
+	id5, err := st.InsertDigest(ctx, 888, fiveID, "B5", 1, "")
 	if err != nil {
 		t.Fatalf("InsertDigest: %v", err)
 	}
@@ -137,7 +137,7 @@ func TestNewDigestViewer_TOCBrokenCreatedAt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	if _, err := st.InsertDigest(ctx, 999, 1, "B", 1); err != nil {
+	if _, err := st.InsertDigest(ctx, 999, 1, "B", 1, ""); err != nil {
 		t.Fatalf("InsertDigest: %v", err)
 	}
 	if err := st.Close(); err != nil {

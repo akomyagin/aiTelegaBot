@@ -12,7 +12,7 @@ func TestListDigestItemsBySource(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
 
-	digestID, err := st.InsertDigest(ctx, 500, 1, "body", 4)
+	digestID, err := st.InsertDigest(ctx, 500, 1, "body", 4, "")
 	if err != nil {
 		t.Fatalf("InsertDigest: %v", err)
 	}
@@ -26,7 +26,7 @@ func TestListDigestItemsBySource(t *testing.T) {
 		t.Fatalf("MarkDelivered: %v", err)
 	}
 	// Соседний дайджест с тем же источником не должен подмешиваться в выборку.
-	otherID, err := st.InsertDigest(ctx, 500, 2, "body2", 1)
+	otherID, err := st.InsertDigest(ctx, 500, 2, "body2", 1, "")
 	if err != nil {
 		t.Fatalf("InsertDigest other: %v", err)
 	}

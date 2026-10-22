@@ -1,8 +1,8 @@
 // Stage 8 D-1 тесты (план §D, тест-кейсы D на telegram-уровне): диспетчер
 // L1:/L2:/L3: — DrillDown seam (data проходит насквозь без парсинга, порядок
 // ack-раньше-edit, ошибка seam'а → ack без edit, nil-деградация без паники,
-// not-owner/inaccessible → seam не вызывается) и композиция кнопок L1-view
-// («Подробнее →» + «◀ К оглавлению» — граница C/D, RenderTopicL1 заморожен).
+// not-owner/inaccessible → seam не вызывается) и alias L1: → viewer-путь
+// (9D: клавиатуру T:/L1:-view полностью собирает viewer).
 
 package telegram
 
@@ -134,8 +134,8 @@ func TestHandleCallbackQuery_DrillDown(t *testing.T) {
 }
 
 // «L1:<digestID>» — alias T:-пути: тот же viewer seam (ViewKindTopic), тот же
-// owner/ack/inaccessible-контур; drillDown не вызывается. Кнопки L1-view:
-// «Подробнее →» (L2:<digestID>) РЯДОМ с «◀ К оглавлению» (TOC:<runID>), первой.
+// owner/ack/inaccessible-контур; drillDown не вызывается. Клавиатура — как её
+// собрал viewer (9D: telegram ничего не докомпановывает, «Подробнее →» нет).
 func TestHandleCallbackQuery_L1IsTopicViewAlias(t *testing.T) {
 	const owner = int64(111)
 	view := DigestView{
@@ -160,44 +160,14 @@ func TestHandleCallbackQuery_L1IsTopicViewAlias(t *testing.T) {
 		t.Fatalf("edits = %v, want [L1 BODY]", rec.texts)
 	}
 	kb := rec.kbs[0]
-	if kb == nil || len(kb.InlineKeyboard) != 1 || len(kb.InlineKeyboard[0]) != 2 {
-		t.Fatalf("markup = %+v, want 1 ряд × 2 кнопки", kb)
+	if kb == nil || len(kb.InlineKeyboard) != 1 || len(kb.InlineKeyboard[0]) != 1 {
+		t.Fatalf("markup = %+v, want 1 ряд [◀ К оглавлению TOC:77]", kb)
 	}
-	if kb.InlineKeyboard[0][0].Text != drillDownMoreLabel || kb.InlineKeyboard[0][0].CallbackData != "L2:42" {
-		t.Errorf("button[0] = %+v, want {%s, L2:42}", kb.InlineKeyboard[0][0], drillDownMoreLabel)
-	}
-	if kb.InlineKeyboard[0][1].Text != "◀ К оглавлению" || kb.InlineKeyboard[0][1].CallbackData != "TOC:77" {
-		t.Errorf("button[1] = %+v, want {◀ К оглавлению, TOC:77}", kb.InlineKeyboard[0][1])
+	if kb.InlineKeyboard[0][0].Text != "◀ К оглавлению" || kb.InlineKeyboard[0][0].CallbackData != "TOC:77" {
+		t.Errorf("button[0] = %+v, want {◀ К оглавлению, TOC:77}", kb.InlineKeyboard[0][0])
 	}
 	// view.Buttons не мутируется in-place (viewer может переиспользовать срезы).
 	if len(view.Buttons[0]) != 1 || view.Buttons[0][0].Data != "TOC:77" {
 		t.Errorf("view.Buttons мутирован: %+v", view.Buttons)
-	}
-}
-
-// T:-view без кнопок viewer'а (например, легаси run_id=0 — «◀ К оглавлению»
-// не рендерится): «Подробнее →» становится единственным рядом.
-func TestHandleCallbackQuery_MoreButtonWithoutViewerButtons(t *testing.T) {
-	const owner = int64(111)
-	rec := &recorder{}
-	b := &Bot{chatID: owner, log: discardLogger(), ackFn: rec.ack, editFn: rec.edit,
-		digestViewer: func(ctx context.Context, req DigestViewRequest) (DigestView, bool, error) {
-			return DigestView{Text: "BODY"}, true, nil
-		}}
-
-	b.handleCallbackQuery(context.Background(), cbQuery("T:42", owner, true))
-
-	kb := rec.kbs[0]
-	if kb == nil || len(kb.InlineKeyboard) != 1 || len(kb.InlineKeyboard[0]) != 1 ||
-		kb.InlineKeyboard[0][0].CallbackData != "L2:42" {
-		t.Fatalf("markup = %+v, want один ряд [Подробнее → L2:42]", kb)
-	}
-
-	// TOC-view кнопку «Подробнее» НЕ получает (это кнопка L1-вью темы).
-	rec2 := &recorder{}
-	b.ackFn, b.editFn = rec2.ack, rec2.edit
-	b.handleCallbackQuery(context.Background(), cbQuery("TOC:77", owner, true))
-	if rec2.kbs[0] != nil {
-		t.Errorf("TOC-view получил markup %+v, want nil", rec2.kbs[0])
 	}
 }

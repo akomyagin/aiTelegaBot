@@ -9,8 +9,6 @@ import (
 	"testing"
 	"time"
 	"unicode/utf8"
-
-	"github.com/akomyagin/aiTelegaBot/internal/storage"
 )
 
 var updateGoldens = flag.Bool("update", false, "rewrite golden files under testdata/")
@@ -58,70 +56,6 @@ func TestRenderTopicBody_Golden(t *testing.T) {
 			compareGolden(t, tt.name, got)
 		})
 	}
-}
-
-func TestRenderTopicL1_Golden(t *testing.T) {
-	body := RenderTopicBody("Тема <1>", "Заголовок & суть.", 2, goldenNow)
-	items := []storage.DigestItem{
-		{Title: "Первый материал <b>&</b> " + strings.Repeat("x", 150)},
-		{Title: "Второй"},
-	}
-
-	t.Run("normal", func(t *testing.T) {
-		compareGolden(t, "topic_l1_normal", RenderTopicL1(body, items))
-	})
-	t.Run("empty_items", func(t *testing.T) {
-		got := RenderTopicL1(body, nil)
-		compareGolden(t, "topic_l1_empty_items", got)
-		if got != body {
-			t.Errorf("empty items must return the body AS IS")
-		}
-	})
-}
-
-func TestRenderTopicL1_Overflow(t *testing.T) {
-	t.Run("items_cut", func(t *testing.T) {
-		body := strings.Repeat("а", 3900)
-		items := make([]storage.DigestItem, 30)
-		for i := range items {
-			items[i] = storage.DigestItem{Title: "заголовок материала номер " + string(rune('A'+i%26))}
-		}
-		got := RenderTopicL1(body, items)
-		if n := utf8.RuneCountInString(got); n > 4096 {
-			t.Errorf("rune count = %d, want ≤4096", n)
-		}
-		if !strings.Contains(got, "…и ещё ") {
-			t.Errorf("missing «…и ещё K» marker, tail: %q", got[max(0, len(got)-120):])
-		}
-		if !strings.Contains(got, "• заголовок материала номер A") {
-			t.Error("the first item line must survive the tail cut")
-		}
-	})
-	t.Run("body_cut", func(t *testing.T) {
-		body := strings.Repeat("б", 5000)
-		got := RenderTopicL1(body, []storage.DigestItem{{Title: "T"}})
-		if n := utf8.RuneCountInString(got); n != 4096 {
-			t.Errorf("rune count = %d, want exactly 4096", n)
-		}
-		if !strings.HasSuffix(got, "…") {
-			t.Error("body cut must end with …")
-		}
-	})
-	// Review C1 M1 regression: bodies in the ~4081–4094-rune band made the
-	// old code panic (slice r[:4095] on a shorter body) when even the
-	// marker-only tail did not fit. The body alone fits → returned as is.
-	t.Run("body_in_panic_band_returned_as_is", func(t *testing.T) {
-		for _, n := range []int{4085, 4090, 4094, 4095, 4096} {
-			body := strings.Repeat("в", n)
-			got := RenderTopicL1(body, []storage.DigestItem{{Title: "Длинный тайтл"}})
-			if r := utf8.RuneCountInString(got); r > 4096 {
-				t.Errorf("n=%d: rune count = %d, want ≤4096", n, r)
-			}
-			if !strings.HasPrefix(got, body) {
-				t.Errorf("n=%d: body must survive verbatim when it fits", n)
-			}
-		}
-	})
 }
 
 // Review C1 M2: RenderTopicBody caps the stored body — headline to 800 runes,

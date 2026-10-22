@@ -29,7 +29,7 @@ const digestItemFullTextRunes = 8000
 
 // digestSelect is the shared column list for digests reads. topic_id is read
 // through COALESCE(topic_id, 1): legacy NULL ≡ «Без темы».
-const digestSelect = "SELECT id, run_id, COALESCE(topic_id, 1), created_at, item_count, body, delivered"
+const digestSelect = "SELECT id, run_id, COALESCE(topic_id, 1), created_at, item_count, body, delivered, sections_json"
 
 // Digest is one persisted topic digest (a digests row).
 type Digest struct {
@@ -40,6 +40,11 @@ type Digest struct {
 	ItemCount int
 	Body      string // ready HTML L1 topic header (RenderTopicBody), stored at insert
 	Delivered bool
+	// SectionsJSON — саммари топиков вызова C (миграция v6, директива
+	// диспетчера 9D-2a): JSON-массив [{"source_id":N,"summary":"…"}], порядок =
+	// порядок collect. '' (legacy/v5-строки) или битый JSON → L1/L2 деградируют
+	// на строки без саммари (digest.ParseTopicSections), не ошибка.
+	SectionsJSON string
 }
 
 // DigestItem is one drill-down row of a digest (digest_items).
@@ -103,15 +108,21 @@ func NewDigestItem(it feed.Item, summary, class string) DigestItem {
 }
 
 // InsertDigest creates a digests row with delivered=0 and returns its id
-// (plan §4.3: delivery gates persistence).
-func (s *SQLiteStore) InsertDigest(ctx context.Context, runID, topicID int64, body string, itemCount int) (int64, error) {
+// (plan §4.3: delivery gates persistence). sectionsJSON (миграция v6, Этап
+// 9D-2a) — саммари топиков вызова C для L1/L2-view после рестарта; ” =
+// legacy/нет саммари. Параметр InsertDigest, а не отдельный SetDigestSections
+// (обоснование директивы диспетчера): sections известны в момент вставки —
+// pipeline строит body и sections из одного результата вызова C, поэтому одна
+// запись атомарна, нет окна «digest без sections» и нет второго round-trip.
+// В 9D-2a pipeline передаёт "" — полный wiring вызова C сделает 9D-2b.
+func (s *SQLiteStore) InsertDigest(ctx context.Context, runID, topicID int64, body string, itemCount int, sectionsJSON string) (int64, error) {
 	now := time.Now().UTC().Format(time.RFC3339)
 	// topicID 0 → NULL (review C1 L2): reads COALESCE(topic_id,1), so a
 	// literal 0 would bypass the «Без темы» normalization — defense even
 	// though pipeline Run maps 0→1 itself.
 	res, err := s.db.ExecContext(ctx,
-		"INSERT INTO digests(created_at, item_count, body, delivered, topic_id, run_id) VALUES(?,?,?,0,?,?)",
-		now, itemCount, body, nilIfZero(topicID), runID)
+		"INSERT INTO digests(created_at, item_count, body, delivered, topic_id, run_id, sections_json) VALUES(?,?,?,0,?,?,?)",
+		now, itemCount, body, nilIfZero(topicID), runID, sectionsJSON)
 	if err != nil {
 		return 0, fmt.Errorf("insert digest: %w", err)
 	}
@@ -282,7 +293,7 @@ type rowScanner interface {
 func scanDigest(row rowScanner) (Digest, int, error) {
 	var d Digest
 	var delivered int
-	if err := row.Scan(&d.ID, &d.RunID, &d.TopicID, &d.CreatedAt, &d.ItemCount, &d.Body, &delivered); err != nil {
+	if err := row.Scan(&d.ID, &d.RunID, &d.TopicID, &d.CreatedAt, &d.ItemCount, &d.Body, &delivered, &d.SectionsJSON); err != nil {
 		return Digest{}, 0, fmt.Errorf("scan digest: %w", err)
 	}
 	return d, delivered, nil

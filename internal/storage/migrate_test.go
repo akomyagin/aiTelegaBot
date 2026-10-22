@@ -9,7 +9,7 @@ import (
 )
 
 // TestMigrate_FreshDBReachesLatestVersion: a fresh Open runs all migrations
-// (user_version=5 since Stage 9A) and a repeated Open of the same file is
+// (user_version=6 since Этап 9D-2a) and a repeated Open of the same file is
 // idempotent. The v2→v3 upgrade path itself is covered in topics_test.go,
 // the v4→v5 upgrade path — in TestMigrate_V4ToV5 below.
 func TestMigrate_FreshDBReachesLatestVersion(t *testing.T) {
@@ -24,8 +24,8 @@ func TestMigrate_FreshDBReachesLatestVersion(t *testing.T) {
 	if err := st.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatalf("read user_version: %v", err)
 	}
-	if version != 5 {
-		t.Errorf("user_version = %d, want 5", version)
+	if version != 6 {
+		t.Errorf("user_version = %d, want 6", version)
 	}
 	if err := st.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -40,8 +40,8 @@ func TestMigrate_FreshDBReachesLatestVersion(t *testing.T) {
 	if err := st2.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatalf("read user_version after reopen: %v", err)
 	}
-	if version != 5 {
-		t.Errorf("user_version after reopen = %d, want 5", version)
+	if version != 6 {
+		t.Errorf("user_version after reopen = %d, want 6", version)
 	}
 }
 
@@ -242,8 +242,8 @@ func TestMigrate_V4ToV5(t *testing.T) {
 	if err := st.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatalf("read user_version: %v", err)
 	}
-	if version != 5 {
-		t.Errorf("user_version = %d, want 5", version)
+	if version != 6 {
+		t.Errorf("user_version = %d, want 6", version)
 	}
 
 	// Новые таблицы v5 существуют.
@@ -317,7 +317,7 @@ func TestMigrate_V4ToV5(t *testing.T) {
 	if err := st2.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatalf("read user_version after reopen: %v", err)
 	}
-	if version != 5 {
-		t.Errorf("user_version after reopen = %d, want 5", version)
+	if version != 6 {
+		t.Errorf("user_version after reopen = %d, want 6", version)
 	}
 }

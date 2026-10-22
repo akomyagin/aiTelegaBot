@@ -231,6 +231,46 @@ func (b *Bot) handleCallbackQuery(ctx context.Context, q *models.CallbackQuery) 
 		return
 	}
 
+	// Этап 9D (план §4.6, «Подэтап 9D»): порядок CutPrefix — TOC: → T: → S: →
+	// M: → P: → PDEL → L1: → L2: → L3: → ad:/dp:/ts:/tl:/tn: → fallback. Все
+	// префиксы попарно не пересекаются (второй байт различается), порядок
+	// задан планом; owner-чек и ack-контур — выше.
+	if rest, ok := strings.CutPrefix(q.Data, cbPrefixTOC); ok {
+		b.handleTOC(ctx, q, rest)
+		return
+	}
+	if rest, ok := strings.CutPrefix(q.Data, cbPrefixTopicOpen); ok {
+		b.handleTopicOpen(ctx, q, rest)
+		return
+	}
+	// S: (топик) и M: (сообщение) уходят в drillDown seam (digest.NewDrillDown —
+	// диспетчер 9D); туда же — legacy L2:/L3: кнопок СТАРЫХ доставленных
+	// сообщений (alias'ы §4.6: L2:<did> → T:-аналог, L3:<did>:<sid> →
+	// S:<did>:<sid>). Аргументы НЕ парсятся здесь — q.Data передаётся как есть,
+	// включая мусор (сторона seam'а отвечает ошибкой → ack «Не получилось
+	// открыть»).
+	if strings.HasPrefix(q.Data, cbPrefixSource) || strings.HasPrefix(q.Data, cbPrefixMessage) ||
+		strings.HasPrefix(q.Data, cbPrefixL2) || strings.HasPrefix(q.Data, cbPrefixL3) {
+		b.handleDrillDown(ctx, q)
+		return
+	}
+	// P: (фото) — 9D-заглушка: ack «Медиа недоступно», БЕЗ edit (sendPhoto —
+	// 9E, CallbackResult.Send в 9D всегда nil). PDEL — ack-only без
+	// deleteMessage (9E): фото-сообщений в 9D не появляется.
+	if strings.HasPrefix(q.Data, cbPrefixPhoto) {
+		b.answerCallback(ctx, q.ID, photoUnavailableText)
+		return
+	}
+	if q.Data == cbPhotoDelete {
+		b.answerCallback(ctx, q.ID, "")
+		return
+	}
+	// L1: — legacy alias T:-пути (viewer seam; owner/ack/inaccessible-механики
+	// общие). L2:/L3: — выше, в drillDown seam.
+	if rest, ok := strings.CutPrefix(q.Data, cbPrefixL1); ok {
+		b.handleTopicOpen(ctx, q, rest)
+		return
+	}
 	if rest, ok := strings.CutPrefix(q.Data, cbPrefixDialogAdd); ok {
 		b.handleDialogAdd(ctx, q, rest)
 		return
@@ -241,8 +281,7 @@ func (b *Bot) handleCallbackQuery(ctx context.Context, q *models.CallbackQuery) 
 	}
 	// Stage 8 B: topic prefixes (план §4.4/§4.11) — тот же диспетчер, owner-чек
 	// и ack-контур выше; обработчики в topics_admin.go. Второй диспетчер НЕ
-	// заводится. Порядок CutPrefix безопасен: ts:/tl:/tn: не пересекаются с
-	// ad:/dp: (и будущими L1/L2/L3).
+	// заводится.
 	if rest, ok := strings.CutPrefix(q.Data, cbPrefixTopicSet); ok {
 		b.handleTopicSetCallback(ctx, q, rest)
 		return
@@ -253,31 +292,6 @@ func (b *Bot) handleCallbackQuery(ctx context.Context, q *models.CallbackQuery) 
 	}
 	if rest, ok := strings.CutPrefix(q.Data, cbPrefixTopicNone); ok {
 		b.handleTopicNoneCallback(ctx, q, rest)
-		return
-	}
-	// Stage 8 C: digest navigation (план §4.4/§C) — TOC: проверяется раньше
-	// T: (читаемость; префиксы не пересекаются — второй символ различается).
-	// Обработчики в topic_view.go; owner-чек и ack-контур — выше.
-	if rest, ok := strings.CutPrefix(q.Data, cbPrefixTOC); ok {
-		b.handleTOC(ctx, q, rest)
-		return
-	}
-	if rest, ok := strings.CutPrefix(q.Data, cbPrefixTopicOpen); ok {
-		b.handleTopicOpen(ctx, q, rest)
-		return
-	}
-	// Stage 8 D: drill-down L1→L2→L3 (план §4.4/§D). L1: — alias T:-пути
-	// (кнопка «◀ Назад» из L2 ведёт в тот же topic-view: viewer seam, owner/
-	// ack/inaccessible-механики общие). L2:/L3: уходят в drillDown seam;
-	// аргументы НЕ парсятся здесь — q.Data передаётся как есть (D-2). Порядок
-	// CutPrefix безопасен: L1:/L2:/L3: не пересекаются с ad:/dp:/ts:/tl:/tn:/
-	// T:/TOC: (регистр и второй байт различаются).
-	if rest, ok := strings.CutPrefix(q.Data, cbPrefixL1); ok {
-		b.handleTopicOpen(ctx, q, rest)
-		return
-	}
-	if strings.HasPrefix(q.Data, cbPrefixL2) || strings.HasPrefix(q.Data, cbPrefixL3) {
-		b.handleDrillDown(ctx, q)
 		return
 	}
 	if b.callbackHandler != nil {

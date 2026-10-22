@@ -48,8 +48,8 @@ func TestMigrate_FromV2ReachesLatest(t *testing.T) {
 	if err := st.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatalf("read user_version: %v", err)
 	}
-	if version != 5 {
-		t.Errorf("user_version = %d, want 5", version)
+	if version != 6 {
+		t.Errorf("user_version = %d, want 6", version)
 	}
 
 	// Raw check: legacy row keeps its data, origin defaults, topic NULL.
@@ -100,8 +100,8 @@ func TestMigrate_FromV2ReachesLatest(t *testing.T) {
 	if err := st2.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatalf("read user_version after reopen: %v", err)
 	}
-	if version != 5 {
-		t.Errorf("user_version after reopen = %d, want 5", version)
+	if version != 6 {
+		t.Errorf("user_version after reopen = %d, want 6", version)
 	}
 }
 

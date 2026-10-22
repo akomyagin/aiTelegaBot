@@ -570,7 +570,7 @@ func (p *Pipeline) Run(ctx context.Context) error {
 		}
 		body := RenderTopicBody(name, "", len(kept), now, fallbackTitles...)
 
-		digestID, err := p.Store.InsertDigest(ctx, runID, tid, body, len(kept))
+		digestID, err := p.Store.InsertDigest(ctx, runID, tid, body, len(kept), "")
 		if err != nil {
 			log.Error("insert digest failed; topic skipped", "topic_id", tid, "err", err)
 			failed++

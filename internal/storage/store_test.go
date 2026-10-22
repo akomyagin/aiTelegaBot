@@ -37,9 +37,9 @@ func TestSQLiteStore(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 
-	// 1. Open creates schema at the latest migration version (Stage 8 C: v4).
-	if v := userVersion(t, path); v != 5 {
-		t.Fatalf("user_version = %d, want 5", v)
+	// 1. Open creates schema at the latest migration version (Этап 9D-2a: v6).
+	if v := userVersion(t, path); v != 6 {
+		t.Fatalf("user_version = %d, want 6", v)
 	}
 
 	items := []feed.Item{
@@ -119,7 +119,7 @@ func TestSQLiteStore(t *testing.T) {
 		t.Fatalf("reopen: %v", err)
 	}
 	t.Cleanup(func() { _ = store2.Close() })
-	if v := userVersion(t, path); v != 5 {
+	if v := userVersion(t, path); v != 6 {
 		t.Fatalf("after reopen user_version = %d, want 5 (Stage 9A: schema at v5)", v)
 	}
 	if got, _ := store2.FilterUnseen(ctx, []feed.Item{items[0]}); len(got) != 0 {

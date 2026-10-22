@@ -27,7 +27,7 @@ func TestGetDigestItem_RoundtripAndMiss(t *testing.T) {
 	ctx := context.Background()
 	s := openRunsStore(t)
 
-	did, err := s.InsertDigest(ctx, 1700000000, 1, "<b>body</b>", 1)
+	did, err := s.InsertDigest(ctx, 1700000000, 1, "<b>body</b>", 1, "")
 	if err != nil {
 		t.Fatalf("InsertDigest: %v", err)
 	}

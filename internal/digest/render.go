@@ -11,9 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
-	"github.com/akomyagin/aiTelegaBot/internal/storage"
 	"github.com/akomyagin/aiTelegaBot/internal/telegram"
 )
 
@@ -62,7 +60,7 @@ const (
 // изменений; C2 SHOULD передать до 10 заголовков элементов, чтобы ветка
 // работала в проде.
 func RenderTopicBody(topicName, headline string, itemCount int, now time.Time, fallbackTitles ...string) string {
-	// Review C1 M2: digests.body feeds RenderTopicL1 whose guard cuts (or, on
+	// Review C1 M2: digests.body feeds the L1 topic view whose guard cuts (or, on
 	// the pre-fix code, panicked near) Telegram's 4096-rune limit — cap the
 	// dynamic parts HERE so the stored body stays well below it: headline to
 	// topicHeadlineRunes (the llm JSON path caps at 800 too, but the
@@ -99,52 +97,6 @@ func RenderTopicBody(topicName, headline string, itemCount int, now time.Time, f
 	b.WriteString(strconv.Itoa(itemCount))
 	b.WriteString(" материалов")
 	return b.String()
-}
-
-// RenderTopicL1 renders the L1 topic view: the stored body AS IS (already
-// HTML — never re-escape it) plus one "• <title>" line per digest item.
-// Shared helper for Stage 8 D («L1:<digestID>» restore MUST reuse it — the
-// signature is frozen by plan C). Empty items (crash case delivered=0) →
-// body only. Guard: over 4096 runes the items block is cut from the tail on
-// a rune boundary with an «…и ещё K» marker; if it still does not fit, the
-// body itself is cut ("…"). No L1 pagination (revision trigger: regularly
-// cut topics of >~50 items).
-func RenderTopicL1(body string, items []storage.DigestItem) string {
-	if len(items) == 0 {
-		return body
-	}
-	lines := make([]string, 0, len(items))
-	for _, it := range items {
-		lines = append(lines, "• "+telegram.EscapeHTML(truncateRunes(it.Title, topicTitleRunes)))
-	}
-	for dropped := 0; dropped <= len(lines); dropped++ {
-		block := strings.Join(lines[:len(lines)-dropped], "\n")
-		if dropped > 0 {
-			marker := "…и ещё " + strconv.Itoa(dropped)
-			if block != "" {
-				block += "\n" + marker
-			} else {
-				block = marker
-			}
-		}
-		full := body
-		if block != "" {
-			full = body + "\n\n" + block
-		}
-		if utf8.RuneCountInString(full) <= maxBodyRunes {
-			return full
-		}
-	}
-	// The loop above never tests the body ALONE (the last iteration still
-	// appends the «…и ещё N» marker), so body ≤ maxBodyRunes can reach here.
-	// Return it as is; otherwise cut on a rune boundary (review C1 M1: the
-	// previous unconditional r[:maxBodyRunes-1] panicked for bodies in the
-	// ~4081–4094-rune band).
-	r := []rune(body)
-	if len(r) <= maxBodyRunes {
-		return body
-	}
-	return string(r[:maxBodyRunes-1]) + "…"
 }
 
 // RenderTOC renders the run's table of contents (golden):

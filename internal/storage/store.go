@@ -48,8 +48,9 @@ type Store interface {
 	// dedup_key → empty result, not an error (Stage 9B).
 	ListItemLinks(ctx context.Context, dedupKey string) ([]ItemLink, error)
 	// InsertDigest creates a digests row with delivered=0 and returns its id
-	// (Stage 8 C, plan §4.3 — delivery gates persistence).
-	InsertDigest(ctx context.Context, runID, topicID int64, body string, itemCount int) (digestID int64, err error)
+	// (Stage 8 C, plan §4.3 — delivery gates persistence). sectionsJSON —
+	// саммари топиков вызова C (миграция v6, Этап 9D-2a); '' = legacy/нет.
+	InsertDigest(ctx context.Context, runID, topicID int64, body string, itemCount int, sectionsJSON string) (digestID int64, err error)
 	// MarkDelivered flips delivered=1, inserts the digest_items rows and marks
 	// the items seen — all in ONE transaction; any error rolls everything back.
 	MarkDelivered(ctx context.Context, digestID int64, items []DigestItem) error

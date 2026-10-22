@@ -231,15 +231,10 @@ func TestHandleCallbackQuery_DigestViews(t *testing.T) {
 			}
 			if tt.wantBtns && len(rec.kbs) == 1 {
 				kb := rec.kbs[0]
-				// D-1 (граница C/D): telegram докомпановывает к L1-view кнопку
-				// «Подробнее →» (L2:<digestID>) РЯДОМ с кнопкой viewer'а
-				// «◀ К оглавлению» — тот же ряд, первой. Единственное
 				// отличие golden'а от C: добавленная кнопка.
-				if kb == nil || len(kb.InlineKeyboard) != 1 || len(kb.InlineKeyboard[0]) != 2 ||
-					kb.InlineKeyboard[0][0].Text != drillDownMoreLabel ||
-					kb.InlineKeyboard[0][0].CallbackData != "L2:42" ||
-					kb.InlineKeyboard[0][1].CallbackData != "TOC:77" {
-					t.Errorf("edit markup = %+v, want ряд [Подробнее → L2:42 | TOC:77]", kb)
+				if kb == nil || len(kb.InlineKeyboard) != 1 || len(kb.InlineKeyboard[0]) != 1 ||
+					kb.InlineKeyboard[0][0].CallbackData != "TOC:77" {
+					t.Errorf("edit markup = %+v, want ряд [TOC:77]", kb)
 				}
 			}
 		})
@@ -255,7 +250,7 @@ func TestHandleCallbackQuery_DigestViewFromDBAfterRestart(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 
-	digestID, err := st.InsertDigest(ctx, 555, 1, "STORED BODY", 1)
+	digestID, err := st.InsertDigest(ctx, 555, 1, "STORED BODY", 1, "")
 	if err != nil {
 		t.Fatalf("InsertDigest: %v", err)
 	}

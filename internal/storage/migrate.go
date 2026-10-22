@@ -143,6 +143,18 @@ var migrations = []string{
 	ALTER TABLE digest_items ADD COLUMN media_kind TEXT NOT NULL DEFAULT '';
 	ALTER TABLE digest_items ADD COLUMN media_ref  TEXT NOT NULL DEFAULT '';
 	`,
+	// v6 (Этап 9D-2a, ДИРЕКТИВА ДИСПЕТЧЕРА — сознательное отклонение от плана,
+	// фиксируется в «Итог 9D»): саммари топиков вызова C (sections) должны
+	// переживать рестарт (план 9D тест-кейс 7: S:/M: рендерятся из БД; §4.3
+	// Этапа 8 «drill-down переживает рестарт»), но схема v5 их не хранит.
+	// sections_json — JSON-массив [{"source_id":N,"summary":"…"}], порядок
+	// элементов = порядок collect (детерминированный рендер L1). DEFAULT ''
+	// читается как «саммари топиков нет» → L1/L2 деградируют на строки без
+	// саммари (план §4.6), не ошибка. v5 ещё не деплоилась на прод — v6
+	// штатна для любых БД; v1–v5 не правятся (append-only).
+	`
+	ALTER TABLE digests ADD COLUMN sections_json TEXT NOT NULL DEFAULT '';
+	`,
 }
 
 // migrate applies pending migrations starting from the current PRAGMA

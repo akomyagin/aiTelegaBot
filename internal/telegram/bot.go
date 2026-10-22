@@ -255,8 +255,11 @@ func (b *Bot) Deliver(ctx context.Context, chatID, text string) error {
 
 // InlineButton is one inline-keyboard button: Text is the label (Bot API
 // limit — 64 BYTES, урок A2 H1), Data is callback_data (≤64 bytes, план §4.4).
-// Produced by digest.TOCButtons; delivered by DeliverWithButtons.
-type InlineButton struct{ Text, Data string }
+// URL (Этап 9D, план §4.6) — внешняя ссылка («↗ Перейти в источник»): Data и
+// URL взаимоисключающи — при непустом URL Data ИГНОРИруется (inlineKeyboard не
+// заполняет callback_data; не паника — контракт комментарием). Produced by
+// digest.TOCButtons/NavButtons; delivered by DeliverWithButtons.
+type InlineButton struct{ Text, Data, URL string }
 
 // View kinds of the digest navigation (plan §C): a topic L1 view keyed by
 // digestID, or the run's table of contents keyed by runID.
@@ -302,22 +305,38 @@ type EditMessage struct {
 // CallbackResult is what a DrillDown seam returns. AckText goes into
 // AnswerCallbackQuery (always — every callback is acked, план §4.7); Edit is
 // nil for «ack only» (nothing to edit).
+//
+// Send (Этап 9D, план §4.5.2) — side-эффект «отдельное сообщение»: тип
+// объявлен в 9D, но поле всегда nil — обработка (sendPhoto «P:» /
+// deleteMessage «PDEL») появится в 9E.
 type CallbackResult struct {
 	AckText string
 	Edit    *EditMessage // nil → только ack, без edit
+	Send    *SendAction  // nil в 9D (обработка — 9E)
+}
+
+// SendAction — side-эффект callback-результата (план §4.5.2, обработка в 9E):
+// отдельное sendPhoto-сообщение («P:» → фото материала) и/или удаление
+// сообщения («PDEL» → закрыть фото). В 9D только объявлен тип.
+type SendAction struct {
+	PhotoMediaRef   string           // digest_items.media_ref: tg file_id ИЛИ http(s) URL
+	PhotoCaption    string           // готовый HTML (ParseMode HTML)
+	PhotoButtons    [][]InlineButton // клавиатура фото-сообщения (9E: «✖ Закрыть» → PDEL)
+	DeleteMessageID int64            // >0 → удалить сообщение (PDEL-поток, 9E)
 }
 
 // DrillDown resolves an "L2:…" / "L3:…" callback (Stage 8 D). data is the raw
 // callback_data INCLUDING the prefix — parsing/validation of the arguments is
-// the seam's job (D-2: digest.NewDrillDown), telegram dispatches on the prefix
-// only. The owner-check, the ack-before-edit order and the inaccessible-message
-// guard live in the shared handleCallbackQuery contour.
+// the seam's job (digest.NewDrillDown — диспетчер 9D: S:/M:/P:/PDEL + legacy
+// alias'ы L2:/L3:, план §4.6), telegram dispatches on the prefix only. The
+// owner-check, the ack-before-edit order and the inaccessible-message guard
+// live in the shared handleCallbackQuery contour.
 type DrillDown func(ctx context.Context, data string) (*CallbackResult, error)
 
-// WithDrillDown wires the L2:/L3: drill-down seam (Stage 8 D). Without it
-// those callbacks degrade to ack + «Drill-down недоступен.» — сборка и
-// поведение остальных префиксов не меняются. L1: is NOT routed here: it is an
-// alias of the T: viewer path.
+// WithDrillDown wires the S:/M: navigation seam (+ legacy L2:/L3: alias'ы
+// кнопок старых сообщений, Этап 9D). Without it those callbacks degrade to
+// ack + «Drill-down недоступен.» — сборка и поведение остальных префиксов не
+// меняются. L1: is NOT routed here: it is an alias of the T: viewer path.
 func WithDrillDown(fn DrillDown) Option {
 	return func(b *Bot) { b.drillDown = fn }
 }
@@ -373,10 +392,15 @@ func inlineKeyboard(buttons [][]InlineButton) *models.InlineKeyboardMarkup {
 	for _, row := range buttons {
 		btns := make([]models.InlineKeyboardButton, 0, len(row))
 		for _, b := range row {
-			btns = append(btns, models.InlineKeyboardButton{
-				Text:         b.Text,
-				CallbackData: b.Data,
-			})
+			btn := models.InlineKeyboardButton{Text: b.Text}
+			if b.URL != "" {
+				// Data/URL взаимоисключающи: при непустом URL Data игнорируется
+				// (контракт InlineButton, план §4.6).
+				btn.URL = b.URL
+			} else {
+				btn.CallbackData = b.Data
+			}
+			btns = append(btns, btn)
 		}
 		rows = append(rows, btns)
 	}
