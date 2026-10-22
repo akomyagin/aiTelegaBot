@@ -247,6 +247,32 @@ func TestOfflineAggregateTopic_Deterministic(t *testing.T) {
 	}
 }
 
+// Ревью 9D L4: топики со ВСЕМИ пустыми саммари в Sections ОТСУТСТВУЮТ
+// (контракт TopicAggregate — aggregate.go).
+func TestOfflineAggregateTopic_EmptySummariesSkipped(t *testing.T) {
+	o := NewOffline()
+	ctx := context.Background()
+	agg, err := o.AggregateTopic(ctx, "Тема", []SourceBlock{
+		{SourceID: 11, Name: "A", Summaries: []string{"", "   "}},
+		{SourceID: 22, Name: "B", Summaries: []string{"s1"}},
+	})
+	if err != nil {
+		t.Fatalf("AggregateTopic: %v", err)
+	}
+	want := []TopicHeadline{{SourceID: 22, Summary: "- s1"}}
+	if !reflect.DeepEqual(agg.Sections, want) {
+		t.Errorf("Sections = %+v, want %+v (пустая секция не пропускается)", agg.Sections, want)
+	}
+	// Все саммари пусты во всех топиках → Sections пусты (без ошибки).
+	empty, err := o.AggregateTopic(ctx, "Тема", []SourceBlock{{SourceID: 11, Summaries: []string{""}}})
+	if err != nil {
+		t.Fatalf("AggregateTopic: %v", err)
+	}
+	if len(empty.Sections) != 0 {
+		t.Errorf("Sections = %+v, want пусто", empty.Sections)
+	}
+}
+
 func TestOfflineAggregateOverall_Deterministic(t *testing.T) {
 	o := NewOffline()
 	ctx := context.Background()

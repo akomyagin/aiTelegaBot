@@ -108,6 +108,15 @@ func (b *Bot) handleDigestView(ctx context.Context, q *models.CallbackQuery, arg
 	// telegram ничего не докомпановывает — «Подробнее →» из Этапа 8 D больше
 	// нет (L1-view сам перечисляет топики). T: и L1: (alias в диспетчере)
 	// дают одинаковый view.
+	//
+	// Ревью 9D L5: T-view идёт через drillDownKeyboard — при пустых Buttons
+	// inlineKeyboard дал бы nil, и editCallbackMessage сохранил бы СТАРЫЙ
+	// markup (legacy run_id=0 без items: старые кнопки под новым текстом);
+	// non-nil пустой markup заставляет Bot API убрать старые кнопки.
+	if kind == ViewKindTopic {
+		b.editCallbackMessage(ctx, msg, view.Text, drillDownKeyboard(view.Buttons))
+		return
+	}
 	b.editCallbackMessage(ctx, msg, view.Text, inlineKeyboard(view.Buttons))
 }
 

@@ -54,6 +54,16 @@ const (
 	// «Ссылки:» в L3.
 	messageLinkTitleRunes   = 120
 	messageLinkSummaryRunes = 300
+	// navHeaderTitleRunes — предел title в шапке L3 (ревью 9D M1:
+	// digest_items.title пишется БЕЗ резки — для tg_*-источников это первая
+	// строка сообщения до ~4096 рун, а EscapeHTML ещё удлиняет; без лимита
+	// текст L3 превышает 4096 → MESSAGE_TOO_LONG, view не открывается.
+	// Полный текст и так ниже в full_text).
+	navHeaderTitleRunes = 300
+	// navBlockTitleRunes — предел title внутри блока L2 (ревью 9D L1:
+	// сверхдлинный блок иначе молча отбрасывается guard'ом fitDrillDownList;
+	// паттерн topicTitleRunes Этапа 8).
+	navBlockTitleRunes = 120
 	// Лейблы кнопок новой навигации (план §4.6).
 	sourceReadLabel   = "Читать ▸"
 	messagePhotoLabel = "🖼 Фото"
@@ -177,6 +187,16 @@ func topicEntryName(name string, sourceID int64) string {
 	return "источник #" + strconv.FormatInt(sourceID, 10)
 }
 
+// navTruncateTitle — резка title до n рун с явной пометкой «…» при обрезке
+// (ревью 9D M1/L1). Вызывать ДО EscapeHTML — экранирование (&→&amp;) само
+// удлиняет строку, поэтому резать нужно исходные руны.
+func navTruncateTitle(s string, n int) string {
+	if utf8.RuneCountInString(s) <= n {
+		return s
+	}
+	return truncateRunes(s, n) + "…"
+}
+
 // SourceSection — один топик (источник) L2-view: Name/Summary — шапка и
 // саммари топика (вызов C), Items — сообщения в порядке ListDigestItems
 // (id ASC). Порядок среза задаёт вызывающий (9D-2 — groupBySource):
@@ -232,17 +252,25 @@ func RenderSourceView(topicName string, digestID, sourceID int64, sections []Sou
 	truncated := false
 loop:
 	for _, sec := range sections {
+		// Ревью 9D L6: подзаголовок добавляется ЛЕНИВО — только перед первым
+		// ПОКАЗАННЫМ элементом секции. Иначе при truncation ровно на границе
+		// секций (shown≥20) рендерился подзаголовок следующей секции с нулём
+		// элементов и приклеенным «…и ещё K».
+		sub := ""
 		if sourceID == 0 {
-			sub := "<b>" + telegram.EscapeHTML(topicEntryName(sec.Name, sec.SourceID)) + "</b>"
+			sub = "<b>" + telegram.EscapeHTML(topicEntryName(sec.Name, sec.SourceID)) + "</b>"
 			if s := strings.TrimSpace(sec.Summary); s != "" {
 				sub += "\n" + telegram.EscapeHTML(truncateRunes(s, topicViewSummaryRunes))
 			}
-			blocks = append(blocks, sub)
 		}
 		for _, it := range sec.Items {
 			if shown >= sourceViewMaxItems {
 				truncated = true
 				break loop
+			}
+			if sub != "" {
+				blocks = append(blocks, sub)
+				sub = ""
 			}
 			block, btn := renderSourceItemBlock(it)
 			blocks = append(blocks, block)
@@ -294,7 +322,7 @@ func renderSourceItemBlock(it storage.DigestItem) (string, []telegram.InlineButt
 	if title == "" {
 		title = "(без заголовка)" // паттерн ревью D L7: пустой <a></a> не рендерим
 	}
-	escTitle := telegram.EscapeHTML(title)
+	escTitle := telegram.EscapeHTML(navTruncateTitle(title, navBlockTitleRunes)) // ревью 9D L1
 	if link != "" {
 		b.WriteString(`<a href="`)
 		b.WriteString(link)
@@ -355,7 +383,9 @@ func RenderMessageView(it storage.DigestItem, links []MessageLink) *NavView {
 	if title == "" {
 		title = "(без заголовка)"
 	}
-	header := "<b>" + telegram.EscapeHTML(title) + "</b>"
+	// Ревью 9D M1: title режется ДО EscapeHTML — иначе header (и весь текст
+	// L3) может превысить 4096 рун → MESSAGE_TOO_LONG.
+	header := "<b>" + telegram.EscapeHTML(navTruncateTitle(title, navHeaderTitleRunes)) + "</b>"
 
 	body := strings.TrimSpace(it.FullText)
 	if body == "" {

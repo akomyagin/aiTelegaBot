@@ -49,7 +49,8 @@ type Pipeline struct {
 	SourceProvider func(ctx context.Context) ([]TrackedSource, error)
 	Store          storage.Store
 	// Classify — вызов A плана §4.8 (классификация + саммари сообщения,
-	// Этап 9A). Заменил TopicSummarizer в Run; llm/topicdigest.go жив до 9D.
+	// Этап 9A). Заменил TopicSummarizer в Run; llm/topicdigest.go удалён в
+	// 9D-2b, заменён вызовом C (§4.7, llm/aggregate.go).
 	Classify llm.ClassifySummarizer
 	// Поля шага 4c (Этап 9B, план §4.3/§4.8.1): внешние ссылки kept-элементов.
 	// Нил-сейвы: LinkClassify == nil → шаг 4c пропускается ЦЕЛИКОМ (обратная

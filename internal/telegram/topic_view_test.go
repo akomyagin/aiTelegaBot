@@ -241,6 +241,31 @@ func TestHandleCallbackQuery_DigestViews(t *testing.T) {
 	}
 }
 
+// Ревью 9D L5: T-view с пустыми Buttons (legacy run_id=0 без items) — editFn
+// получает NON-NIL пустой markup: Bot API убирает старые кнопки (inlineKeyboard
+// дал бы nil, и старый markup остался бы под новым текстом).
+func TestHandleDigestView_EmptyButtonsClearsKeyboard(t *testing.T) {
+	rec := &recorder{}
+	b := &Bot{chatID: 111, log: discardLogger(), ackFn: rec.ack, editFn: rec.edit,
+		digestViewer: func(ctx context.Context, req DigestViewRequest) (DigestView, bool, error) {
+			return DigestView{Text: "LEGACY BODY"}, true, nil // Buttons пусты
+		}}
+	b.handleCallbackQuery(context.Background(), cbQuery("T:42", 111, true))
+	if len(rec.texts) != 1 || rec.texts[0] != "LEGACY BODY" {
+		t.Fatalf("edits = %v, want [LEGACY BODY]", rec.texts)
+	}
+	if len(rec.kbs) != 1 {
+		t.Fatalf("kbs = %d, want 1", len(rec.kbs))
+	}
+	kb := rec.kbs[0]
+	if kb == nil {
+		t.Fatal("markup = nil, want non-nil пустой (старые кнопки должны быть убраны)")
+	}
+	if len(kb.InlineKeyboard) != 0 {
+		t.Errorf("markup = %+v, want пустой", kb)
+	}
+}
+
 // После «рестарта» (новый Bot, данные не из памяти) T: рендерит из БД.
 func TestHandleCallbackQuery_DigestViewFromDBAfterRestart(t *testing.T) {
 	ctx := context.Background()

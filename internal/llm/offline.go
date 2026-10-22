@@ -115,10 +115,11 @@ func extractLead(text string) string {
 // AggregateTopic реализует TopicAggregator offline (план §4.7, вызов C):
 // headline темы — первые ≤3 строки «- <саммари сообщения>» из ВСЕХ топиков
 // (порядок среза входа, паттерн Offline.SummarizeTopic); саммари каждого
-// топика — первые ≤3 строки его собственного списка. Sections содержат по
-// одной строке на топик входа (пустые саммари дают Summary="" — L1 деградирует
-// на строку без саммари). Детерминированно: два вызова на одном входе
-// байт-в-байт одинаковы (нет сети, random, time.Now, map-итераций).
+// топика — первые ≤3 строки его собственного списка. Sections содержат
+// только топики с НЕПУСТЫМ саммари — контракт TopicAggregate (aggregate.go:
+// топики с пустым саммари в Sections ОТСУТСТВУЮТ; ревью 9D L4).
+// Детерминированно: два вызова на одном входе байт-в-байт одинаковы
+// (нет сети, random, time.Now, map-итераций).
 func (o *Offline) AggregateTopic(ctx context.Context, topicName string, sources []SourceBlock) (TopicAggregate, error) {
 	_ = ctx
 	_ = topicName
@@ -130,10 +131,11 @@ func (o *Offline) AggregateTopic(ctx context.Context, topicName string, sources 
 		Headline: strings.Join(firstSummaryLines(all, aggregateFallbackLines), "\n"),
 	}
 	for _, s := range sources {
-		agg.Sections = append(agg.Sections, TopicHeadline{
-			SourceID: s.SourceID,
-			Summary:  strings.Join(firstSummaryLines(s.Summaries, aggregateFallbackLines), "\n"),
-		})
+		sum := strings.Join(firstSummaryLines(s.Summaries, aggregateFallbackLines), "\n")
+		if sum == "" {
+			continue // все саммари топика пусты → секции нет (ревью 9D L4)
+		}
+		agg.Sections = append(agg.Sections, TopicHeadline{SourceID: s.SourceID, Summary: sum})
 	}
 	return agg, nil
 }

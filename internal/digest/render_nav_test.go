@@ -311,3 +311,71 @@ func TestNavViewPlaceholderInvariant(t *testing.T) {
 	}
 	_ = telegram.InlineButton{} // компиляционная связка: Buttons — тип telegram
 }
+
+// Ревью 9D M1: длинный одностирочный title (tg firstLine — до ~4096 рун) не
+// должен выводить текст L3 за бюджет 4096 → MESSAGE_TOO_LONG.
+func TestRenderMessageView_LongSingleLineTitle(t *testing.T) {
+	it := storage.DigestItem{
+		ID: 1, DigestID: 7, SourceID: 5,
+		Title:    strings.Repeat("я", 4000),
+		FullText: "Тело сообщения.",
+	}
+	v := RenderMessageView(it, nil)
+	if n := utf8.RuneCountInString(v.Text); n > 4096 {
+		t.Errorf("Text = %d рун, want ≤4096", n)
+	}
+	if !strings.Contains(v.Text, "<b>"+strings.Repeat("я", navHeaderTitleRunes)+"…</b>") {
+		t.Errorf("шапка без усечённого до %d рун title с «…»: %.120q", navHeaderTitleRunes, v.Text)
+	}
+	if strings.Contains(v.Text, strings.Repeat("я", navHeaderTitleRunes+1)) {
+		t.Error("title НЕ усечён — в тексте больше рун, чем navHeaderTitleRunes")
+	}
+}
+
+// Ревью 9D L1: сверхдлинный title блока L2 усекается, а блок остаётся ВИДИМ
+// (раньше молча отбрасывался guard'ом fitDrillDownList).
+func TestRenderSourceView_LongTitleBlockVisible(t *testing.T) {
+	long := strings.Repeat("я", 4000)
+	v := RenderSourceView("Тема", 7, 5, []SourceSection{{SourceID: 5, Name: "A",
+		Items: []storage.DigestItem{navItem(1, long, "https://a/1", "s1")}}})
+	want := `<a href="https://a/1">` + strings.Repeat("я", navBlockTitleRunes) + `…</a>`
+	if !strings.Contains(v.Text, want) {
+		t.Errorf("блок с усечённым title не виден в тексте: %.200q", v.Text)
+	}
+	if strings.Contains(v.Text, strings.Repeat("я", navBlockTitleRunes+1)) {
+		t.Error("title НЕ усечён — в тексте больше рун, чем navBlockTitleRunes")
+	}
+	if !strings.Contains(v.Text, "перейти</a>") || !strings.Contains(v.Text, "s1") {
+		t.Error("хвост блока (перейти/саммари) отсутствует — блок отброшен guard'ом")
+	}
+	if n := utf8.RuneCountInString(v.Text); n > 4096 {
+		t.Errorf("Text = %d рун, want ≤4096", n)
+	}
+}
+
+// Ревью 9D L6: truncation ровно на границе секций (sid=0) — подзаголовок
+// следующей секции НЕ рендерится без показанных элементов.
+func TestRenderSourceView_AllMode_TruncateAtSectionBoundary(t *testing.T) {
+	mk := func(base, n int) []storage.DigestItem {
+		items := make([]storage.DigestItem, 0, n)
+		for i := range n {
+			items = append(items, navItem(int64(base+i), "T"+strconv.Itoa(base+i),
+				"https://a/"+strconv.Itoa(base+i), "s"))
+		}
+		return items
+	}
+	sections := []SourceSection{
+		{SourceID: 5, Name: "A", Items: mk(1, sourceViewMaxItems)}, // ровно 20
+		{SourceID: 6, Name: "B", Items: mk(100, 5)},                // граница — перед B
+	}
+	v := RenderSourceView("Тема", 7, 0, sections)
+	if !strings.Contains(v.Text, "<b>A</b>") {
+		t.Error("подзаголовок показанной секции A отсутствует")
+	}
+	if strings.Contains(v.Text, "<b>B</b>") {
+		t.Error("подзаголовок секции B отрендерен без единого показанного элемента (ревью 9D L6)")
+	}
+	if !strings.Contains(v.Text, "…и ещё 5") {
+		t.Error("нет маркера «…и ещё 5»")
+	}
+}
