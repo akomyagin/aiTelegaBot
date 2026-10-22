@@ -190,6 +190,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		SourceProvider:    sourceProvider,
 		Store:             store,
 		Classify:          summarizer,
+		Dedup:             newDeduper(cfg),
 		LinkClassify:      linkClassify,
 		LinkSummary:       linkSummary,
 		LinkFetch:         linkFetch,
@@ -324,6 +325,17 @@ func Run(ctx context.Context, cfg *config.Config) error {
 // *llm.Client. Паттерн прежнего выбора TopicSummarizer (Stage 8 C); вынесено
 // из Run ради тест-кейса 7 (wiring проверяется без подъёма бота/планировщика).
 func newSummarizer(cfg *config.Config) llm.ClassifySummarizer {
+	if cfg.Offline {
+		return llm.NewOffline()
+	}
+	return llm.NewClient(cfg.LLMAPIKey, cfg.LLMBaseURL, cfg.LLMModel, cfg.LLMMaxRetries)
+}
+
+// newDeduper выбирает реализацию вызова B (Этап 9C, план §4.4): cfg.Offline →
+// детерминированный *llm.Offline (точное совпадение нормализованного
+// заголовка, без сети), иначе сетевой *llm.Client. Та же offline-вилка, что и
+// у newSummarizer/newLinkStack (паттерн wiring Этапа 9A).
+func newDeduper(cfg *config.Config) llm.Deduper {
 	if cfg.Offline {
 		return llm.NewOffline()
 	}
