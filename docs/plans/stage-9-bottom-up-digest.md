@@ -306,7 +306,9 @@ media_ref, при промахе кеша message_state:
 1. `mtproto.Client.DownloadPhoto(ctx, ref string, msgID int, destPath string) error`
    — `messages.downloadMedia`, **стриминг на диск** (temp-файл в `os.TempDir()`,
    никогда не целиком в память — RAM 458 MB), FloodWait-дисциплина как в
-   GetHistory (существующие middleware+backoff).
+   GetHistory (существующие middleware+backoff). *(9E реализован: сигнатура
+   совпала; транспорт — getHistory(offset_id)+upload.getFile chunk'ами 1 МБ,
+   cap 10 МБ — см. «Итог 9E».)*
 2. Бот шлёт фото СЕБЕ в owner-чат (`SendPhoto` c `models.InputFileUpload`) → из
    ответа берёт `Photo` largest-size `FileID` → **сразу `DeleteMessage`** того
    служебного сообщения (пользователь видит только финальный дайджест).
@@ -335,7 +337,11 @@ API — режем `TruncateButtonLabelTo`-паттерном по байтам)
 sendPhoto c URL: фото качают серверы Telegram (лимит Bot API 5 MB на URL);
 ошибка → ack «Не удалось показать фото» (элемент остаётся, деградация).
 
-Новые seam'ы telegram.Bot (тестируемо без сети, паттерн sendFn/editFn):
+Новые seam'ы telegram.Bot (тестируемо без сети, паттерн sendFn/editFn).
+*(Эскиз ниже УСТАРЕЛ — 9D-2a объявил фактический контракт `SendAction`, 9E
+добавил `SendPhoto(ctx, chatID, mediaRef, caption, buttons)` одним путём
+InputFileString, `DeleteMessage`, `UploadPhoto` для re-upload и seams
+sendPhotoFn/deleteMsgFn/uploadPhotoFn — см. «Итог 9E»:)*
 
 ```go
 // internal/telegram/bot.go
@@ -1087,7 +1093,7 @@ RenderSourceView (L2, `S:<did>:<sid>`, sid=0 → все топики с подз
 | `internal/mtproto/media.go` (новый) | MediaResolver: download→bot re-upload→file_id→deleteMessage, лимит N/прогон |
 | `internal/telegram/bot.go` | SendPhoto/DeleteMessage + seams sendPhotoFn/deleteMsgFn; обработка CallbackResult.Send (sendPhoto в owner-чат) и PDEL (deleteMessage q.Message + ack) |
 | `internal/digest/drilldown.go` | P:<itemID> → CallbackResult{Send: …} из digest_items.media_ref (file_id приоритетнее URL); «🖼 Фото»-кнопка активируется (в 9D — заглушка-ack) |
-| `internal/digest/pipeline.go` | шаг media-resolver (§4.8.1 шаг 4, между c и d): resolver-интерфейс `MediaResolver interface { Resolve(ctx, items []feed.Item, states map[string]storage.MessageState) error }` — вторая реализация offline(no-op)+боевая → интерфейс оправдан; media_ref → digest_items |
+| `internal/digest/pipeline.go` | шаг media-resolver (§4.8.1 шаг 4, между c и d): resolver-интерфейс `MediaResolver interface { Resolve(ctx, items []feed.Item, states map[string]storage.MessageState) error }` — вторая реализация offline(no-op)+боевая → интерфейс оправдан; media_ref → digest_items *(9E реализован с отклонением: `Resolve(ctx, items []feed.Item, budget int) (used int, err error)` — без states, запись в storage владеет pipeline; no-op = Media==nil, не вторая реализация — см. «Итог 9E»)* |
 | `internal/config/config.go` | MTMediaReuploadMax (env MT_MEDIA_REUPLOAD_MAX, default 3) |
 | `internal/app/app.go` | wiring resolver (mtClient + bot + лимит); без mtClient/bot → no-op |
 
@@ -1127,6 +1133,88 @@ defer'ом (крах не оставляет мусор: temp-каталог ч�
 сценарий: канал с картинками (tg_public или managed) → L3 → «🖼 Фото» → фото в
 боте, «✖ Закрыть» удаляет; при настроенном MTProto — фото приватного канала
 (re-upload ≤3/прогон, в логах нет FloodWait).
+
+**Итог 9E (реализован 2026-10-23, сдан одним PR, три кодинг-прогона
+9E-1/2a/2b + один цикл фиксов):**
+
+- Прогоны: build/vet/gofmt чистые, `go test -race -count=1` 9/9 пакетов ok
+  (финальный прогон основной сессии). Все 6 тест-кейсов покрыты (отчёт
+  тест-агента); пробелы только low: «нет кнопки без медиа» assert'ом, а не
+  golden; config без тестов (в пакете их нет вообще); DownloadPhoto/gotd-стрим
+  не мокается (осознанная практика — покрывается ручным сценарием на деплое);
+  app-wiring resolver'а косвенно.
+- Ревью (Opus): 1 high / 2 medium / 5 low / 6 info. Закрыты фиксами: H1
+  (резка ГОТОВОГО HTML-caption по байтам рвала `<a href` → Bot API 400 «can't
+  parse entities»; дефект был зафиксирован в уже закоммиченном golden — теперь
+  компоненты ужимаются как plain text ДО сборки, fitEscapedBytes, приоритет
+  summary→title→отброс строки «↪», assertWellFormedCaption в тестах), M2
+  (media_ref без gate http(s) — мусорный URL кешировался навсегда; httpMediaURL
+  в feed и telegram), M3 (молчаливая потеря кеша медиа при отсутствии строки
+  states — log.Warn), L4/L5 (комментарии контрактов к факту), L6
+  (uploadPhotoResult возвращает messageID при «no photo» — resolver удаляет
+  служебное сообщение), L8 (README: ≤0 → default 3), I9 (PhotoCaptionMaxBytes
+  одна на telegram+digest), I11 (cap 10 МБ в streamPhotoToFile). Приняты без
+  правок: L7 (defensive-check fileID=="" безвреден), I10 (summary без «…» —
+  косметика), I12/I13 (сброс mediaGroups, ack ПОСЛЕ sendPhoto — задокументированы).
+- **Подтверждённые отклонения от плана** (не переоткрывать):
+  - Порядок кодинг-прогонов: показ (9E-1) → источники (9E-2a) → resolver
+    (9E-2b) вместо «источники→показ» handoff'а: resolver использует
+    UploadPhoto/DeleteMessage из 9E-1 (снимает forward-зависимость); 2a/2b —
+    дробление «источники+resolver» по round-бюджету.
+  - Эскиз seam'ов §4.5.2 (`PhotoRef`/`SendPhotoResult`) устарел — фактический
+    контракт `SendAction` объявлен в 9D-2a (bot.go). `SendPhoto(ctx, chatID,
+    mediaRef, caption, buttons)` шлёт ЛЮБУЮ непустую строку одним путём
+    `models.InputFileString{Data}`: в go-telegram/bot v1.22 нет
+    InputFileURL/InputFileID, URL-vs-file_id решает сервер Telegram; gate схемы
+    — на стороне источников (фикс M2), т.к. file_id теоретически может
+    начинаться с «http».
+  - §4.5.1 п.1: DownloadPhoto реализован через getHistory(offset_id) +
+    upload.getFile (не messages.downloadMedia), стриминг chunk'ами 1 МБ на диск
+    (RAM 458 MB), FloodWait-паттерн GetHistory, cap 10 МБ (лимит Bot API
+    upload — большее фото всё равно не re-upload'ится).
+  - §4.5.1 п.2: re-upload — НОВЫЙ метод `Bot.UploadPhoto` (multipart
+    InputFileUpload, largest file_id из ответа) + seam uploadPhotoFn; служебное
+    сообщение удаляется resolver'ом СРАЗУ; при «no photo» в ответе — удаление
+    по возвращённому messageID (фикс L6).
+  - Интерфейс digest-стороны: `MediaResolver.Resolve(ctx, items []feed.Item,
+    budget int) (used int, err error)` — БЕЗ states-параметра эскиза (§4.5.2/
+    таблица файлов): записью в storage владеет pipeline (батч
+    UpsertMessageState + снапшот digest_items через NewDigestItem); budget —
+    общий re-upload-лимит на RUN (счётчик в pipeline, шаг 4c-bis между c и d
+    вызывается на тему), budget≤0 → Resolve не вызывается (log.Info). Боевая
+    реализация — `mtproto.MediaResolver` c инверсией зависимостей
+    (PhotoDownloader/PhotoUploader: mtproto НЕ импортирует telegram/storage —
+    был бы цикл; Bot удовлетворяет структурно, wiring в app.go только при
+    mtClient≠nil); offline/no-mtClient → Media==nil, шаг no-op.
+  - Альбом tg_botapi: «первый пост группы» — `ChannelBuffer.MarkMediaGroupFirst`
+    (seen-множество media_group_id под mutex, cap 512, сброс целиком:
+    запоздавший пост старого альбома может получить медиа-поля — безвредно,
+    каждый пост отдельный Item со своим DedupKey).
+  - feed.Item.MediaKind/MediaFileID/MediaURL были объявлены ещё в 9A —
+    source.go в 9E не менялся.
+- **Техдолг 9E** (триггеры пересмотра):
+  1. DownloadPhoto без юнит-покрытия (gotd-клиент не мокается — существующая
+     практика); триггер: падение ручного сценария на деплое / баги MTProto-медиа.
+  2. Принятый каскад (M3): сбой A-батча UpsertMessageState → кеш медиа не
+     записан → каждый следующий прогон повторяет те же re-upload'ы (сжигание
+     бюджета, FloodWait-риск); в логах Error A-батча + Warn «media cache write
+     skipped»; триггер: повторяющиеся Warn в прод-логах.
+  3. `SendAction.DeleteMessageID` зарезервировано (в прод-пути мертво: PDEL
+     перехватывается telegram ДО seam'а); триггер: seam-поток с удалением.
+  4. Cap 10 МБ streamPhotoToFile — превышение → фото молча не показывается
+     (log); триггер: регулярные фото >10 МБ.
+  5. `MT_MEDIA_REUPLOAD_MAX` ≤0 → 3 (консистентно с LINK_*); триггер:
+     потребность в «0 = отключить».
+  6. Техдолг 9D.4 (peer-Title fallback только «-100X») в 9E НЕ закрыт —
+     resolver берёт peer из PeerCache, media-снапшот GetPeer не делался;
+     триггер прежний.
+- **Ручной сценарий** (критерий 9E и §3 этапа) перенесён на деплой (в
+  агент-среде токена нет): канал с картинками → L3 → «🖼 Фото» → фото в боте,
+  «✖ Закрыть» удаляет; при настроенном MTProto — фото приватного канала
+  (re-upload ≤3/прогон, в логах нет FloodWait).
+- **Этап 9 ЗАКРЫТ ПО КОДУ** (9A–9E). Деплой на VPS не выполнялся — 9A–9E
+  накоплены в master (каждый подэтап автономен); чек-лист деплоя — в
+  `docs/handoff/2026-10-23-stage-9-complete.md`.
 
 ## 6. Сквозные требования ко всем подэтапам (наследуют §6 Этапа 8)
 

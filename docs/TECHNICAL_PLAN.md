@@ -431,7 +431,7 @@ URL или `<guid>`; для Telegram — `tg:<channel>:<messageID>`. Ретен�
   доставки = слот планировщика не выполнен.
 
 **Этап 9 — Дайджест снизу вверх** (детальный план — `docs/plans/stage-9-bottom-up-digest.md`)
-- *Статус подэтапов (2026-10-22):* **9A** (схема v5: message_state/link_cache/
+- *Статус подэтапов (2026-10-23):* **9A** (схема v5: message_state/link_cache/
   item_links/runs + 4 колонки digest_items; вызов A — классификация §4.1 +
   саммари сообщения вместо SummarizeTopic в Run; кеш обработки: крах не теряет
   LLM-работу, повторный прогон не переспрашивает; ad-фильтр с seen до доставки;
@@ -484,7 +484,27 @@ URL или `<guid>`; для Telegram — `tg:<channel>:<messageID>`. Ретен�
   человекочитаемыми именами (текст + кнопки-имена ≤64 байт); RenderTOC c
   overall; InlineButton.URL (Data/URL взаимоисключающи); мёртвый
   TopicSummarizer/SummarizeTopic Этапа 8 удалён (заменён вызовами A+C));
-  9E (медиа) — **впереди**.
+  **9E** (медиа — **сделан по коду**: feed.Item.MediaKind/MediaFileID/MediaURL
+  заполняются источниками (tg_botapi — largest file_id ChannelPost.Photo +
+  первый пост альбома через MarkMediaGroupFirst; tg_public — URL из
+  photo_wrap style; rss/arxiv — enclosure image/*, fallback fi.Image;
+  tg_mtproto — MessageMediaPhoto → только MediaKind; gate http(s) у URL);
+  MTProto-resolver (mtproto.MediaResolver, инверсия PhotoDownloader/
+  PhotoUploader): DownloadPhoto (getHistory+upload.getFile, стриминг 1 МБ
+  chunk'ами на диск, cap 10 МБ) → Bot.UploadPhoto (re-upload в owner-чат) →
+  file_id → DeleteMessage служебного сообщения; бюджет re-upload'ов ОБЩИЙ на
+  прогон (счётчик в pipeline, шаг 4c-bis между c и d); кеш media_kind/
+  media_ref в message_state (re-upload не повторяется между прогонами) +
+  снапшот в digest_items; показ: P:<itemID> → CallbackResult.Send →
+  sendPhoto отдельным сообщением (caption — well-formed HTML ≤1024 байт,
+  fitEscapedBytes: компоненты ужимаются ДО сборки; «↪ источник»), «✖
+  Закрыть» PDEL → deleteMessage того же сообщения; 9D-заглушки «Медиа
+  недоступно» удалены; offline/no-mtClient → resolver no-op).
+  **Этап 9 ЗАКРЫТ ПО КОДУ (9A–9E)**; деплой на VPS НЕ выполнялся (9A–9E
+  накоплены, каждый автономен; чек-лист — `docs/handoff/2026-10-23-stage-9-complete.md`).
+  *Env-переменная 9E:* `MT_MEDIA_REUPLOAD_MAX` — лимит re-upload'ов фото
+  приватных каналов на прогон, дефолт `3` (значения ≤0 дают default —
+  консистентно с LINK_*).
   *Env-переменные 9B* (основная таблица env — «Переменные окружения» в
   README.md; строки добавит диспетчер — README вне списка файлов этой части):
   `LINK_FETCH_TIMEOUT` — таймаут одного GET статьи, дефолт `15s`;
