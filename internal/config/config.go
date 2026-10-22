@@ -14,6 +14,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Config holds all runtime settings for the bot service.
@@ -49,6 +50,13 @@ type Config struct {
 	// MTProto channel sources (Фаза 2, Этап 7).
 	MTProtoChannels []string // env MTPROTO_CHANNELS, comma-separated usernames (@channel)
 	MTProtoLimit    int      // env MTPROTO_LIMIT, default 20 — max posts per channel
+
+	// Внешние ссылки (Этап 9B, план §4.3). Невалидное/неположительное значение
+	// env → дефолт (тот же мягкий паттерн, что parseIntOr: Load не падает).
+	LinkFetchTimeout  time.Duration // env LINK_FETCH_TIMEOUT, default 15s, >0
+	LinkFetchMaxBytes int64         // env LINK_FETCH_MAX_BYTES, default 2<<20 (2 MB), >0
+	LinkPerMessageMax int           // env LINK_PER_MESSAGE_MAX, default 5, >0
+	LinkFetchTotalMax int           // env LINK_FETCH_TOTAL_MAX, default 30, >0
 
 	// Scheduling.
 	DigestTime string // daily slot, e.g. "09:00"
@@ -87,6 +95,11 @@ func Load() (*Config, error) {
 
 		MTProtoChannels: parseCSV(os.Getenv("MTPROTO_CHANNELS")),
 		MTProtoLimit:    parseIntOr(os.Getenv("MTPROTO_LIMIT"), 20),
+
+		LinkFetchTimeout:  parseDurationOr(os.Getenv("LINK_FETCH_TIMEOUT"), 15*time.Second),
+		LinkFetchMaxBytes: parseInt64Or(os.Getenv("LINK_FETCH_MAX_BYTES"), 2<<20),
+		LinkPerMessageMax: parsePositiveIntOr(os.Getenv("LINK_PER_MESSAGE_MAX"), 5),
+		LinkFetchTotalMax: parsePositiveIntOr(os.Getenv("LINK_FETCH_TOTAL_MAX"), 30),
 	}
 	cfg.Offline = cfg.LLMAPIKey == ""
 
@@ -136,6 +149,33 @@ func parseCSV(raw string) []string {
 func parseIntOr(raw string, def int) int {
 	if n, err := strconv.Atoi(strings.TrimSpace(raw)); err == nil {
 		return n
+	}
+	return def
+}
+
+// parsePositiveIntOr returns the parsed int or def if parsing fails or the
+// value is not > 0 (защита лимитов Этапа 9B).
+func parsePositiveIntOr(raw string, def int) int {
+	if n := parseIntOr(raw, def); n > 0 {
+		return n
+	}
+	return def
+}
+
+// parseInt64Or returns the parsed int64 or def if parsing fails or the value
+// is not > 0.
+func parseInt64Or(raw string, def int64) int64 {
+	if n, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64); err == nil && n > 0 {
+		return n
+	}
+	return def
+}
+
+// parseDurationOr returns the parsed duration or def if parsing fails or the
+// value is not > 0.
+func parseDurationOr(raw string, def time.Duration) time.Duration {
+	if d, err := time.ParseDuration(strings.TrimSpace(raw)); err == nil && d > 0 {
+		return d
 	}
 	return def
 }

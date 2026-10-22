@@ -35,6 +35,18 @@ type Store interface {
 	// MarkSeenBatch marks dedup keys seen in ONE transaction — for ad/dup
 	// drops at classification time, before delivery (Stage 9A, план §4.2).
 	MarkSeenBatch(ctx context.Context, keys []string) error
+	// GetLinkCache returns cached link rows (link_cache) for the given URLs;
+	// missing URLs are absent from the map (Stage 9B, план §4.3 — кеш бессрочный).
+	GetLinkCache(ctx context.Context, urls []string) (map[string]LinkCacheRow, error)
+	// UpsertLinkCache writes a batch of link_cache rows in ONE transaction;
+	// fetched_at is stamped internally (Stage 9B).
+	UpsertLinkCache(ctx context.Context, rows []LinkCacheRow) error
+	// UpsertItemLinks writes message↔link bindings in ONE transaction
+	// (PK (dedup_key,url) — повтор = update) (Stage 9B).
+	UpsertItemLinks(ctx context.Context, links []ItemLink) error
+	// ListItemLinks returns one message's links ordered by ord ASC; unknown
+	// dedup_key → empty result, not an error (Stage 9B).
+	ListItemLinks(ctx context.Context, dedupKey string) ([]ItemLink, error)
 	// InsertDigest creates a digests row with delivered=0 and returns its id
 	// (Stage 8 C, plan §4.3 — delivery gates persistence).
 	InsertDigest(ctx context.Context, runID, topicID int64, body string, itemCount int) (digestID int64, err error)
@@ -94,6 +106,10 @@ type SQLiteStore struct {
 	db  *sql.DB
 	log *slog.Logger
 }
+
+// Compile-time assert: *SQLiteStore удовлетворяет Store (включая методы
+// ссылок Этапа 9B).
+var _ Store = (*SQLiteStore)(nil)
 
 // Open opens and migrates the SQLite database. Single-writer (SetMaxOpenConns(1)).
 func Open(path string) (*SQLiteStore, error) {

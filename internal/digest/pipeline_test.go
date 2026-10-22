@@ -18,8 +18,10 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/akomyagin/aiTelegaBot/internal/feed"
+	"github.com/akomyagin/aiTelegaBot/internal/linkfetch"
 	"github.com/akomyagin/aiTelegaBot/internal/llm"
 	"github.com/akomyagin/aiTelegaBot/internal/storage"
 	"github.com/akomyagin/aiTelegaBot/internal/telegram"
@@ -1321,5 +1323,1106 @@ func TestPipelineRun_MarkSeenBatchErrorIsLogOnly(t *testing.T) {
 	}
 	if len(fresh) != 1 || fresh[0].Title != "ad-T1" {
 		t.Errorf("fresh = %+v, want only the unmarked ad", fresh)
+	}
+}
+
+// --- Этап 9B (план, тест-кейсы 5–6): фейки шага 4c со счётчиками ---
+
+// fakeLinkFetcher — фейк LinkFetcher: счётчик вызовов, порядок URL, отказы по
+// failURLs (любая ошибка Fetch → pipeline пишет kind=unavailable, без ретрая).
+type fakeLinkFetcher struct {
+	mu       sync.Mutex
+	calls    int
+	urls     []string
+	failURLs map[string]bool
+}
+
+func (f *fakeLinkFetcher) Fetch(ctx context.Context, url string) (linkfetch.Page, error) {
+	f.mu.Lock()
+	f.calls++
+	f.urls = append(f.urls, url)
+	fail := f.failURLs[url]
+	f.mu.Unlock()
+	if fail {
+		return linkfetch.Page{}, errors.New("fetch boom: " + url)
+	}
+	return linkfetch.Page{URL: url, Title: "title " + url, Text: "text of " + url}, nil
+}
+
+func (f *fakeLinkFetcher) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+// fakeLinkClassifier — фейк вызова E: счётчик, вид по URL (byURL), вид по
+// паре (Msg,Link) 1-based (byPair — приоритетнее byURL; нужен для конфликта
+// видов одного URL в разных сообщениях темы, ревью F1-iii), дефолт article;
+// err рвёт вызов (кейс E-error).
+type fakeLinkClassifier struct {
+	mu     sync.Mutex
+	calls  int
+	byURL  map[string]string
+	byPair map[[2]int]string
+	err    error
+}
+
+func (f *fakeLinkClassifier) ClassifyLinks(ctx context.Context, msgs []llm.MsgLinks) ([]llm.LinkKind, error) {
+	f.mu.Lock()
+	f.calls++
+	f.mu.Unlock()
+	if f.err != nil {
+		return nil, f.err
+	}
+	out := make([]llm.LinkKind, 0, len(msgs))
+	for m, msg := range msgs {
+		for l, u := range msg.URLs {
+			kind := llm.LinkKindArticle
+			if v, ok := f.byPair[[2]int{m + 1, l + 1}]; ok {
+				kind = v
+			} else if v, ok := f.byURL[u]; ok {
+				kind = v
+			}
+			out = append(out, llm.LinkKind{Msg: m + 1, Link: l + 1, Kind: kind})
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeLinkClassifier) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+// fakeLinkSummarizer — фейк вызова F: счётчик, саммари по URL (byURL), дефолт
+// «сжато: <url>»; err рвёт вызов (кейс F-error).
+type fakeLinkSummarizer struct {
+	mu    sync.Mutex
+	calls int
+	byURL map[string]string
+	err   error
+}
+
+func (f *fakeLinkSummarizer) SummarizeLinks(ctx context.Context, pages []llm.LinkPage) ([]llm.LinkSummary, error) {
+	f.mu.Lock()
+	f.calls++
+	f.mu.Unlock()
+	if f.err != nil {
+		return nil, f.err
+	}
+	out := make([]llm.LinkSummary, 0, len(pages))
+	for i, pg := range pages {
+		s := "сжато: " + pg.URL
+		if v, ok := f.byURL[pg.URL]; ok {
+			s = v
+		}
+		out = append(out, llm.LinkSummary{Index: i + 1, Summary: s})
+	}
+	return out, nil
+}
+
+func (f *fakeLinkSummarizer) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+// linkTestPipeline — Pipeline 9A (newTestPipeline) + поля шага 4c Этапа 9B.
+func linkTestPipeline(st storage.Store, cls llm.ClassifySummarizer, poster MessagePoster,
+	srcs []TrackedSource, e llm.LinkClassifier, f llm.LinkSummarizer, lf LinkFetcher,
+	perMsg, totalMax int) *Pipeline {
+	p := newTestPipeline(st, cls, poster, srcs, testNow)
+	p.LinkClassify, p.LinkSummary, p.LinkFetch = e, f, lf
+	p.LinkPerMessageMax, p.LinkFetchTotalMax = perMsg, totalMax
+	return p
+}
+
+// linkItem — tg-элемент со ссылкой-статьёй в тексте. Item.URL — t.me-ссылка:
+// extractURLs её отбрасывает (не внешняя), dedup_key элементов разных каналов
+// различается.
+func linkItem(ch, id, title, articleURL string) feed.Item {
+	return feed.Item{
+		Kind:  "tg_public",
+		ID:    id,
+		URL:   "https://t.me/" + ch + "/" + id,
+		Title: title,
+		Text:  "пост про " + articleURL,
+	}
+}
+
+// 9B кейс 5: одна статья из двух каналов — разные dedup_key, ОДИН URL, одна
+// тема: Fetcher вызван ОДИН раз, link_cache одна строка, ОБА сообщения получили
+// ↳-саммари; message_state.summary — базовое, без ↳.
+func TestPipelineRun_SharedArticleFetchedOnce(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	const art = "https://art.test/x"
+	it1 := linkItem("ch1", "1", "c1-T1", art)
+	it2 := linkItem("ch2", "2", "c2-T1", art)
+	if it1.DedupKey() == it2.DedupKey() {
+		t.Fatalf("dedup keys collide: %q", it1.DedupKey())
+	}
+	e := &fakeLinkClassifier{}
+	f := &fakeLinkSummarizer{}
+	lf := &fakeLinkFetcher{}
+	poster := &fakePoster{}
+	srcs := []TrackedSource{
+		{Src: fakeSource{name: "ch1", items: []feed.Item{it1}}, SourceID: 1, TopicID: 1},
+		{Src: fakeSource{name: "ch2", items: []feed.Item{it2}}, SourceID: 2, TopicID: 1},
+	}
+	if err := linkTestPipeline(st, &fakeClassifier{}, poster, srcs, e, f, lf, 5, 30).Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if e.callCount() != 1 {
+		t.Errorf("E calls = %d, want 1 (один вызов на тему)", e.callCount())
+	}
+	if lf.callCount() != 1 {
+		t.Errorf("fetch calls = %d, want 1 (общий URL фетчится один раз)", lf.callCount())
+	}
+	if f.callCount() != 1 {
+		t.Errorf("F calls = %d, want 1", f.callCount())
+	}
+	rows, err := st.ListRunDigests(ctx, testNow.Unix())
+	if err != nil {
+		t.Fatalf("ListRunDigests: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("rows = %+v, want 1", rows)
+	}
+	ditems, err := st.ListDigestItems(ctx, rows[0].ID)
+	if err != nil {
+		t.Fatalf("ListDigestItems: %v", err)
+	}
+	if len(ditems) != 2 {
+		t.Fatalf("digest_items = %+v, want 2", ditems)
+	}
+	wantSuffix := "\n↳ сжато: " + art
+	for _, di := range ditems {
+		if !strings.HasSuffix(di.Summary, wantSuffix) {
+			t.Errorf("summary %q lacks %q", di.Summary, wantSuffix)
+		}
+	}
+	cache, err := st.GetLinkCache(ctx, []string{art})
+	if err != nil {
+		t.Fatalf("GetLinkCache: %v", err)
+	}
+	if len(cache) != 1 {
+		t.Fatalf("link_cache rows = %+v, want exactly 1", cache)
+	}
+	if row := cache[art]; row.Kind != llm.LinkKindArticle ||
+		row.Summary != "сжато: "+art || row.Title != "title "+art {
+		t.Errorf("cache row = %+v, want article + fetched title + F summary", row)
+	}
+	for _, it := range []feed.Item{it1, it2} {
+		links, err := st.ListItemLinks(ctx, it.DedupKey())
+		if err != nil {
+			t.Fatalf("ListItemLinks: %v", err)
+		}
+		if len(links) != 1 || links[0].URL != art ||
+			links[0].Kind != llm.LinkKindArticle || links[0].Ord != 1 {
+			t.Errorf("item_links(%s) = %+v, want one article ord=1", it.DedupKey(), links)
+		}
+	}
+	states, err := st.GetMessageStates(ctx, dedupKeys([]feed.Item{it1, it2}))
+	if err != nil {
+		t.Fatalf("GetMessageStates: %v", err)
+	}
+	if len(states) != 2 {
+		t.Fatalf("states = %+v, want 2", states)
+	}
+	for _, s := range states {
+		if strings.Contains(s.Summary, "↳") {
+			t.Errorf("message_state summary %q must stay base (no ↳)", s.Summary)
+		}
+	}
+}
+
+// 9B кейс 5: MESSAGE-level skip (ревью M2) — СООБЩЕНИЕ с class ∈ {course, ad}
+// из вызова A вообще не доходит до шага 4c: extractURLs не запускается, E/fetch
+// не вызываются, item_links пуст; ad отсеян до 4c — то же. Не путать с
+// LINK-level skip (kind ∈ {course, ad} из вызова E внутри news-сообщения) —
+// см. TestPipelineRun_CourseLinkKindCachedWithoutFetch.
+func TestPipelineRun_CourseAndAdMessageSkipsLinkStep(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	const courseArt = "https://course.test/go"
+	const adArt = "https://ad.test/sale"
+	cIt := linkItem("c", "1", "c-T1", courseArt)
+	adIt := linkItem("ad", "2", "ad-T1", adArt)
+	cls := &fakeClassifier{byTitle: map[string]fakeOutcome{
+		"c-T1":  {class: llm.ClassCourse, summary: "Курс: Go — основы"},
+		"ad-T1": {class: llm.ClassAd},
+	}}
+	e := &fakeLinkClassifier{}
+	f := &fakeLinkSummarizer{}
+	lf := &fakeLinkFetcher{}
+	poster := &fakePoster{}
+	srcs := []TrackedSource{{Src: fakeSource{name: "c", items: []feed.Item{cIt, adIt}}, TopicID: 1}}
+	if err := linkTestPipeline(st, cls, poster, srcs, e, f, lf, 5, 30).Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if e.callCount() != 0 || lf.callCount() != 0 || f.callCount() != 0 {
+		t.Errorf("E/fetch/F calls = %d/%d/%d, want 0/0/0",
+			e.callCount(), lf.callCount(), f.callCount())
+	}
+	for _, it := range []feed.Item{cIt, adIt} {
+		links, err := st.ListItemLinks(ctx, it.DedupKey())
+		if err != nil {
+			t.Fatalf("ListItemLinks: %v", err)
+		}
+		if len(links) != 0 {
+			t.Errorf("item_links(%s) = %+v, want empty", it.DedupKey(), links)
+		}
+	}
+	cache, err := st.GetLinkCache(ctx, []string{courseArt, adArt})
+	if err != nil {
+		t.Fatalf("GetLinkCache: %v", err)
+	}
+	if len(cache) != 0 {
+		t.Errorf("link_cache = %+v, want empty", cache)
+	}
+	rows, err := st.ListRunDigests(ctx, testNow.Unix())
+	if err != nil {
+		t.Fatalf("ListRunDigests: %v", err)
+	}
+	if len(rows) != 1 || rows[0].ItemCount != 1 {
+		t.Fatalf("rows = %+v, want one row ItemCount=1 (course; ad выброшен)", rows)
+	}
+	ditems, err := st.ListDigestItems(ctx, rows[0].ID)
+	if err != nil {
+		t.Fatalf("ListDigestItems: %v", err)
+	}
+	if len(ditems) != 1 || ditems[0].Title != "c-T1" ||
+		strings.Contains(ditems[0].Summary, "↳") {
+		t.Errorf("digest_items = %+v, want lone course item without ↳", ditems)
+	}
+}
+
+// 9B кейс 5: LinkFetchTotalMax=2 и 3 статьи → Fetcher вызван 2 раза, третья
+// ссылка есть в item_links, но без строки link_cache и без ↳ (деградация).
+func TestPipelineRun_FetchBudgetIsPerRun(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	arts := []string{"https://a1.test/x", "https://a2.test/x", "https://a3.test/x"}
+	items := make([]feed.Item, 0, 3)
+	for i, a := range arts {
+		items = append(items, linkItem("b", strconv.Itoa(i+1),
+			"b-T"+strconv.Itoa(i+1), a))
+	}
+	e := &fakeLinkClassifier{}
+	f := &fakeLinkSummarizer{}
+	lf := &fakeLinkFetcher{}
+	poster := &fakePoster{}
+	srcs := []TrackedSource{{Src: fakeSource{name: "b", items: items}, TopicID: 1}}
+	if err := linkTestPipeline(st, &fakeClassifier{}, poster, srcs, e, f, lf, 5, 2).Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if lf.callCount() != 2 {
+		t.Fatalf("fetch calls = %d, want 2 (общий бюджет прогона)", lf.callCount())
+	}
+	cache, err := st.GetLinkCache(ctx, arts)
+	if err != nil {
+		t.Fatalf("GetLinkCache: %v", err)
+	}
+	if len(cache) != 2 {
+		t.Errorf("link_cache rows = %+v, want 2 (третья без строки)", cache)
+	}
+	if _, hit := cache[arts[2]]; hit {
+		t.Errorf("третья ссылка не должна быть в link_cache: %+v", cache[arts[2]])
+	}
+	for i, it := range items {
+		links, err := st.ListItemLinks(ctx, it.DedupKey())
+		if err != nil {
+			t.Fatalf("ListItemLinks: %v", err)
+		}
+		if len(links) != 1 || links[0].URL != arts[i] || links[0].Kind != llm.LinkKindArticle {
+			t.Errorf("item_links(%s) = %+v, want one article %s", it.DedupKey(), links, arts[i])
+		}
+	}
+	rows, err := st.ListRunDigests(ctx, testNow.Unix())
+	if err != nil {
+		t.Fatalf("ListRunDigests: %v", err)
+	}
+	ditems, err := st.ListDigestItems(ctx, rows[0].ID)
+	if err != nil {
+		t.Fatalf("ListDigestItems: %v", err)
+	}
+	if len(ditems) != 3 {
+		t.Fatalf("digest_items = %+v, want 3", ditems)
+	}
+	for i, di := range ditems {
+		has := strings.Contains(di.Summary, "↳")
+		if want := i < 2; has != want {
+			t.Errorf("item[%d] has↳ = %v, want %v (бюджет 2)", i, has, want)
+		}
+	}
+}
+
+// 9B кейс 5: offline — LinkFetch=nil, E=Offline → item_links kind=other,
+// fetch/F не вызываются, link_cache пуст, дайджест цел (summary без ↳).
+func TestPipelineRun_OfflineLinkDegradation(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	const art = "https://art.test/off"
+	it := linkItem("o", "1", "o-T1", art)
+	f := &fakeLinkSummarizer{} // в offline-wiring F есть (Offline), но не вызывается
+	poster := &fakePoster{}
+	srcs := []TrackedSource{{Src: fakeSource{name: "o", items: []feed.Item{it}}, TopicID: 1}}
+	p := linkTestPipeline(st, &fakeClassifier{}, poster, srcs, llm.NewOffline(), f, nil, 5, 30)
+	if err := p.Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if f.callCount() != 0 {
+		t.Errorf("F calls = %d, want 0 (нет fetch — нет свежих страниц)", f.callCount())
+	}
+	links, err := st.ListItemLinks(ctx, it.DedupKey())
+	if err != nil {
+		t.Fatalf("ListItemLinks: %v", err)
+	}
+	if len(links) != 1 || links[0].Kind != llm.LinkKindOther {
+		t.Errorf("item_links = %+v, want one other (Offline-E)", links)
+	}
+	cache, err := st.GetLinkCache(ctx, []string{art})
+	if err != nil {
+		t.Fatalf("GetLinkCache: %v", err)
+	}
+	if len(cache) != 0 {
+		t.Errorf("link_cache = %+v, want empty offline", cache)
+	}
+	if poster.calls() != 1 {
+		t.Fatalf("poster calls = %d, want 1 (дайджест цел)", poster.calls())
+	}
+	rows, err := st.ListRunDigests(ctx, testNow.Unix())
+	if err != nil {
+		t.Fatalf("ListRunDigests: %v", err)
+	}
+	ditems, err := st.ListDigestItems(ctx, rows[0].ID)
+	if err != nil {
+		t.Fatalf("ListDigestItems: %v", err)
+	}
+	if len(ditems) != 1 || ditems[0].Summary != "s1" {
+		t.Errorf("digest_items = %+v, want base summary s1 without ↳", ditems)
+	}
+}
+
+// 9B, решение диспетчера (E-error): ошибка вызова E → ВСЕ пары kind=other в
+// item_links, Fetcher/F НЕ вызываются, дайджест цел, Run=nil.
+func TestPipelineRun_LinkClassifyErrorDegradesToOther(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	const art = "https://art.test/e"
+	it := linkItem("e", "1", "e-T1", art)
+	e := &fakeLinkClassifier{err: errors.New("E boom")}
+	f := &fakeLinkSummarizer{}
+	lf := &fakeLinkFetcher{}
+	poster := &fakePoster{}
+	srcs := []TrackedSource{{Src: fakeSource{name: "e", items: []feed.Item{it}}, TopicID: 1}}
+	if err := linkTestPipeline(st, &fakeClassifier{}, poster, srcs, e, f, lf, 5, 30).Run(ctx); err != nil {
+		t.Fatalf("Run = %v, want nil (E-error — деградация)", err)
+	}
+	if e.callCount() != 1 {
+		t.Errorf("E calls = %d, want 1", e.callCount())
+	}
+	if lf.callCount() != 0 || f.callCount() != 0 {
+		t.Errorf("fetch/F calls = %d/%d, want 0/0", lf.callCount(), f.callCount())
+	}
+	links, err := st.ListItemLinks(ctx, it.DedupKey())
+	if err != nil {
+		t.Fatalf("ListItemLinks: %v", err)
+	}
+	if len(links) != 1 || links[0].Kind != llm.LinkKindOther || links[0].Ord != 1 {
+		t.Errorf("item_links = %+v, want one other ord=1", links)
+	}
+	if poster.calls() != 1 {
+		t.Fatalf("poster calls = %d, want 1 (сообщение осталось в дайджесте)", poster.calls())
+	}
+	rows, err := st.ListRunDigests(ctx, testNow.Unix())
+	if err != nil {
+		t.Fatalf("ListRunDigests: %v", err)
+	}
+	ditems, err := st.ListDigestItems(ctx, rows[0].ID)
+	if err != nil {
+		t.Fatalf("ListDigestItems: %v", err)
+	}
+	if len(ditems) != 1 || ditems[0].Summary != "s1" {
+		t.Errorf("digest_items = %+v, want base s1 without ↳", ditems)
+	}
+}
+
+// 9B: ошибка вызова F → строки link_cache с пустым summary, дайджест цел
+// без ↳, Run=nil (§4.3).
+func TestPipelineRun_LinkSummarizeErrorKeepsEmptySummary(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	const art = "https://art.test/f"
+	it := linkItem("g", "1", "g-T1", art)
+	e := &fakeLinkClassifier{}
+	f := &fakeLinkSummarizer{err: errors.New("F boom")}
+	lf := &fakeLinkFetcher{}
+	poster := &fakePoster{}
+	srcs := []TrackedSource{{Src: fakeSource{name: "g", items: []feed.Item{it}}, TopicID: 1}}
+	if err := linkTestPipeline(st, &fakeClassifier{}, poster, srcs, e, f, lf, 5, 30).Run(ctx); err != nil {
+		t.Fatalf("Run = %v, want nil (F-error — деградация)", err)
+	}
+	if lf.callCount() != 1 || f.callCount() != 1 {
+		t.Fatalf("fetch/F calls = %d/%d, want 1/1", lf.callCount(), f.callCount())
+	}
+	cache, err := st.GetLinkCache(ctx, []string{art})
+	if err != nil {
+		t.Fatalf("GetLinkCache: %v", err)
+	}
+	if len(cache) != 1 {
+		t.Fatalf("link_cache = %+v, want 1 row", cache)
+	}
+	if row := cache[art]; row.Kind != llm.LinkKindArticle || row.Summary != "" ||
+		row.Title != "title "+art {
+		t.Errorf("cache row = %+v, want article + title + EMPTY summary", row)
+	}
+	if poster.calls() != 1 {
+		t.Fatalf("poster calls = %d, want 1", poster.calls())
+	}
+	rows, err := st.ListRunDigests(ctx, testNow.Unix())
+	if err != nil {
+		t.Fatalf("ListRunDigests: %v", err)
+	}
+	ditems, err := st.ListDigestItems(ctx, rows[0].ID)
+	if err != nil {
+		t.Fatalf("ListDigestItems: %v", err)
+	}
+	if len(ditems) != 1 || strings.Contains(ditems[0].Summary, "↳") {
+		t.Errorf("digest_items = %+v, want no ↳", ditems)
+	}
+}
+
+// 9B: ошибка Fetch на один URL → строка kind=unavailable (без ретрая),
+// остальные ссылки обработаны, дайджест цел.
+func TestPipelineRun_FetchErrorMarksUnavailable(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	const bad = "https://bad.test/x"
+	const good = "https://good.test/y"
+	it1 := linkItem("h", "1", "h-T1", bad)
+	it2 := linkItem("h", "2", "h-T2", good)
+	e := &fakeLinkClassifier{}
+	f := &fakeLinkSummarizer{}
+	lf := &fakeLinkFetcher{failURLs: map[string]bool{bad: true}}
+	poster := &fakePoster{}
+	srcs := []TrackedSource{{Src: fakeSource{name: "h", items: []feed.Item{it1, it2}}, TopicID: 1}}
+	if err := linkTestPipeline(st, &fakeClassifier{}, poster, srcs, e, f, lf, 5, 30).Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if lf.callCount() != 2 {
+		t.Fatalf("fetch calls = %d, want 2 (по одной попытке на URL, без ретрая)", lf.callCount())
+	}
+	cache, err := st.GetLinkCache(ctx, []string{bad, good})
+	if err != nil {
+		t.Fatalf("GetLinkCache: %v", err)
+	}
+	if len(cache) != 2 {
+		t.Fatalf("link_cache = %+v, want 2 rows", cache)
+	}
+	if row := cache[bad]; row.Kind != "unavailable" || row.Summary != "" {
+		t.Errorf("bad row = %+v, want unavailable + empty summary", row)
+	}
+	if row := cache[good]; row.Kind != llm.LinkKindArticle || row.Summary == "" {
+		t.Errorf("good row = %+v, want article + summary", row)
+	}
+	rows, err := st.ListRunDigests(ctx, testNow.Unix())
+	if err != nil {
+		t.Fatalf("ListRunDigests: %v", err)
+	}
+	ditems, err := st.ListDigestItems(ctx, rows[0].ID)
+	if err != nil {
+		t.Fatalf("ListDigestItems: %v", err)
+	}
+	if len(ditems) != 2 {
+		t.Fatalf("digest_items = %+v, want 2", ditems)
+	}
+	if strings.Contains(ditems[0].Summary, "↳") {
+		t.Errorf("failed-fetch item got ↳: %q", ditems[0].Summary)
+	}
+	if !strings.Contains(ditems[1].Summary, "↳ сжато: "+good) {
+		t.Errorf("good item lacks ↳: %q", ditems[1].Summary)
+	}
+}
+
+// 9B кейс 5: кеш прошлых прогонов — pre-seed link_cache с summary → ↳ без
+// fetch (счётчик 0), F не вызывается.
+func TestPipelineRun_CachedSummaryUsedWithoutFetch(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	const art = "https://art.test/old"
+	if err := st.UpsertLinkCache(ctx, []storage.LinkCacheRow{
+		{URL: art, Kind: llm.LinkKindArticle, Title: "старая", Summary: "кешированное саммари"},
+	}); err != nil {
+		t.Fatalf("UpsertLinkCache: %v", err)
+	}
+	it := linkItem("k", "1", "k-T1", art)
+	e := &fakeLinkClassifier{}
+	f := &fakeLinkSummarizer{}
+	lf := &fakeLinkFetcher{}
+	poster := &fakePoster{}
+	srcs := []TrackedSource{{Src: fakeSource{name: "k", items: []feed.Item{it}}, TopicID: 1}}
+	if err := linkTestPipeline(st, &fakeClassifier{}, poster, srcs, e, f, lf, 5, 30).Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if lf.callCount() != 0 {
+		t.Errorf("fetch calls = %d, want 0 (кеш-хит не фетчится)", lf.callCount())
+	}
+	if f.callCount() != 0 {
+		t.Errorf("F calls = %d, want 0 (нет свежих страниц)", f.callCount())
+	}
+	rows, err := st.ListRunDigests(ctx, testNow.Unix())
+	if err != nil {
+		t.Fatalf("ListRunDigests: %v", err)
+	}
+	ditems, err := st.ListDigestItems(ctx, rows[0].ID)
+	if err != nil {
+		t.Fatalf("ListDigestItems: %v", err)
+	}
+	if len(ditems) != 1 || ditems[0].Summary != "s1\n↳ кешированное саммари" {
+		t.Errorf("digest_items = %+v, want «s1\\n↳ кешированное саммари»", ditems)
+	}
+}
+
+// 9B кейс 6: ↳-конкатенация ≤600 рун с обрезкой на границе руны;
+// message_state.summary остаётся базовым.
+func TestPipelineRun_LinkSummaryConcatCappedAt600Runes(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	arts := []string{"https://l1.test/a", "https://l2.test/b", "https://l3.test/c"}
+	long := strings.Repeat("длинное саммари ", 16) // 16 рун × 16 = 256 рун
+	if n := utf8.RuneCountInString(long); n != 256 {
+		t.Fatalf("fixture broken: %d runes, want 256", n)
+	}
+	byURL := make(map[string]string, len(arts))
+	for _, a := range arts {
+		byURL[a] = long
+	}
+	it := feed.Item{
+		Kind: "tg_public", ID: "77", URL: "https://t.me/l/77", Title: "l-T1",
+		Text: "список статей: " + arts[0] + " " + arts[1] + " " + arts[2],
+	}
+	e := &fakeLinkClassifier{}
+	f := &fakeLinkSummarizer{byURL: byURL}
+	lf := &fakeLinkFetcher{}
+	poster := &fakePoster{}
+	srcs := []TrackedSource{{Src: fakeSource{name: "l", items: []feed.Item{it}}, TopicID: 1}}
+	if err := linkTestPipeline(st, &fakeClassifier{}, poster, srcs, e, f, lf, 5, 30).Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	rows, err := st.ListRunDigests(ctx, testNow.Unix())
+	if err != nil {
+		t.Fatalf("ListRunDigests: %v", err)
+	}
+	ditems, err := st.ListDigestItems(ctx, rows[0].ID)
+	if err != nil {
+		t.Fatalf("ListDigestItems: %v", err)
+	}
+	if len(ditems) != 1 {
+		t.Fatalf("digest_items = %+v, want 1", ditems)
+	}
+	sum := ditems[0].Summary
+	if n := utf8.RuneCountInString(sum); n > 600 {
+		t.Errorf("summary = %d runes, want ≤600", n)
+	}
+	if !utf8.ValidString(sum) {
+		t.Error("summary is not valid UTF-8 (обрезка не на границе руны)")
+	}
+	if !strings.HasPrefix(sum, "s1\n↳ "+long) {
+		t.Errorf("summary lacks base + first ↳: %.60q", sum)
+	}
+	states, err := st.GetMessageStates(ctx, dedupKeys([]feed.Item{it}))
+	if err != nil {
+		t.Fatalf("GetMessageStates: %v", err)
+	}
+	if s := states[it.DedupKey()]; s.Summary != "s1" {
+		t.Errorf("message_state summary = %q, want base s1 (без ↳)", s.Summary)
+	}
+}
+
+// 9B кейс 6 (ревью F5, замена vacuous L3-golden): L2-golden с длинным
+// ↳-саммари РОВНО 600 рун. Строка собирается strings.Repeat БЕЗ вызова
+// truncateRunes — golden не должен дублировать логику pipeline. Существующие
+// golden не меняются; drill_l2_links.golden — осознанное ДОБАВЛЕНИЕ
+// (`go test ./internal/digest -run TestRenderDrillL2_LinkSummary_Golden -update`).
+func TestRenderDrillL2_LinkSummary_Golden(t *testing.T) {
+	const base = "Базовое саммари."       // 16 рун
+	long := strings.Repeat("детали ", 83) // 7 × 83 = ровно 581 руна
+	summary := base + "\n↳ " + long       // 16 + 3 + 581 = ровно 600 рун
+	if n := utf8.RuneCountInString(summary); n != 600 {
+		t.Fatalf("fixture broken: %d runes, want exactly 600", n)
+	}
+	item := storage.DigestItem{SourceID: 3, Title: "Новости Go", Summary: summary}
+	res := renderDrillL2("Тема 1", []l2Section{
+		{SourceID: 3, Name: "Habr", Items: []storage.DigestItem{item}},
+	}, 42)
+	if res == nil || res.Edit == nil {
+		t.Fatal("renderDrillL2 = nil, want callback result")
+	}
+	compareGolden(t, "drill_l2_links", res.Edit.Text)
+}
+
+// 9B: повторный Run после успешной доставки — 0 fetch, 0 E/F
+// (seen_items: прогон выходит до шага 4c).
+func TestPipelineRun_RepeatAfterDeliveryNoLinkWork(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	const art = "https://art.test/rep"
+	it := linkItem("r", "1", "r-T1", art)
+	e := &fakeLinkClassifier{}
+	f := &fakeLinkSummarizer{}
+	lf := &fakeLinkFetcher{}
+	srcs := []TrackedSource{{Src: fakeSource{name: "r", items: []feed.Item{it}}, TopicID: 1}}
+	poster := &fakePoster{}
+	if err := linkTestPipeline(st, &fakeClassifier{}, poster, srcs, e, f, lf, 5, 30).Run(ctx); err != nil {
+		t.Fatalf("Run(1): %v", err)
+	}
+	if lf.callCount() != 1 || e.callCount() != 1 || f.callCount() != 1 {
+		t.Fatalf("run1 counters fetch/E/F = %d/%d/%d, want 1/1/1",
+			lf.callCount(), e.callCount(), f.callCount())
+	}
+	poster2 := &fakePoster{}
+	p2 := linkTestPipeline(st, &fakeClassifier{}, poster2, srcs, e, f, lf, 5, 30)
+	p2.Now = func() time.Time { return testNow.Add(time.Hour) }
+	if err := p2.Run(ctx); err != nil {
+		t.Fatalf("Run(2): %v", err)
+	}
+	if poster2.calls() != 0 {
+		t.Errorf("run2 delivered again: calls = %d, want 0", poster2.calls())
+	}
+	if lf.callCount() != 1 || e.callCount() != 1 || f.callCount() != 1 {
+		t.Errorf("counters after run2 = %d/%d/%d, want still 1/1/1",
+			lf.callCount(), e.callCount(), f.callCount())
+	}
+}
+
+// --- Подэтап 9B, ре-ревью: F1 (политика кеша course/ad), F3 (SSRF-guard),
+// F9a (кросс-топик бюджет), F9b (сбой доставки + ссылки). ---
+
+// F1-i: E вернул course на ссылку внутри NEWS-сообщения (LINK-level, в
+// отличие от message-level skip в TestPipelineRun_CourseAndAdMessageSkipsLinkStep)
+// → fetch НЕ вызван, строка link_cache{kind=course, title=”, summary=”}
+// создана, дайджест цел без ↳.
+func TestPipelineRun_CourseLinkKindCachedWithoutFetch(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	const art = "https://course-link.test/x"
+	it := linkItem("cl", "1", "cl-T1", art)
+	e := &fakeLinkClassifier{byURL: map[string]string{art: llm.LinkKindCourse}}
+	f := &fakeLinkSummarizer{}
+	lf := &fakeLinkFetcher{}
+	poster := &fakePoster{}
+	srcs := []TrackedSource{{Src: fakeSource{name: "cl", items: []feed.Item{it}}, TopicID: 1}}
+	if err := linkTestPipeline(st, &fakeClassifier{}, poster, srcs, e, f, lf, 5, 30).Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if lf.callCount() != 0 || f.callCount() != 0 {
+		t.Errorf("fetch/F calls = %d/%d, want 0/0 (course не фетчится)", lf.callCount(), f.callCount())
+	}
+	cache, err := st.GetLinkCache(ctx, []string{art})
+	if err != nil {
+		t.Fatalf("GetLinkCache: %v", err)
+	}
+	if len(cache) != 1 {
+		t.Fatalf("link_cache = %+v, want 1 row", cache)
+	}
+	if row := cache[art]; row.Kind != llm.LinkKindCourse || row.Title != "" || row.Summary != "" {
+		t.Errorf("cache row = %+v, want course + empty title/summary", row)
+	}
+	links, err := st.ListItemLinks(ctx, it.DedupKey())
+	if err != nil {
+		t.Fatalf("ListItemLinks: %v", err)
+	}
+	if len(links) != 1 || links[0].Kind != llm.LinkKindCourse {
+		t.Errorf("item_links = %+v, want one course", links)
+	}
+	rows, err := st.ListRunDigests(ctx, testNow.Unix())
+	if err != nil {
+		t.Fatalf("ListRunDigests: %v", err)
+	}
+	ditems, err := st.ListDigestItems(ctx, rows[0].ID)
+	if err != nil {
+		t.Fatalf("ListDigestItems: %v", err)
+	}
+	if len(ditems) != 1 || strings.Contains(ditems[0].Summary, "↳") {
+		t.Errorf("digest_items = %+v, want base summary without ↳", ditems)
+	}
+}
+
+// F1-ii: pre-seed богатой строки {article,title,summary} + текущий E вернул ad
+// на тот же URL → строка НЕ изменена (summary цел), fetch не вызван, без ↳.
+func TestPipelineRun_AdLinkKindDoesNotClobberRichCache(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	const art = "https://rich.test/x"
+	if err := st.UpsertLinkCache(ctx, []storage.LinkCacheRow{
+		{URL: art, Kind: llm.LinkKindArticle, Title: "старая", Summary: "кешированное саммари"},
+	}); err != nil {
+		t.Fatalf("UpsertLinkCache: %v", err)
+	}
+	it := linkItem("rc", "1", "rc-T1", art)
+	e := &fakeLinkClassifier{byURL: map[string]string{art: llm.LinkKindAd}}
+	f := &fakeLinkSummarizer{}
+	lf := &fakeLinkFetcher{}
+	poster := &fakePoster{}
+	srcs := []TrackedSource{{Src: fakeSource{name: "rc", items: []feed.Item{it}}, TopicID: 1}}
+	if err := linkTestPipeline(st, &fakeClassifier{}, poster, srcs, e, f, lf, 5, 30).Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if lf.callCount() != 0 || f.callCount() != 0 {
+		t.Errorf("fetch/F calls = %d/%d, want 0/0", lf.callCount(), f.callCount())
+	}
+	cache, err := st.GetLinkCache(ctx, []string{art})
+	if err != nil {
+		t.Fatalf("GetLinkCache: %v", err)
+	}
+	if row := cache[art]; row.Kind != llm.LinkKindArticle || row.Title != "старая" ||
+		row.Summary != "кешированное саммари" {
+		t.Errorf("cache row = %+v, want UNCHANGED rich article row", row)
+	}
+	rows, err := st.ListRunDigests(ctx, testNow.Unix())
+	if err != nil {
+		t.Fatalf("ListRunDigests: %v", err)
+	}
+	ditems, err := st.ListDigestItems(ctx, rows[0].ID)
+	if err != nil {
+		t.Fatalf("ListDigestItems: %v", err)
+	}
+	if len(ditems) != 1 || strings.Contains(ditems[0].Summary, "↳") {
+		t.Errorf("digest_items = %+v, want no ↳ (текущий kind=ad)", ditems)
+	}
+}
+
+// F1-iii: внутрипрогонный конфликт видов одного URL в одной теме — msg1
+// X=article, msg2 X=ad → Fetcher вызван ОДИН раз, ad-строка не пишется,
+// строка article c title, ↳ только у msg1.
+func TestPipelineRun_ConflictingLinkKindsFetchOnce(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	const x = "https://shared.test/x"
+	it1 := linkItem("c1", "1", "c1-T1", x)
+	it2 := linkItem("c2", "2", "c2-T2", x)
+	e := &fakeLinkClassifier{byPair: map[[2]int]string{{2, 1}: llm.LinkKindAd}}
+	f := &fakeLinkSummarizer{}
+	lf := &fakeLinkFetcher{}
+	poster := &fakePoster{}
+	srcs := []TrackedSource{
+		{Src: fakeSource{name: "c1", items: []feed.Item{it1}}, SourceID: 1, TopicID: 1},
+		{Src: fakeSource{name: "c2", items: []feed.Item{it2}}, SourceID: 2, TopicID: 1},
+	}
+	if err := linkTestPipeline(st, &fakeClassifier{}, poster, srcs, e, f, lf, 5, 30).Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if lf.callCount() != 1 {
+		t.Fatalf("fetch calls = %d, want 1 (X фетчится один раз)", lf.callCount())
+	}
+	cache, err := st.GetLinkCache(ctx, []string{x})
+	if err != nil {
+		t.Fatalf("GetLinkCache: %v", err)
+	}
+	if len(cache) != 1 {
+		t.Fatalf("link_cache = %+v, want exactly 1 row", cache)
+	}
+	if row := cache[x]; row.Kind != llm.LinkKindArticle || row.Title != "title "+x ||
+		row.Summary != "сжато: "+x {
+		t.Errorf("cache row = %+v, want article + title + summary", row)
+	}
+	rows, err := st.ListRunDigests(ctx, testNow.Unix())
+	if err != nil {
+		t.Fatalf("ListRunDigests: %v", err)
+	}
+	ditems, err := st.ListDigestItems(ctx, rows[0].ID)
+	if err != nil {
+		t.Fatalf("ListDigestItems: %v", err)
+	}
+	if len(ditems) != 2 {
+		t.Fatalf("digest_items = %+v, want 2", ditems)
+	}
+	for _, di := range ditems {
+		has := strings.Contains(di.Summary, "↳")
+		switch di.Title {
+		case "c1-T1":
+			if !has {
+				t.Errorf("msg1 (article) lacks ↳: %q", di.Summary)
+			}
+		case "c2-T2":
+			if has {
+				t.Errorf("msg2 (ad) got ↳: %q", di.Summary)
+			}
+		}
+	}
+	l1, err := st.ListItemLinks(ctx, it1.DedupKey())
+	if err != nil {
+		t.Fatalf("ListItemLinks(it1): %v", err)
+	}
+	l2, err := st.ListItemLinks(ctx, it2.DedupKey())
+	if err != nil {
+		t.Fatalf("ListItemLinks(it2): %v", err)
+	}
+	if len(l1) != 1 || l1[0].Kind != llm.LinkKindArticle {
+		t.Errorf("item_links(it1) = %+v, want article", l1)
+	}
+	if len(l2) != 1 || l2[0].Kind != llm.LinkKindAd {
+		t.Errorf("item_links(it2) = %+v, want ad", l2)
+	}
+}
+
+// F1-iv: кеш-строка {course} прошлых прогонов + текущий E=article → строка
+// курса = ПРОМАХ: fetch выполнен, строка апгрейднута до article с title и
+// summary из F.
+func TestPipelineRun_CachedCourseUpgradedByFetch(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	const art = "https://upg.test/x"
+	if err := st.UpsertLinkCache(ctx, []storage.LinkCacheRow{
+		{URL: art, Kind: llm.LinkKindCourse},
+	}); err != nil {
+		t.Fatalf("UpsertLinkCache: %v", err)
+	}
+	it := linkItem("u", "1", "u-T1", art)
+	e := &fakeLinkClassifier{} // дефолт article
+	f := &fakeLinkSummarizer{}
+	lf := &fakeLinkFetcher{}
+	poster := &fakePoster{}
+	srcs := []TrackedSource{{Src: fakeSource{name: "u", items: []feed.Item{it}}, TopicID: 1}}
+	if err := linkTestPipeline(st, &fakeClassifier{}, poster, srcs, e, f, lf, 5, 30).Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if lf.callCount() != 1 || f.callCount() != 1 {
+		t.Fatalf("fetch/F calls = %d/%d, want 1/1 (course-строка = промах)", lf.callCount(), f.callCount())
+	}
+	cache, err := st.GetLinkCache(ctx, []string{art})
+	if err != nil {
+		t.Fatalf("GetLinkCache: %v", err)
+	}
+	if row := cache[art]; row.Kind != llm.LinkKindArticle || row.Title != "title "+art ||
+		row.Summary != "сжато: "+art {
+		t.Errorf("cache row = %+v, want upgraded article + title + F summary", row)
+	}
+	rows, err := st.ListRunDigests(ctx, testNow.Unix())
+	if err != nil {
+		t.Fatalf("ListRunDigests: %v", err)
+	}
+	ditems, err := st.ListDigestItems(ctx, rows[0].ID)
+	if err != nil {
+		t.Fatalf("ListDigestItems: %v", err)
+	}
+	if len(ditems) != 1 || ditems[0].Summary != "s1\n↳ сжато: "+art {
+		t.Errorf("digest_items = %+v, want «s1\\n↳ сжато: %s»", ditems, art)
+	}
+}
+
+// F3: SSRF-guard — literal-внутренние цели (loopback, cloud metadata, private,
+// IPv6 loopback, localhost) НЕ фетчатся, БЕЗ траты бюджета (totalMax=1 уходит
+// целиком на публичный URL) и БЕЗ строк link_cache; дайджест цел, Run=nil.
+// Публичный кейс — hostname example.com с фейк-fetcher: реального HTTP нет,
+// DNS либо резолвит публичный IP, либо (sandbox) падает → guard fail-open.
+func TestPipelineRun_SSRFGuardSkipsInternalTargets(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	internal := []string{
+		"http://127.0.0.1:9/x",
+		"http://169.254.169.254/latest",
+		"http://10.0.0.1/",
+		"http://[::1]/x",
+		"http://localhost/x",
+	}
+	const public = "https://example.com/pub"
+	all := append(append([]string{}, internal...), public)
+	items := make([]feed.Item, 0, len(all))
+	for i, u := range all {
+		items = append(items, linkItem("s", strconv.Itoa(i+1), "s-T"+strconv.Itoa(i+1), u))
+	}
+	e := &fakeLinkClassifier{}
+	f := &fakeLinkSummarizer{}
+	lf := &fakeLinkFetcher{}
+	poster := &fakePoster{}
+	srcs := []TrackedSource{{Src: fakeSource{name: "s", items: items}, TopicID: 1}}
+	if err := linkTestPipeline(st, &fakeClassifier{}, poster, srcs, e, f, lf, 5, 1).Run(ctx); err != nil {
+		t.Fatalf("Run = %v, want nil (guard — деградация без ошибки)", err)
+	}
+	if lf.callCount() != 1 {
+		t.Fatalf("fetch calls = %d, want 1 (только публичный URL)", lf.callCount())
+	}
+	if len(lf.urls) != 1 || lf.urls[0] != public {
+		t.Errorf("fetched urls = %v, want [%s]", lf.urls, public)
+	}
+	probe := []string{
+		"http://127.0.0.1:9/x", "http://169.254.169.254/latest",
+		"http://10.0.0.1", "http://10.0.0.1/", "http://[::1]/x",
+		"http://localhost/x", public,
+	}
+	cache, err := st.GetLinkCache(ctx, probe)
+	if err != nil {
+		t.Fatalf("GetLinkCache: %v", err)
+	}
+	if len(cache) != 1 {
+		t.Fatalf("link_cache = %+v, want exactly 1 row (public)", cache)
+	}
+	if row := cache[public]; row.Kind != llm.LinkKindArticle {
+		t.Errorf("public row = %+v, want article", row)
+	}
+	rows, err := st.ListRunDigests(ctx, testNow.Unix())
+	if err != nil {
+		t.Fatalf("ListRunDigests: %v", err)
+	}
+	ditems, err := st.ListDigestItems(ctx, rows[0].ID)
+	if err != nil {
+		t.Fatalf("ListDigestItems: %v", err)
+	}
+	if len(ditems) != len(all) {
+		t.Fatalf("digest_items = %+v, want %d (дайджест цел)", ditems, len(all))
+	}
+	for _, di := range ditems {
+		has := strings.Contains(di.Summary, "↳")
+		if want := di.Title == "s-T"+strconv.Itoa(len(all)); has != want {
+			t.Errorf("item %s has↳ = %v, want %v", di.Title, has, want)
+		}
+	}
+}
+
+// F9a: кросс-топик — LinkFetchTotalMax=1; тема1 URL A (article) → fetch=1;
+// тема2 тот же A → кеш-хит из БД (immediate-upsert темы1), fetch НЕ вызван, ↳
+// получен; тема2 URL B → бюджет исчерпан: B в item_links, без строки кеша,
+// без ↳.
+func TestPipelineRun_CrossTopicCacheHitAndBudget(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	const a = "https://shared.test/a"
+	const b = "https://second.test/b"
+	it1 := linkItem("t1", "1", "t1-T1", a)
+	it2 := linkItem("t2", "2", "t2-T1", a)
+	it3 := linkItem("t2", "3", "t2-T2", b)
+	e := &fakeLinkClassifier{}
+	f := &fakeLinkSummarizer{}
+	lf := &fakeLinkFetcher{}
+	poster := &fakePoster{}
+	srcs := []TrackedSource{
+		{Src: fakeSource{name: "t1", items: []feed.Item{it1}}, SourceID: 1, TopicID: 1},
+		{Src: fakeSource{name: "t2", items: []feed.Item{it2, it3}}, SourceID: 2, TopicID: 2},
+	}
+	if err := linkTestPipeline(st, &fakeClassifier{}, poster, srcs, e, f, lf, 5, 1).Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if lf.callCount() != 1 || e.callCount() != 2 {
+		t.Fatalf("fetch/E calls = %d/%d, want 1/2", lf.callCount(), e.callCount())
+	}
+	cache, err := st.GetLinkCache(ctx, []string{a, b})
+	if err != nil {
+		t.Fatalf("GetLinkCache: %v", err)
+	}
+	if len(cache) != 1 {
+		t.Fatalf("link_cache = %+v, want exactly 1 row (A)", cache)
+	}
+	if row := cache[a]; row.Kind != llm.LinkKindArticle || row.Title != "title "+a ||
+		row.Summary != "сжато: "+a {
+		t.Errorf("cache row A = %+v, want article + title + summary", row)
+	}
+	l2, err := st.ListItemLinks(ctx, it2.DedupKey())
+	if err != nil {
+		t.Fatalf("ListItemLinks(it2): %v", err)
+	}
+	l3, err := st.ListItemLinks(ctx, it3.DedupKey())
+	if err != nil {
+		t.Fatalf("ListItemLinks(it3): %v", err)
+	}
+	if len(l2) != 1 || l2[0].URL != a || l2[0].Kind != llm.LinkKindArticle {
+		t.Errorf("item_links(it2) = %+v, want one article A", l2)
+	}
+	if len(l3) != 1 || l3[0].URL != b || l3[0].Kind != llm.LinkKindArticle {
+		t.Errorf("item_links(it3) = %+v, want one article B (без строки кеша)", l3)
+	}
+	rows, err := st.ListRunDigests(ctx, testNow.Unix())
+	if err != nil {
+		t.Fatalf("ListRunDigests: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("rows = %+v, want 2 (две темы)", rows)
+	}
+	for _, r := range rows {
+		ditems, err := st.ListDigestItems(ctx, r.ID)
+		if err != nil {
+			t.Fatalf("ListDigestItems: %v", err)
+		}
+		for _, di := range ditems {
+			has := strings.Contains(di.Summary, "↳ сжато: "+a)
+			switch di.Title {
+			case "t1-T1", "t2-T1":
+				if !has {
+					t.Errorf("%s lacks ↳ (кеш-хит A): %q", di.Title, di.Summary)
+				}
+			case "t2-T2":
+				if strings.Contains(di.Summary, "↳") {
+					t.Errorf("t2-T2 got ↳ despite exhausted budget: %q", di.Summary)
+				}
+			}
+		}
+	}
+}
+
+// F9b: сбой доставки ПОСЛЕ шага 4c — run1: fetch=1, E=1, F=1, link_cache с
+// summary; run2 (те же элементы, seen не помечен): E вызван ЗАНОВО (счётчик
+// E=2 — документированное отклонение 9B-4 п.6), fetch НЕ растёт (кеш-хит),
+// F не вызван (freshPages пуст), доставка успешна, ↳ на месте.
+func TestPipelineRun_DeliveryFailureThenRetryUsesLinkCache(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	const art = "https://retry.test/x"
+	it := linkItem("d", "1", "d-T1", art)
+	e := &fakeLinkClassifier{}
+	f := &fakeLinkSummarizer{}
+	lf := &fakeLinkFetcher{}
+	srcs := []TrackedSource{{Src: fakeSource{name: "d", items: []feed.Item{it}}, TopicID: 1}}
+
+	poster1 := &fakePoster{err: errors.New("deliver boom")}
+	p1 := linkTestPipeline(st, &fakeClassifier{}, poster1, srcs, e, f, lf, 5, 30)
+	if err := p1.Run(ctx); err == nil {
+		t.Fatal("Run(1) = nil, want delivery error (4c завершается ДО доставки)")
+	}
+	if lf.callCount() != 1 || e.callCount() != 1 || f.callCount() != 1 {
+		t.Fatalf("run1 counters fetch/E/F = %d/%d/%d, want 1/1/1",
+			lf.callCount(), e.callCount(), f.callCount())
+	}
+	cache, err := st.GetLinkCache(ctx, []string{art})
+	if err != nil {
+		t.Fatalf("GetLinkCache: %v", err)
+	}
+	if row := cache[art]; row.Summary != "сжато: "+art {
+		t.Fatalf("run1 cache row = %+v, want summary saved before delivery", row)
+	}
+
+	poster2 := &fakePoster{}
+	p2 := linkTestPipeline(st, &fakeClassifier{}, poster2, srcs, e, f, lf, 5, 30)
+	p2.Now = func() time.Time { return testNow.Add(time.Hour) }
+	if err := p2.Run(ctx); err != nil {
+		t.Fatalf("Run(2): %v", err)
+	}
+	if e.callCount() != 2 {
+		t.Errorf("E calls = %d, want 2 (документированное отклонение 9B-4 п.6)", e.callCount())
+	}
+	if lf.callCount() != 1 {
+		t.Errorf("fetch calls = %d, want still 1 (кеш-хит — GET не повторяется)", lf.callCount())
+	}
+	if f.callCount() != 1 {
+		t.Errorf("F calls = %d, want still 1 (freshPages пуст)", f.callCount())
+	}
+	if poster2.calls() != 1 {
+		t.Fatalf("run2 poster calls = %d, want 1", poster2.calls())
+	}
+	rows, err := st.ListRunDigests(ctx, testNow.Add(time.Hour).Unix())
+	if err != nil {
+		t.Fatalf("ListRunDigests: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("run2 rows = %+v, want 1", rows)
+	}
+	ditems, err := st.ListDigestItems(ctx, rows[0].ID)
+	if err != nil {
+		t.Fatalf("ListDigestItems: %v", err)
+	}
+	if len(ditems) != 1 || ditems[0].Summary != "s1\n↳ сжато: "+art {
+		t.Errorf("run2 digest_items = %+v, want «s1\\n↳ сжато: %s»", ditems, art)
 	}
 }

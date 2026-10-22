@@ -45,10 +45,23 @@ type Pipeline struct {
 	// Classify — вызов A плана §4.8 (классификация + саммари сообщения,
 	// Этап 9A). Заменил TopicSummarizer в Run; llm/topicdigest.go жив до 9D.
 	Classify llm.ClassifySummarizer
-	Poster   MessagePoster
-	ChatID   string
-	Log      *slog.Logger     // optional; defaults to slog.Default()
-	Now      func() time.Time // optional; defaults to time.Now (for tests)
+	// Поля шага 4c (Этап 9B, план §4.3/§4.8.1): внешние ссылки kept-элементов.
+	// Нил-сейвы: LinkClassify == nil → шаг 4c пропускается ЦЕЛИКОМ (обратная
+	// совместимость с pipeline-тестами 9A); LinkFetch == nil → fetch-фаза
+	// пропускается (offline: item_links пишутся, саммари статей нет).
+	LinkClassify llm.LinkClassifier // вызов E — виды ссылок, батч на тему
+	LinkSummary  llm.LinkSummarizer // вызов F — саммари свежесобранных страниц
+	LinkFetch    LinkFetcher        // ≤1 GET на URL; nil в offline
+	// LinkPerMessageMax — ≤N ссылок на сообщение (LINK_PER_MESSAGE_MAX,
+	// дефолт 5); LinkFetchTotalMax — бюджет fetch'ей ОБЩИЙ НА ПРОГОН
+	// (LINK_FETCH_TOTAL_MAX, дефолт 30); сверх бюджета ссылки остаются в
+	// item_links без саммари (деградация, не ошибка).
+	LinkPerMessageMax int
+	LinkFetchTotalMax int
+	Poster            MessagePoster
+	ChatID            string
+	Log               *slog.Logger     // optional; defaults to slog.Default()
+	Now               func() time.Time // optional; defaults to time.Now (for tests)
 }
 
 // log returns the configured logger or the default.
@@ -189,6 +202,10 @@ func (p *Pipeline) Run(ctx context.Context) error {
 	// L1 body → InsertDigest(delivered=0). A failed topic is SKIPPED: no
 	// digests row, its items stay unseen and are picked up by the next run
 	// (кеш message_state при этом сохраняется — §4.9).
+	// linkFetchBudget — счётчик fetch'ей шага 4c, ОБЩИЙ НА ПРОГОН (§4.3:
+	// ≤LinkFetchTotalMax GET'ов; темы обрабатываются последовательно —
+	// гонки нет, указатель передаётся в processTopicLinks).
+	linkFetchBudget := p.LinkFetchTotalMax
 	var pending []pendingTopic
 	entries := make([]TOCEntry, 0, len(topicIDs))
 	var adKeys []string
@@ -295,10 +312,6 @@ func (p *Pipeline) Run(ctx context.Context) error {
 		for j, i := range unclsAt {
 			pos[i] = j
 		}
-		type keptItem struct {
-			it             feed.Item
-			summary, class string
-		}
 		kept := make([]keptItem, 0, len(topicItems))
 		for i, it := range topicItems {
 			if st, hit := cached[i]; hit {
@@ -325,6 +338,14 @@ func (p *Pipeline) Run(ctx context.Context) error {
 			// записи в оглавлении. Это НЕ сбой темы (failed не растёт).
 			continue
 		}
+
+		// 4c (Этап 9B, план §4.8.1 шаг 4 позиция c): внешние ссылки
+		// kept-элементов — вызов E, fetch article/other (кеш link_cache),
+		// вызов F; ↳-саммари конкатенируются в kept.summary и попадают ТОЛЬКО
+		// в digest_items (message_state.summary остаётся базовым — повторный
+		// прогон детерминированно пересобирает конкатенацию из link_cache).
+		// Любая ошибка E/fetch/F — деградация (log.Warn), тема НЕ пропускается.
+		p.processTopicLinks(ctx, kept, &linkFetchBudget)
 
 		// Fallback titles (C1 отклонение 2): в 9A headline-вызова нет (вызов C
 		// и полная агрегация — в 9D), тело темы рендерится существующей

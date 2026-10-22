@@ -19,6 +19,7 @@ import (
 	"github.com/akomyagin/aiTelegaBot/internal/config"
 	"github.com/akomyagin/aiTelegaBot/internal/digest"
 	"github.com/akomyagin/aiTelegaBot/internal/feed"
+	"github.com/akomyagin/aiTelegaBot/internal/linkfetch"
 	"github.com/akomyagin/aiTelegaBot/internal/llm"
 	"github.com/akomyagin/aiTelegaBot/internal/mtproto"
 	"github.com/akomyagin/aiTelegaBot/internal/scheduler"
@@ -182,11 +183,19 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	sourceProvider := newSourceProvider(store, staticSources, staticRefs,
 		hc, tgLimit, channelBuf, mtClient, mtLimit)
 
+	// Этап 9B: вызовы E/F и fetcher внешних ссылок — та же offline-вилка, что
+	// и у newSummarizer (паттерн wiring Этапа 9A).
+	linkClassify, linkSummary, linkFetch := newLinkStack(cfg)
 	pipeline := &digest.Pipeline{
-		SourceProvider: sourceProvider,
-		Store:          store,
-		Classify:       summarizer,
-		ChatID:         cfg.TelegramChatID,
+		SourceProvider:    sourceProvider,
+		Store:             store,
+		Classify:          summarizer,
+		LinkClassify:      linkClassify,
+		LinkSummary:       linkSummary,
+		LinkFetch:         linkFetch,
+		LinkPerMessageMax: cfg.LinkPerMessageMax,
+		LinkFetchTotalMax: cfg.LinkFetchTotalMax,
+		ChatID:            cfg.TelegramChatID,
 	}
 
 	listSources := func(ctx context.Context) (string, error) {
@@ -319,6 +328,30 @@ func newSummarizer(cfg *config.Config) llm.ClassifySummarizer {
 		return llm.NewOffline()
 	}
 	return llm.NewClient(cfg.LLMAPIKey, cfg.LLMBaseURL, cfg.LLMModel, cfg.LLMMaxRetries)
+}
+
+// newLinkStack — wiring шага 4c (Этап 9B, план §4.3): вызов E (LinkClassifier)
+// и вызов F (LinkSummarizer) реализуются теми же *llm.Client / *llm.Offline,
+// что и вызов A; fetcher создаётся ТОЛЬКО в сетевом режиме (offline → nil:
+// fetch-фаза пропускается, item_links пишутся с kind=other). http.Client у
+// fetcher ОТДЕЛЬНЫЙ (не общий с feed): собственный Timeout из
+// cfg.LinkFetchTimeout — осознанное отклонение от формулировки плана «общий
+// hc», к лучшему: таймаут ссылок (дефолт 15с) независим от таймаута feed
+// (pipeline ctx сам не оборачивает; Fetch уважает отмену ctx).
+// LinkFetchTimeout ≤ 0 возможен лишь при ручном конструировании Config
+// (Load даёт дефолт 15с) — страховка дефолтом.
+func newLinkStack(cfg *config.Config) (llm.LinkClassifier, llm.LinkSummarizer, digest.LinkFetcher) {
+	if cfg.Offline {
+		off := llm.NewOffline()
+		return off, off, nil
+	}
+	cl := llm.NewClient(cfg.LLMAPIKey, cfg.LLMBaseURL, cfg.LLMModel, cfg.LLMMaxRetries)
+	timeout := cfg.LinkFetchTimeout
+	if timeout <= 0 {
+		timeout = 15 * time.Second
+	}
+	hc := &http.Client{Timeout: timeout}
+	return cl, cl, linkfetch.NewFetcher(hc, cfg.LinkFetchMaxBytes)
 }
 
 // sourceAdder validates and persists a candidate source; the signature

@@ -96,6 +96,30 @@ func (o *Offline) ClassifySummarize(ctx context.Context, items []ClassifyItem) (
 	return degradedClassifyResult(items), nil
 }
 
+// ClassifyLinks implements LinkClassifier offline (план §4.7):
+// детерминированно все пары (msg,link) получают kind=other — без сети.
+// Семантика: «неизвестное считаем статьёй» (§4.3), но pipeline в offline-режиме
+// не fetch'ит вовсе (item_links пишутся с kind=other без саммари). Контракт
+// покрытия LinkClassifier соблюдён: ровно по одному LinkKind на пару в порядке
+// входа. Два вызова на одном входе байт-в-байт одинаковы.
+func (o *Offline) ClassifyLinks(ctx context.Context, msgs []MsgLinks) ([]LinkKind, error) {
+	_ = ctx
+	return allLinkPairs(msgs), nil
+}
+
+// SummarizeLinks implements LinkSummarizer offline (план §4.7):
+// детерминированно все Summary="" — offline ссылки не саммаризуются (без
+// сети). Контракт покрытия: ровно по одному LinkSummary на страницу,
+// Index 1..n. Два вызова на одном входе байт-в-байт одинаковы.
+func (o *Offline) SummarizeLinks(ctx context.Context, pages []LinkPage) ([]LinkSummary, error) {
+	_ = ctx
+	out := make([]LinkSummary, len(pages))
+	for i := range out {
+		out[i] = LinkSummary{Index: i + 1} // Summary="" — деградация по определению
+	}
+	return out, nil
+}
+
 // extractLead takes the first ~leadRunes runes of text, or everything up to the
 // first ". " sentence boundary, whichever is shorter. Deterministic.
 func extractLead(text string) string {
