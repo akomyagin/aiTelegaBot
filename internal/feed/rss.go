@@ -52,14 +52,37 @@ func (s *RSSSource) Collect(ctx context.Context) ([]Item, error) {
 		} else if fi.UpdatedParsed != nil {
 			published = *fi.UpdatedParsed
 		}
-		items = append(items, Item{
+		item := Item{
 			Source:    s.name,
 			Kind:      s.kind,
 			Title:     strings.TrimSpace(fi.Title),
 			URL:       fi.Link,
 			Text:      text,
 			Published: published,
-		})
+		}
+		// Медиа (plan §4.5, Stage 9E): первая картинка элемента — enclosure
+		// image/* или media:content (gofeed fi.Image).
+		if mediaURL := mediaImageURL(fi); mediaURL != "" {
+			item.MediaKind = "photo"
+			item.MediaURL = mediaURL
+		}
+		items = append(items, item)
 	}
 	return items, nil
+}
+
+// mediaImageURL возвращает URL первой картинки gofeed-элемента (plan §4.5):
+// enclosure с типом image/*, иначе fi.Image (media:content). Не-image
+// enclosures (application/pdf и т.п.) игнорируются — документы/видео не несём
+// (plan §2). Пустой Type у enclosure картинкой не считается.
+func mediaImageURL(fi *gofeed.Item) string {
+	for _, e := range fi.Enclosures {
+		if e != nil && e.URL != "" && strings.HasPrefix(e.Type, "image/") {
+			return e.URL
+		}
+	}
+	if fi.Image != nil {
+		return fi.Image.URL
+	}
+	return ""
 }

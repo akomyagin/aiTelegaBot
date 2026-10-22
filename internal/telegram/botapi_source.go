@@ -5,8 +5,22 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/go-telegram/bot/models"
+
 	"github.com/akomyagin/aiTelegaBot/internal/feed"
 )
+
+// largestPhotoFileID возвращает file_id наибольшего размера фото или "".
+// Bot API гарантирует порядок Message.photo: «available sizes of the photo,
+// sorted from smallest to largest» (документация Bot API, поле photo);
+// go-telegram/bot models.PhotoSize — прямое зеркало JSON без переупорядочивания
+// (проверено на v1.22.0), поэтому наибольший размер — последний элемент.
+func largestPhotoFileID(photo []models.PhotoSize) string {
+	if len(photo) == 0 {
+		return ""
+	}
+	return photo[len(photo)-1].FileID
+}
 
 // ManagedSource reads Telegram channel posts from ONE channel/group where the
 // bot is an admin. Posts are buffered by handleUpdate under key and drained on

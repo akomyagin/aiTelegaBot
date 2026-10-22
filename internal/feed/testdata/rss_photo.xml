@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Photo feed</title>
+    <item>
+      <title>Item with image</title>
+      <link>https://example.com/img</link>
+      <enclosure url="https://example.com/pic.jpg" length="12345" type="image/jpeg"/>
+    </item>
+    <item>
+      <title>Item with PDF</title>
+      <link>https://example.com/pdf</link>
+      <enclosure url="https://example.com/paper.pdf" length="999" type="application/pdf"/>
+    </item>
+    <item>
+      <title>Item without enclosure</title>
+      <link>https://example.com/plain</link>
+    </item>
+  </channel>
+</rss>

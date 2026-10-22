@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -13,6 +14,13 @@ import (
 
 	"github.com/akomyagin/aiTelegaBot/internal/feed"
 )
+
+// photoURLRe извлекает URL картинки из style-атрибута
+// div.tgme_widget_message_photo_wrap: background-image:url('…'). Компилируется
+// один раз (пакетный var, как остальные regexp проекта). Html-сущности (&amp;
+// и т.п.) в значении атрибута уже декодированы golang.org/x/net/html до regex,
+// а внутри url('…') t.me кладёт сырой URL — дополнительная обработка не нужна.
+var photoURLRe = regexp.MustCompile(`background-image:url\('([^']+)'\)`)
 
 // PublicSource scrapes https://t.me/s/<channel> for the latest posts of a
 // public Telegram channel. It degrades gracefully: any error returns an empty
@@ -130,7 +138,7 @@ func messageToItem(msg *html.Node, channel string) (feed.Item, bool) {
 	text := findMessageText(msg)
 	published := findMessageTime(msg)
 
-	return feed.Item{
+	item := feed.Item{
 		Kind:      "tg_public",
 		Source:    channel,
 		ID:        msgID,
@@ -138,7 +146,44 @@ func messageToItem(msg *html.Node, channel string) (feed.Item, bool) {
 		URL:       "https://t.me/" + channel + "/" + msgID,
 		Text:      text,
 		Published: published,
-	}, true
+	}
+	// Медиа (plan §4.5, Stage 9E): photo_wrap со style=background-image →
+	// MediaURL; у поста без фото поля остаются пустыми.
+	if photoURL := findMessagePhoto(msg); photoURL != "" {
+		item.MediaKind = "photo"
+		item.MediaURL = photoURL
+	}
+	return item, true
+}
+
+// findMessagePhoto возвращает URL картинки из первого
+// tgme_widget_message_photo_wrap внутри поста, или "" если фото нет /
+// style-атрибут не распознан.
+func findMessagePhoto(n *html.Node) string {
+	var found *html.Node
+	var search func(*html.Node)
+	search = func(node *html.Node) {
+		if found != nil {
+			return
+		}
+		if node.Type == html.ElementNode && node.Data == "div" &&
+			hasClass(attr(node, "class"), "tgme_widget_message_photo_wrap") {
+			found = node
+			return
+		}
+		for c := node.FirstChild; c != nil; c = c.NextSibling {
+			search(c)
+		}
+	}
+	search(n)
+	if found == nil {
+		return ""
+	}
+	m := photoURLRe.FindStringSubmatch(attr(found, "style"))
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
 }
 
 // findMessageText returns the concatenated text of the first
