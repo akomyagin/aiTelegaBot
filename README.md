@@ -192,6 +192,7 @@ go run ./cmd/bot
 | `LINK_FETCH_MAX_BYTES` | нет | Лимит байт тела страницы | `2097152` (2 MB) |
 | `LINK_PER_MESSAGE_MAX` | нет | Макс. внешних ссылок на сообщение | `5` |
 | `LINK_FETCH_TOTAL_MAX` | нет | Бюджет fetch'ей на прогон | `30` |
+| `MT_MEDIA_REUPLOAD_MAX` | нет | Лимит re-upload'ов фото приватных каналов (MTProto) на прогон | `3` |
 | `DB_PATH` | нет | Путь к SQLite | `/data/state.db` |
 | `MTPROTO_APP_ID` | нет | App ID с my.telegram.org | — |
 | `MTPROTO_APP_HASH` | нет | App Hash с my.telegram.org | — |

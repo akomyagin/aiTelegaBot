@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -618,4 +619,238 @@ func prompt(label string) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(line), nil
+}
+
+// DownloadPhoto (подэтап 9E, план §4.5.1 п.1) скачивает фото, прикреплённое к
+// сообщению msgID канала ref, и СТРИМИТ его chunk'ами в destPath. Файл НИКОГДА
+// не держится в памяти целиком (прод RAM 458 MB): каждый chunk (≤1 МБ — лимит
+// upload.getFile) пишется на диск по мере получения. ref — "@username"/
+// "username" (ChannelSource) либо "-100X" (PeerSource; access_hash из
+// PeerCache, при промахе ОДИН dialogs refresh — паттерн GetHistoryByPeer).
+// FloodWait-дисциплина как у GetHistory: floodwait middleware + ограниченный
+// экспоненциальный backoff c jitter (historyMaxTries). Ошибка любого шага
+// возвращается наружу — MediaResolver логирует её, прогон дайджеста не падает
+// (§4.5.1).
+func (c *Client) DownloadPhoto(ctx context.Context, ref string, msgID int, destPath string) error {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return fmt.Errorf("mtproto: downloadPhoto: empty ref")
+	}
+	if msgID <= 0 {
+		return fmt.Errorf("mtproto: downloadPhoto: invalid message id %d", msgID)
+	}
+	if destPath == "" {
+		return fmt.Errorf("mtproto: downloadPhoto: empty dest path")
+	}
+
+	// Числовой ref "-100X": peer из кеша (один refresh при промахе — паттерн
+	// GetHistoryByPeer), затем скачивание в короткоживущей сессии.
+	if strings.HasPrefix(ref, "-") {
+		botAPIID, err := strconv.ParseInt(ref, 10, 64)
+		if err != nil {
+			return fmt.Errorf("mtproto: downloadPhoto: invalid peer ref %q: %w", ref, err)
+		}
+		x, ok := ToMTProtoID(botAPIID)
+		if !ok {
+			return fmt.Errorf("mtproto: downloadPhoto: ref %q is not a channel/supergroup", ref)
+		}
+		peer, err := resolveInputPeer(ctx, c.peerCache, x)
+		if errors.Is(err, errPeerUnknown) {
+			if rerr := c.refreshPeerCache(ctx); rerr != nil {
+				return fmt.Errorf("mtproto: downloadPhoto: peer %d unknown and dialogs refresh failed: %w", x, rerr)
+			}
+			peer, err = resolveInputPeer(ctx, c.peerCache, x)
+		}
+		if err != nil {
+			return err
+		}
+		return c.runDownloadPhoto(ctx, peer, ref, msgID, destPath)
+	}
+
+	// Username: резолвинг в input peer внутри сессии (ContactsResolveUsername
+	// + channelPeer — путь fetchHistory), FloodWait-backoff тот же.
+	username := strings.TrimPrefix(ref, "@")
+	if username == "" {
+		return fmt.Errorf("mtproto: downloadPhoto: empty channel username")
+	}
+	return c.client.Run(ctx, func(ctx context.Context) error {
+		api := c.client.API()
+		var lastErr error
+		for attempt := 0; attempt < historyMaxTries; attempt++ {
+			resolved, err := api.ContactsResolveUsername(ctx, &tg.ContactsResolveUsernameRequest{Username: username})
+			if err == nil {
+				peer, perr := channelPeer(resolved)
+				if perr != nil {
+					return perr
+				}
+				return c.downloadPhotoWithRetry(ctx, peer, ref, msgID, destPath)
+			}
+			if d, ok := tgerr.AsFloodWait(err); ok {
+				lastErr = err
+				wait := d + historyBackoff(attempt)
+				if wait > historyMaxDelay {
+					wait = historyMaxDelay
+				}
+				slog.Warn("mtproto downloadPhoto resolve flood wait", "channel", username, "attempt", attempt, "wait", wait)
+				if werr := sleepCtx(ctx, wait); werr != nil {
+					return werr
+				}
+				continue
+			}
+			return fmt.Errorf("mtproto: downloadPhoto: resolve %q: %w", username, err)
+		}
+		return fmt.Errorf("mtproto: downloadPhoto: resolve %q: flood wait retries exhausted: %w", username, lastErr)
+	})
+}
+
+// runDownloadPhoto — одно скачивание в короткоживущей сессии (client.Run —
+// паттерн runHistoryByPeer).
+func (c *Client) runDownloadPhoto(ctx context.Context, peer tg.InputPeerClass, ref string, msgID int, destPath string) error {
+	return c.client.Run(ctx, func(ctx context.Context) error {
+		return c.downloadPhotoWithRetry(ctx, peer, ref, msgID, destPath)
+	})
+}
+
+// downloadPhotoWithRetry — ограниченный FloodWait-backoff (паттерн
+// getHistoryWithRetry): middleware прозрачно ждёт большинство FLOOD_WAIT, но
+// гранулярные коды могут всплыть поверх — ждём d+backoff и повторяем, не
+// более historyMaxTries.
+func (c *Client) downloadPhotoWithRetry(ctx context.Context, peer tg.InputPeerClass, ref string, msgID int, destPath string) error {
+	var lastErr error
+	for attempt := 0; attempt < historyMaxTries; attempt++ {
+		err := c.downloadPhotoOnce(ctx, peer, ref, msgID, destPath)
+		if err == nil {
+			return nil
+		}
+		if d, ok := tgerr.AsFloodWait(err); ok {
+			lastErr = err
+			wait := d + historyBackoff(attempt)
+			if wait > historyMaxDelay {
+				wait = historyMaxDelay
+			}
+			slog.Warn("mtproto downloadPhoto flood wait", "ref", ref, "msg_id", msgID, "attempt", attempt, "wait", wait)
+			if werr := sleepCtx(ctx, wait); werr != nil {
+				return werr
+			}
+			continue
+		}
+		return err
+	}
+	return fmt.Errorf("mtproto: downloadPhoto %q msg %d: flood wait retries exhausted: %w", ref, msgID, lastErr)
+}
+
+// downloadPhotoOnce: одно сообщение по id (messages.getHistory c
+// offset_id=msgID+1, limit=1 — peer-aware путь, тот же RPC, что GetHistory),
+// извлечение photo-локации и стрим-скачивание на диск.
+func (c *Client) downloadPhotoOnce(ctx context.Context, peer tg.InputPeerClass, ref string, msgID int, destPath string) error {
+	api := c.client.API()
+	res, err := api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+		Peer:     peer,
+		OffsetID: msgID + 1, // «строго меньше msgID+1» ⇒ ровно msgID, если он есть
+		Limit:    1,
+	})
+	if err != nil {
+		return fmt.Errorf("mtproto: downloadPhoto %q msg %d: %w", ref, msgID, err)
+	}
+	msgs, err := messagesFromResponse(res, fmt.Sprintf("downloadPhoto %q", ref))
+	if err != nil {
+		return err
+	}
+	if len(msgs) == 0 || msgs[0].ID != msgID {
+		return fmt.Errorf("mtproto: downloadPhoto: message %d not found in %q", msgID, ref)
+	}
+	loc, err := photoFileLocation(msgs[0])
+	if err != nil {
+		return err
+	}
+	return streamPhotoToFile(ctx, api, loc, destPath)
+}
+
+// photoFileLocation строит inputPhotoFileLocation из сообщения: largest
+// *tg.PhotoSize по площади W×H (ThumbSize = его символ типа). PhotoEmpty /
+// не-фото / отсутствие скачиваемых размеров → ошибка (messageToFeedItem
+// помечает MediaKind="photo" только при *tg.Photo, так что в норме сюда не
+// попадаем).
+func photoFileLocation(msg tg.Message) (*tg.InputPhotoFileLocation, error) {
+	m, ok := msg.Media.(*tg.MessageMediaPhoto)
+	if !ok || m.Photo == nil {
+		return nil, fmt.Errorf("mtproto: downloadPhoto: message %d has no photo media", msg.ID)
+	}
+	ph, ok := m.Photo.(*tg.Photo)
+	if !ok {
+		return nil, fmt.Errorf("mtproto: downloadPhoto: message %d photo is empty", msg.ID)
+	}
+	best := ""
+	bestArea := -1
+	for _, s := range ph.Sizes {
+		ps, ok := s.(*tg.PhotoSize)
+		if !ok {
+			continue
+		}
+		if area := ps.W * ps.H; area > bestArea {
+			bestArea = area
+			best = ps.Type
+		}
+	}
+	if best == "" {
+		return nil, fmt.Errorf("mtproto: downloadPhoto: message %d photo has no downloadable sizes", msg.ID)
+	}
+	return &tg.InputPhotoFileLocation{
+		ID:            ph.ID,
+		AccessHash:    ph.AccessHash,
+		FileReference: ph.FileReference,
+		ThumbSize:     best,
+	}, nil
+}
+
+// downloadChunkBytes — chunk upload.getFile: ≤1 МБ, offset кратен limit
+// (правила Telegram API; Precise=true). Короткий chunk (< limit) или пустой —
+// EOF.
+const downloadChunkBytes = 1024 * 1024
+
+// streamPhotoToFile последовательно качает файл через upload.getFile и пишет
+// его в destPath. СТРИМИНГ: в памяти одновременно один chunk (≤1 МБ) — файл
+// никогда не лежит в RAM целиком (план §4.5.1, прод RAM 458 MB). CDN-редирект
+// (UploadFileCdnRedirect) не поддерживается — вторичный аккаунт качает со
+// своего DC; такой ответ — ошибка.
+func streamPhotoToFile(ctx context.Context, api *tg.Client, loc *tg.InputPhotoFileLocation, destPath string) error {
+	f, err := os.Create(destPath)
+	if err != nil {
+		return fmt.Errorf("mtproto: downloadPhoto: create %s: %w", destPath, err)
+	}
+	defer func() { _ = f.Close() }() // страховка от утечки fd; ошибки ловят явные Flush/Close ниже
+	w := bufio.NewWriter(f)
+	var offset int64
+	for {
+		res, err := api.UploadGetFile(ctx, &tg.UploadGetFileRequest{
+			Location: loc,
+			Offset:   offset,
+			Limit:    downloadChunkBytes,
+			Precise:  true,
+		})
+		if err != nil {
+			return fmt.Errorf("mtproto: downloadPhoto: getFile offset %d: %w", offset, err)
+		}
+		uf, ok := res.(*tg.UploadFile)
+		if !ok {
+			return fmt.Errorf("mtproto: downloadPhoto: unexpected file response %T (CDN not supported)", res)
+		}
+		if len(uf.Bytes) == 0 {
+			break
+		}
+		if _, err := w.Write(uf.Bytes); err != nil {
+			return fmt.Errorf("mtproto: downloadPhoto: write %s: %w", destPath, err)
+		}
+		offset += int64(len(uf.Bytes))
+		if len(uf.Bytes) < downloadChunkBytes {
+			break // короткий chunk = EOF
+		}
+	}
+	if err := w.Flush(); err != nil {
+		return fmt.Errorf("mtproto: downloadPhoto: flush %s: %w", destPath, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("mtproto: downloadPhoto: close %s: %w", destPath, err)
+	}
+	return nil
 }

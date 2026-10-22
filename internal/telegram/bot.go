@@ -13,6 +13,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -97,7 +99,11 @@ type Bot struct {
 	// тот же контракт, что у DeliverWithButtons).
 	sendPhotoFn func(ctx context.Context, chatID int64, photo models.InputFile, caption string, kb *models.InlineKeyboardMarkup) (messageID int64, err error)
 	deleteMsgFn func(ctx context.Context, chatID int64, messageID int64) error
-	log         *slog.Logger
+	// uploadPhotoFn — test-seam загрузки локального файла (9E-2b, план §4.5.1
+	// п.2 — re-upload resolver'а): возвращает id служебного сообщения и
+	// Photo-размеры ответа (largest → file_id). nil => b.api.
+	uploadPhotoFn func(ctx context.Context, chatID int64, photo models.InputFile) (messageID int64, sizes []models.PhotoSize, err error)
+	log           *slog.Logger
 }
 
 // Option configures the Bot.
@@ -513,4 +519,63 @@ func (b *Bot) DeleteMessage(ctx context.Context, chatID string, messageID int64)
 		return fmt.Errorf("telegram delete message: %w", err)
 	}
 	return nil
+}
+
+// UploadPhoto (подэтап 9E, план §4.5.1 п.2) шлёт ЛОКАЛЬНЫЙ файл (multipart —
+// models.InputFileUpload{Filename, Data}) в owner-чат БЕЗ caption/клавиатуры и
+// возвращает id служебного сообщения плюс file_id largest-размера Photo ответа
+// (переиспользует largestPhotoFileID из 9E-2a). Это re-upload MTProto-
+// resolver'а: фото приватного канала становится bot-овским file_id, а
+// служебное сообщение удаляет ВЫЗЫВАЮЩИЙ (DeleteMessage). Семантика chatID —
+// как у Deliver ("" → owner-чат); fileName "" → базовое имя filePath.
+// Транспорт — test-seam uploadPhotoFn; без seam'а и без api → error, НЕ
+// silent no-op (тот же контракт, что у SendPhoto).
+func (b *Bot) UploadPhoto(ctx context.Context, chatID, filePath, fileName string) (int64, string, error) {
+	if strings.TrimSpace(filePath) == "" {
+		return 0, "", fmt.Errorf("telegram upload photo: empty file path")
+	}
+	target := b.chatID
+	if chatID != "" {
+		id, err := strconv.ParseInt(chatID, 10, 64)
+		if err != nil {
+			return 0, "", fmt.Errorf("telegram upload photo: invalid chat id: %w", err)
+		}
+		target = id
+	}
+	if fileName == "" {
+		fileName = filepath.Base(filePath)
+	}
+	f, err := os.Open(filePath)
+	if err != nil {
+		return 0, "", fmt.Errorf("telegram upload photo: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+	upload := &models.InputFileUpload{Filename: fileName, Data: f}
+
+	if b.uploadPhotoFn != nil {
+		id, sizes, err := b.uploadPhotoFn(ctx, target, upload)
+		if err != nil {
+			return 0, "", fmt.Errorf("telegram upload photo: %w", err)
+		}
+		return uploadPhotoResult(int64(id), sizes)
+	}
+	if b.api == nil {
+		return 0, "", fmt.Errorf("telegram upload photo: no transport (neither api nor test seam)")
+	}
+	msg, err := b.api.SendPhoto(ctx, &bot.SendPhotoParams{ChatID: target, Photo: upload})
+	if err != nil {
+		return 0, "", fmt.Errorf("telegram upload photo: %w", err)
+	}
+	return uploadPhotoResult(int64(msg.ID), msg.Photo)
+}
+
+// uploadPhotoResult достаёт largest file_id из ответа sendPhoto; пустое Photo
+// — ошибка (послали фото, ответ обязан его содержать — иначе file_id для
+// media_ref не получить).
+func uploadPhotoResult(messageID int64, sizes []models.PhotoSize) (int64, string, error) {
+	fileID := largestPhotoFileID(sizes)
+	if fileID == "" {
+		return 0, "", fmt.Errorf("telegram upload photo: response contains no photo")
+	}
+	return messageID, fileID, nil
 }
