@@ -188,6 +188,10 @@ go run ./cmd/bot
 | `TG_SOURCE_LIMIT` | нет | Макс. постов на TG-канал | `20` |
 | `DIGEST_TIME` | нет | Время дайджеста `HH:MM` | `09:00` |
 | `TZ` | нет | IANA-таймзона | `UTC` |
+| `LINK_FETCH_TIMEOUT` | нет | Таймаут fetch одной ссылки (Go duration) | `15s` |
+| `LINK_FETCH_MAX_BYTES` | нет | Лимит байт тела страницы | `2097152` (2 MB) |
+| `LINK_PER_MESSAGE_MAX` | нет | Макс. внешних ссылок на сообщение | `5` |
+| `LINK_FETCH_TOTAL_MAX` | нет | Бюджет fetch'ей на прогон | `30` |
 | `DB_PATH` | нет | Путь к SQLite | `/data/state.db` |
 | `MTPROTO_APP_ID` | нет | App ID с my.telegram.org | — |
 | `MTPROTO_APP_HASH` | нет | App Hash с my.telegram.org | — |
