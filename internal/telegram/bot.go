@@ -335,10 +335,14 @@ type CallbackResult struct {
 // сообщения (DeleteMessageID > 0). PDEL в проде перехватывает telegram-
 // диспетчер (deleteMessage того же сообщения без seam'а — аргументов нет).
 type SendAction struct {
-	PhotoMediaRef   string           // digest_items.media_ref: tg file_id ИЛИ http(s) URL
-	PhotoCaption    string           // готовый HTML (ParseMode HTML)
-	PhotoButtons    [][]InlineButton // клавиатура фото-сообщения (9E: «✖ Закрыть» → PDEL)
-	DeleteMessageID int64            // >0 → удалить сообщение (PDEL-поток, 9E)
+	PhotoMediaRef string           // digest_items.media_ref: tg file_id ИЛИ http(s) URL
+	PhotoCaption  string           // готовый HTML (ParseMode HTML)
+	PhotoButtons  [][]InlineButton // клавиатура фото-сообщения (9E: «✖ Закрыть» → PDEL)
+	// Зарезервировано (контракт 9D, не удалять): прод-поток PDEL
+	// перехватывается в telegram до seam'а (handlePhotoDelete —
+	// deleteMessage того же сообщения, аргументов нет); поле используется
+	// только прямыми вызовами seam'а/тестами.
+	DeleteMessageID int64 // >0 → удалить сообщение
 }
 
 // DrillDown resolves an "L2:…" / "L3:…" callback (Stage 8 D). data is the raw
@@ -423,19 +427,26 @@ func inlineKeyboard(buttons [][]InlineButton) *models.InlineKeyboardMarkup {
 	return &models.InlineKeyboardMarkup{InlineKeyboard: rows}
 }
 
-// photoCaptionMaxBytes — жёсткий лимит Bot API на caption (план §4.5.2):
-// SendPhoto защитно режет caption по БАЙТАМ на границе рун с «…» (основную
-// резку делает digest.photoCaption — здесь страховка от прямого вызова).
-const photoCaptionMaxBytes = 1024
+// PhotoCaptionMaxBytes — жёсткий лимит Bot API на caption (план §4.5.2),
+// единственная константа 1024 для обоих пакетов (ревью 9E, фикс 8: digest
+// импортирует telegram и берёт лимит отсюда). Резка в SendPhoto — страховка
+// от прямых внешних вызовов: digest.photoCaption всегда возвращает
+// well-formed HTML ≤1024 байт (ужатие компонентов ДО сборки).
+const PhotoCaptionMaxBytes = 1024
 
 // SendPhoto шлёт отдельное фото-сообщение (Этап 9E, план §4.5.2): mediaRef —
-// digest_items.media_ref, http(s) URL (схема проверяется без учёта регистра)
-// уходит как models.InputFileURL (фото качают серверы Telegram), иначе — как
-// models.InputFileID (tg file_id). chatID "" → owner-чат (семантика Deliver/
-// DeliverWithButtons). ParseMode HTML; buttons → inline-клавиатура (тот же
-// inlineKeyboard-маппинг, InlineButton.URL поддержан с 9D). Возвращает
-// messageID отправленного сообщения (нужен DeleteMessage-потоку). Транспорт —
-// test-seam sendPhotoFn; без seam'а и без api → error, НЕ silent no-op.
+// digest_items.media_ref (tg file_id ИЛИ http(s) URL) — уходит КАК ЕСТЬ как
+// models.InputFileString{Data}: URL это или file_id, решает сервер Telegram,
+// схема здесь НАМЕРЕННО не проверяется (file_id теоретически может начинаться
+// с «http»; gate схемы http/https для внешних URL — на стороне источников:
+// feed.mediaImageURL / findMessagePhoto). Не-http строка трактуется
+// Telegram'ом как file_id, битый — отвергается Bot API → ошибка доходит до
+// ack «Не удалось показать фото» (деградация плана, не паника). chatID "" →
+// owner-чат (семантика Deliver/DeliverWithButtons). ParseMode HTML; buttons →
+// inline-клавиатура (тот же inlineKeyboard-маппинг, InlineButton.URL
+// поддержан с 9D). Возвращает messageID отправленного сообщения (нужен
+// DeleteMessage-потоку). Транспорт — test-seam sendPhotoFn; без seam'а и без
+// api → error, НЕ silent no-op.
 func (b *Bot) SendPhoto(ctx context.Context, chatID, mediaRef, caption string, buttons [][]InlineButton) (int64, error) {
 	if strings.TrimSpace(mediaRef) == "" {
 		return 0, fmt.Errorf("telegram send photo: empty media ref")
@@ -448,20 +459,23 @@ func (b *Bot) SendPhoto(ctx context.Context, chatID, mediaRef, caption string, b
 		}
 		target = id
 	}
-	// http(s) URL (схема проверяется без учёта регистра) → фото качают серверы
-	// Telegram (лимит Bot API 5 MB на URL), иначе mediaRef — tg file_id.
-	// Отклонение от эскиза плана (InputFileURL/InputFileID): в go-telegram/bot
-	// v1.22 отдельных типов нет — Bot API принимает и file_id, и URL строкой,
-	// и библиотека моделирует оба случая как *models.InputFileString{Data}
-	// (фото-контракт SendPhoto это документирует; seam-тесты фиксируют Data).
-	// Не http(s) → трактуем как tg file_id (спека 9E); битый file_id/чужая
-	// схема отвергнутся Bot API → ошибка дойдёт до ack «Не удалось показать
-	// фото» (деградация плана, не паника).
+	// mediaRef уходит как есть строкой — отклонение от эскиза плана
+	// (InputFileURL/InputFileID): в go-telegram/bot v1.22 отдельных типов
+	// нет — Bot API принимает и file_id, и URL строкой, и библиотека
+	// моделирует оба случая как *models.InputFileString{Data} (seam-тесты
+	// фиксируют Data). Схема НЕ проверяется намеренно (см. док SendPhoto):
+	// URL-vs-file_id решает сервер Telegram; не-http строка трактуется как
+	// file_id, битый file_id отвергается Bot API → деградация «Не удалось
+	// показать фото», не паника.
 	photo := &models.InputFileString{Data: mediaRef}
-	// Защитная резка caption ≤1024 БАЙТ на границе рун (TruncateButtonLabelTo —
-	// общая логика, бюджет БЕЗ учёта «…»; ровно 1024 не режется).
-	if len(caption) > photoCaptionMaxBytes {
-		caption = TruncateButtonLabelTo(caption, photoCaptionMaxBytes-len("…"))
+	// Защитная резка caption ≤1024 БАЙТ на границе рун — СТРАХОВКА от прямых
+	// внешних вызовов: caption из digest.photoCaption всегда well-formed и
+	// ≤1024 (ужатие компонентов ДО сборки), в прод-пути резка здесь
+	// недостижима. Байтовая резка способна порвать HTML-сущность — для
+	// внешнего входа это осознанно приемлемо (TruncateButtonLabelTo — общая
+	// логика, бюджет БЕЗ учёта «…»; ровно 1024 не режется).
+	if len(caption) > PhotoCaptionMaxBytes {
+		caption = TruncateButtonLabelTo(caption, PhotoCaptionMaxBytes-len("…"))
 	}
 	kb := inlineKeyboard(buttons)
 
@@ -571,11 +585,13 @@ func (b *Bot) UploadPhoto(ctx context.Context, chatID, filePath, fileName string
 
 // uploadPhotoResult достаёт largest file_id из ответа sendPhoto; пустое Photo
 // — ошибка (послали фото, ответ обязан его содержать — иначе file_id для
-// media_ref не получить).
+// media_ref не получить). messageID при этом ВОЗВРАЩАЕТСЯ и в ошибке
+// (ревью 9E, фикс 6): служебное сообщение уже отправлено, вызывающий
+// (mtproto.resolveOne) удаляет его по id — утечки в owner-чате не остаётся.
 func uploadPhotoResult(messageID int64, sizes []models.PhotoSize) (int64, string, error) {
 	fileID := largestPhotoFileID(sizes)
 	if fileID == "" {
-		return 0, "", fmt.Errorf("telegram upload photo: response contains no photo")
+		return messageID, "", fmt.Errorf("telegram upload photo: response contains no photo")
 	}
 	return messageID, fileID, nil
 }

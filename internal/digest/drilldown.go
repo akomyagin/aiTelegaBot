@@ -34,16 +34,16 @@ const (
 	// drillBackLabel — кнопка «◀ Назад» (используется и render_nav.go).
 	drillBackLabel = "◀ Назад"
 	// Этап 9E (план §4.5.2): фото-сообщение «P:» — лейбл «✖ Закрыть»
-	// (callback_data «PDEL» = 4 байта ≤ 64) и пределы caption. Caption —
+	// (callback_data «PDEL» = 4 байта ≤ 64) и рунные верхние капы компонентов
+	// caption (первая ступень ДО байтового ужатия). Caption —
 	// «<b>title</b>\n<summary>\n↪ <a href>источник</a>», жёсткий лимит Bot API
-	// 1024 БАЙТА (photoCaptionMaxBytes) гарантируется финальной резкой
-	// truncateToBytes; рунные пределы title/summary ДО EscapeHTML (урок 9D M1:
-	// navHeaderTitleRunes) держат типовой caption далеко внутри лимита:
-	// worst-case 120×4 + 200×4 + «↪ <a href="…">источник</a>» (~1300 байт при
-	// pathological-эскейпе и длинном URL) → режется truncateToBytes.
+	// 1024 БАЙТА — telegram.PhotoCaptionMaxBytes (единственная константа,
+	// ревью 9E фикс 8); гарантируется НЕ финальной байтовой резкой готового
+	// HTML (рвёт сущности/теги), а ужатием компонентов ДО сборки
+	// (photoCaption): EscapeHTML РАСТЯГИВАЕТ текст (& → &amp;, до 5x),
+	// поэтому бюджет считается по байтам ЭСКЕЙПНУТОГО фрагмента.
 	photoCloseLabel          = "✖ Закрыть"
 	photoDeleteCallbackData  = "PDEL"
-	photoCaptionMaxBytes     = 1024
 	photoCaptionTitleRunes   = 120
 	photoCaptionSummaryRunes = 200
 )
@@ -508,38 +508,105 @@ func drillPhotoSend(ctx context.Context, store storage.Store, itemID int64) (*te
 }
 
 // photoCaption — caption фото-сообщения (план §4.5.2/9E): «<b>title</b>\n
-// <summary ≤200 рун>\n↪ <a href="LINK">источник</a>». Весь динамический текст
-// через telegram.EscapeHTML ДО сборки; title/summary режутся по рунам ДО
-// EscapeHTML (урок 9D M1); href — l3Link (только http/https, кавычка
-// отвергнута, fallback t.me deep link; пуст → строка «↪» не рендерится).
-// Итог режется до ≤1024 БАЙТ на границе рун (truncateToBytes).
+// <summary ≤200 рун>\n↪ <a href="LINK">источник</a>». ГАРАНТИЯ (ревью 9E,
+// фикс 1): результат ВСЕГДА well-formed HTML ≤1024 байт
+// (telegram.PhotoCaptionMaxBytes) — компоненты ужимаются КАК PLAIN TEXT ДО
+// сборки и только потом EscapeHTML; байтовая резка готового HTML (старый
+// truncateToBytes) рвала «<a href="…» и сущности → Telegram 400 «can't parse
+// entities». href — l3Link (только http/https, кавычка отвергнута, fallback
+// t.me deep link; пуст → строка «↪» не рендерится). Приоритет ужатия при
+// переполнении: (1) summary, (2) title — оба по байтам ЭСКЕЙПНУТОГО
+// фрагмента с «…» на границе рун, (3) ОТБРОСИТЬ строку «↪ <a …>источник</a>»
+// ЦЕЛИКОМ (обрезанный URL — битая ссылка) с пережатием title/summary в
+// освободившийся бюджет. Порядок компонентов не меняется.
 func photoCaption(it storage.DigestItem) string {
 	title := strings.TrimSpace(it.Title)
 	if title == "" {
 		title = "(без заголовка)" // паттерн RenderMessageView
 	}
-	var b strings.Builder
-	b.WriteString("<b>")
-	b.WriteString(telegram.EscapeHTML(navTruncateTitle(title, photoCaptionTitleRunes)))
-	b.WriteString("</b>")
-	if s := strings.TrimSpace(it.Summary); s != "" {
-		b.WriteString("\n")
-		b.WriteString(telegram.EscapeHTML(truncateRunes(s, photoCaptionSummaryRunes)))
-	}
+	title = navTruncateTitle(title, photoCaptionTitleRunes)
+	summary := truncateRunes(strings.TrimSpace(it.Summary), photoCaptionSummaryRunes)
+	srcLine := ""
 	if link := l3Link(it); link != "" {
-		b.WriteString("\n↪ <a href=\"")
-		b.WriteString(link)
-		b.WriteString("\">источник</a>")
+		srcLine = "\n↪ <a href=\"" + link + "\">источник</a>"
 	}
-	return truncateToBytes(b.String(), photoCaptionMaxBytes)
+	cap := buildPhotoCaption(title, summary, srcLine, true)
+	if len(cap) > telegram.PhotoCaptionMaxBytes {
+		// (3): строка источника не влезает даже после ужатия title/summary —
+		// отбрасываем её целиком и пережимаем компоненты в полный бюджет.
+		cap = buildPhotoCaption(title, summary, "", false)
+	}
+	return cap
 }
 
-// truncateToBytes — обобщение telegram.TruncateButtonLabelTo на произвольный
-// байтовый бюджет (план 9E: «НЕ дублировать логику»): режет s до ≤maxBytes
-// БАЙТ на границе рун, при обрезке добавляет «…».
-func truncateToBytes(s string, maxBytes int) string {
-	if len(s) <= maxBytes {
-		return s // в лимит уже укладывается — резать нечего (граница «ровно 1024»)
+// buildPhotoCaption собирает caption из plain-text компонентов: title/summary
+// ужимаются fitEscapedBytes в оставшийся бюджет (БАЙТЫ эскейпнутого
+// фрагмента), srcLine — готовый фрагмент (l3Link уже экранирован/валидирован,
+// резать его нельзя — битый URL). withSrc=false → srcLine игнорируется.
+// Результат ≤PhotoCaptionMaxBytes и well-formed: теги добавляются ПОСЛЕ
+// ужатия, сущности не режутся (резка по plain text до EscapeHTML).
+func buildPhotoCaption(title, summary, srcLine string, withSrc bool) string {
+	const fixed = len("<b>") + len("</b>")
+	src := 0
+	if withSrc {
+		src = len(srcLine)
 	}
-	return telegram.TruncateButtonLabelTo(s, maxBytes-len("…"))
+	escTitle := telegram.EscapeHTML(title)
+	escSummary := ""
+	if summary != "" {
+		// (1) summary: бюджет — что осталось после title и srcLine.
+		budget := telegram.PhotoCaptionMaxBytes - fixed - len(escTitle) - len("\n") - src
+		if budget >= len("…") {
+			escSummary = telegram.EscapeHTML(fitEscapedBytes(summary, budget))
+		}
+	}
+	sumPart := 0
+	if escSummary != "" {
+		sumPart = len("\n") + len(escSummary)
+	}
+	// (2) title: бюджет — что осталось после summary и srcLine.
+	if budget := telegram.PhotoCaptionMaxBytes - fixed - sumPart - src; len(escTitle) > budget {
+		escTitle = telegram.EscapeHTML(fitEscapedBytes(title, budget))
+	}
+	var b strings.Builder
+	b.WriteString("<b>")
+	b.WriteString(escTitle)
+	b.WriteString("</b>")
+	if escSummary != "" {
+		b.WriteString("\n")
+		b.WriteString(escSummary)
+	}
+	if withSrc {
+		b.WriteString(srcLine)
+	}
+	return b.String()
+}
+
+// fitEscapedBytes ужимает s (plain text) до len(EscapeHTML(результата)) ≤
+// budget: бинарный поиск по рунам (длина эскейпнутого префикса монотонна —
+// детерминированно terminates), при обрезке добавляется «…» (EscapeHTML её
+// не экранирует, входит в бюджет). Даже одна руна с «…» не влезает → ""
+// (компонент отброшен). Резка ДО эскейпа — сущность «&amp;» не рвётся.
+func fitEscapedBytes(s string, budget int) string {
+	if budget < len("…") {
+		return ""
+	}
+	if len(telegram.EscapeHTML(s)) <= budget {
+		return s // в лимит уже укладывается — резать нечего
+	}
+	runes := []rune(s)
+	lo, hi, best := 0, len(runes), -1
+	for lo <= hi {
+		mid := (lo + hi) / 2
+		if len(telegram.EscapeHTML(string(runes[:mid])))+len("…") <= budget {
+			best = mid
+			lo = mid + 1
+		} else {
+			hi = mid - 1
+		}
+	}
+	if best < 0 {
+		return ""
+	}
+	return string(runes[:best]) + "…"
 }

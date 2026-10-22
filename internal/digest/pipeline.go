@@ -943,7 +943,10 @@ func (p *Pipeline) processTopicMedia(ctx context.Context, kept []keptItem,
 	// §4.5). Пишутся ТОЛЬКО строки, которые уже есть в states (кеш прошлых
 	// прогонов или A-батч этого): у degraded-элементов строки нет и не
 	// появится — деградация не фиксируется навсегда (§4.9). Неизменённые
-	// строки не перезаписываются (updated_at не шумит).
+	// строки не перезаписываются (updated_at не шумит). Принятый риск (ревью
+	// 9E, фикс 3): строки здесь СОЗНАТЕЛЬНО не создаём (созданием владеет
+	// A-батч) → если A-батч упал, mtproto-фото будет повторно re-upload'иться
+	// каждый прогон (в пределах бюджета), пока A-батч не запишет строку.
 	var batch []storage.MessageState
 	for i := range kept {
 		it := kept[i].it
@@ -959,7 +962,13 @@ func (p *Pipeline) processTopicMedia(ctx context.Context, kept []keptItem,
 		}
 		key := it.DedupKey()
 		st, ok := states[key]
-		if !ok || (st.MediaKind == it.MediaKind && st.MediaRef == ref) {
+		if !ok {
+			// ref здесь гарантированно непустой (проверка выше) — свежее медиа
+			// не кешируется: log вместо молчаливого skip (ревью 9E, фикс 3).
+			log.Warn("media cache write skipped: no message_state row", "dedup_key", key)
+			continue
+		}
+		if st.MediaKind == it.MediaKind && st.MediaRef == ref {
 			continue
 		}
 		st.MediaKind = it.MediaKind

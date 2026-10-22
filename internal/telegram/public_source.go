@@ -183,7 +183,20 @@ func findMessagePhoto(n *html.Node) string {
 	if len(m) < 2 {
 		return ""
 	}
-	return m[1]
+	return httpMediaURL(m[1])
+}
+
+// httpMediaURL — gate схемы media-URL (plan §6, паттерн l3Link): только
+// http:// и https:// (без учёта регистра) — фото по URL качают серверы
+// Telegram; прочее → "" (media-поля не заполняются). Свой хелпер в пакете
+// telegram: feed НЕ импортирует telegram, общий — сломал бы направление
+// зависимостей (ревью 9E, фикс 2).
+func httpMediaURL(u string) string {
+	lower := strings.ToLower(u)
+	if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
+		return u
+	}
+	return ""
 }
 
 // findMessageText returns the concatenated text of the first

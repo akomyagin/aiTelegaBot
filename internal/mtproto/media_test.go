@@ -39,14 +39,18 @@ func (f *fakeDownloader) DownloadPhoto(_ context.Context, _ string, msgID int, d
 }
 
 type fakeUploader struct {
-	uploads int
-	deletes []int64
-	fileErr error
-	delErr  error
+	uploads    int
+	deletes    []int64
+	fileErr    error // транспортная ошибка upload: (0, "", err)
+	noPhotoErr error // «no photo в ответе»: (id>0, "", err) — ревью 9E фикс 6
+	delErr     error
 }
 
 func (f *fakeUploader) UploadPhoto(_ context.Context, _, _, fileName string) (int64, string, error) {
 	f.uploads++
+	if f.noPhotoErr != nil {
+		return int64(900 + f.uploads), "", f.noPhotoErr
+	}
 	if f.fileErr != nil {
 		return 0, "", f.fileErr
 	}
@@ -199,6 +203,8 @@ func TestMediaResolver_DownloadError(t *testing.T) {
 	assertTempFilesRemoved(t, down.paths)
 }
 
+// Транспортная ошибка upload (id служебного сообщения недоступен) — удалять
+// нечего, DeleteMessage не вызывается.
 func TestMediaResolver_UploadError(t *testing.T) {
 	down := &fakeDownloader{}
 	up := &fakeUploader{fileErr: errors.New("upload boom")}
@@ -213,7 +219,31 @@ func TestMediaResolver_UploadError(t *testing.T) {
 		t.Errorf("MediaFileID = %q, want empty", items[0].MediaFileID)
 	}
 	if len(up.deletes) != 0 {
-		t.Errorf("DeleteMessage вызван без успешного re-upload: %v", up.deletes)
+		t.Errorf("DeleteMessage вызван без id служебного сообщения: %v", up.deletes)
+	}
+	assertTempFilesRemoved(t, down.paths)
+}
+
+// Ревью 9E, фикс 6: upload вернул (id>0, "", err) — «no photo в ответе», но
+// служебное сообщение УЖЕ отправлено → resolver удаляет его (утечки в
+// owner-чате нет), элемент без медиа, прогон жив.
+func TestMediaResolver_UploadNoPhotoDeletesSvc(t *testing.T) {
+	down := &fakeDownloader{}
+	up := &fakeUploader{noPhotoErr: errors.New("response contains no photo")}
+	r := NewMediaResolver(down, up, discardMediaLog())
+	items := []feed.Item{mtPhotoItem(1), mtPhotoItem(2)}
+
+	used, err := r.Resolve(context.Background(), items, 3)
+	if err != nil || used != 0 {
+		t.Fatalf("used=%d err=%v, want 0/nil", used, err)
+	}
+	for i := range items {
+		if items[i].MediaFileID != "" {
+			t.Errorf("items[%d].MediaFileID = %q, want empty", i, items[i].MediaFileID)
+		}
+	}
+	if len(up.deletes) != 2 || up.deletes[0] != 901 || up.deletes[1] != 902 {
+		t.Errorf("deletes = %v, want [901 902] (служебные сообщения удалены)", up.deletes)
 	}
 	assertTempFilesRemoved(t, down.paths)
 }

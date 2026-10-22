@@ -59,9 +59,12 @@ func TestSendPhoto_Transport(t *testing.T) {
 		wantID     int64
 	}{
 		{name: "file_id → InputFileString{Data}, owner-чат", mediaRef: "AgADBAADxyz", wantChatID: 111, wantID: 55},
-		{name: "https URL → тот же строковый транспорт (URL качают серверы Telegram)",
+		// Все три кейса фиксируют ЕДИНЫЙ контракт SendPhoto: любой непустой
+		// mediaRef уходит как InputFileString{Data=mediaRef} без проверки схемы
+		// (URL-vs-file_id решает сервер Telegram; фикс 5 ревью 9E).
+		{name: "https URL → тот же контракт InputFileString{Data=mediaRef}",
 			mediaRef: "https://a.example/p.jpg", wantChatID: 111, wantID: 55},
-		{name: "HTTP:// в верхнем регистре — тоже URL-ветка (схема case-insensitive)",
+		{name: "HTTP:// в верхнем регистре → тот же контракт InputFileString{Data=mediaRef} (схема не проверяется)",
 			mediaRef: "HTTP://A.EXAMPLE/p.jpg", wantChatID: 111, wantID: 55},
 		{name: "явный chatID", chatID: "222", mediaRef: "AgAD", wantChatID: 222, wantID: 55},
 		{name: "ошибка seam → error наружу (обёрнутая)", mediaRef: "AgAD", sendErr: errors.New("bot api down"), wantErr: true},
@@ -118,7 +121,9 @@ func TestSendPhoto_Transport(t *testing.T) {
 }
 
 // Тест-кейс 2 плана: caption >1024 байт (многобайтные руны — кириллица/эмодзи)
-// → защитная резка SendPhoto на границе рун, assert ≤1024 байт.
+// → защитная резка SendPhoto на границе рун, assert ≤1024 байт. Вход — ВНЕШНИЙ
+// caption мимо digest.photoCaption (оттуда всегда well-formed ≤1024, и резка
+// здесь недостижима): тестируется именно страховка от прямых вызовов seam'а.
 func TestSendPhoto_CaptionTruncation(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -136,8 +141,8 @@ func TestSendPhoto_CaptionTruncation(t *testing.T) {
 				t.Fatalf("SendPhoto: %v", err)
 			}
 			got := rec.captions[0]
-			if len(got) > photoCaptionMaxBytes {
-				t.Fatalf("caption = %d байт > %d", len(got), photoCaptionMaxBytes)
+			if len(got) > PhotoCaptionMaxBytes {
+				t.Fatalf("caption = %d байт > %d", len(got), PhotoCaptionMaxBytes)
 			}
 			if !strings.HasSuffix(got, "…") {
 				t.Error("обрезанный caption должен заканчиваться «…»")

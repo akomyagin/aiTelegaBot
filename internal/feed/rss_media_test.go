@@ -12,7 +12,8 @@ import (
 
 // TestRSSSourceCollect_Media (Stage 9E, тест-кейс №1): enclosure image/* →
 // MediaKind=photo + MediaURL; enclosure application/pdf и пост без enclosure →
-// media-поля пустые.
+// media-поля пустые. Не-http схемы (file://, ftp:// — ревью 9E, фикс 2)
+// отвергаются httpMediaURL → media-поля пустые.
 func TestRSSSourceCollect_Media(t *testing.T) {
 	sample, err := os.ReadFile("testdata/rss_photo.xml")
 	if err != nil {
@@ -29,8 +30,8 @@ func TestRSSSourceCollect_Media(t *testing.T) {
 	if err != nil {
 		t.Fatalf("collect: %v", err)
 	}
-	if len(items) != 3 {
-		t.Fatalf("want 3 items, got %d", len(items))
+	if len(items) != 5 {
+		t.Fatalf("want 5 items, got %d", len(items))
 	}
 
 	if items[0].MediaKind != "photo" {
@@ -46,5 +47,14 @@ func TestRSSSourceCollect_Media(t *testing.T) {
 	if items[2].MediaKind != "" || items[2].MediaURL != "" {
 		t.Errorf("no enclosure: media-поля должны быть пустыми, got %q/%q",
 			items[2].MediaKind, items[2].MediaURL)
+	}
+	// Ревью 9E, фикс 2: не-http схемы не проходят gate httpMediaURL.
+	if items[3].MediaKind != "" || items[3].MediaURL != "" {
+		t.Errorf("file:// enclosure: media-поля должны быть пустыми, got %q/%q",
+			items[3].MediaKind, items[3].MediaURL)
+	}
+	if items[4].MediaKind != "" || items[4].MediaURL != "" {
+		t.Errorf("ftp:// media:content: media-поля должны быть пустыми, got %q/%q",
+			items[4].MediaKind, items[4].MediaURL)
 	}
 }

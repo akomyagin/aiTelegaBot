@@ -808,6 +808,12 @@ func photoFileLocation(msg tg.Message) (*tg.InputPhotoFileLocation, error) {
 // EOF.
 const downloadChunkBytes = 1024 * 1024
 
+// downloadPhotoMaxBytes — cap размера скачиваемого фото (план §4.5.1, прод
+// RAM 458 MB): 10 МБ — лимит Bot API на загрузку файла ботом; большие фото
+// всё равно не re-upload'ятся/не отправятся — качать их бесполезно. Превышение
+// прерывает стриминг с ошибкой (ревью 9E, фикс 9).
+const downloadPhotoMaxBytes = 10 << 20
+
 // streamPhotoToFile последовательно качает файл через upload.getFile и пишет
 // его в destPath. СТРИМИНГ: в памяти одновременно один chunk (≤1 МБ) — файл
 // никогда не лежит в RAM целиком (план §4.5.1, прод RAM 458 MB). CDN-редирект
@@ -842,6 +848,10 @@ func streamPhotoToFile(ctx context.Context, api *tg.Client, loc *tg.InputPhotoFi
 			return fmt.Errorf("mtproto: downloadPhoto: write %s: %w", destPath, err)
 		}
 		offset += int64(len(uf.Bytes))
+		if offset > downloadPhotoMaxBytes {
+			// Файл не остаётся: defer resolver'а (resolveOne) чистит temp.
+			return fmt.Errorf("mtproto: downloadPhoto: photo exceeds %d MiB", downloadPhotoMaxBytes>>20)
+		}
 		if len(uf.Bytes) < downloadChunkBytes {
 			break // короткий chunk = EOF
 		}

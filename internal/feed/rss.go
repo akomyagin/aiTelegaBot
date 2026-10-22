@@ -74,15 +74,29 @@ func (s *RSSSource) Collect(ctx context.Context) ([]Item, error) {
 // mediaImageURL возвращает URL первой картинки gofeed-элемента (plan §4.5):
 // enclosure с типом image/*, иначе fi.Image (media:content). Не-image
 // enclosures (application/pdf и т.п.) игнорируются — документы/видео не несём
-// (plan §2). Пустой Type у enclosure картинкой не считается.
+// (plan §2). Пустой Type у enclosure картинкой не считается. Принимаются
+// только http/https URL (httpMediaURL) — прочее → "".
 func mediaImageURL(fi *gofeed.Item) string {
 	for _, e := range fi.Enclosures {
 		if e != nil && e.URL != "" && strings.HasPrefix(e.Type, "image/") {
-			return e.URL
+			return httpMediaURL(e.URL)
 		}
 	}
 	if fi.Image != nil {
-		return fi.Image.URL
+		return httpMediaURL(fi.Image.URL)
+	}
+	return ""
+}
+
+// httpMediaURL — gate схемы media-URL (plan §6, паттерн digest.l3Link):
+// только http:// и https:// (без учёта регистра) — фото по URL качают серверы
+// Telegram; file://, ftp:// и прочее отвергается → "" (media-поля источника
+// не заполняются). Свой хелпер в пакете feed: feed НЕ импортирует telegram
+// (направление зависимостей, ревью 9E фикс 2).
+func httpMediaURL(u string) string {
+	lower := strings.ToLower(u)
+	if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
+		return u
 	}
 	return ""
 }

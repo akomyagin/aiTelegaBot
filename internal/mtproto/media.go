@@ -118,6 +118,16 @@ func (r *MediaResolver) resolveOne(ctx context.Context, ref string, msgID int) (
 	}
 	svcID, fileID, err := r.up.UploadPhoto(ctx, "", path, fmt.Sprintf("photo-%d.jpg", msgID))
 	if err != nil {
+		// «no photo в ответе» приходит с id УЖЕ отправленного служебного
+		// сообщения (uploadPhotoResult) — удаляем, чтобы не утекало в
+		// owner-чат (ревью 9E, фикс 6). Транспортная ошибка (svcID
+		// недоступен) — удалять нечего, поведение прежнее.
+		if svcID > 0 {
+			if derr := r.up.DeleteMessage(ctx, "", svcID); derr != nil {
+				r.log.Warn("mtproto media: delete service message after failed upload",
+					"svc_id", svcID, "err", derr)
+			}
+		}
 		return "", fmt.Errorf("re-upload: %w", err)
 	}
 	// Служебное сообщение удаляется СРАЗУ после re-upload (§4.5.1 п.2).
