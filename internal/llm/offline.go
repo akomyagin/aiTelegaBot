@@ -58,31 +58,10 @@ func (o *Offline) SuggestTopic(ctx context.Context, existing []string, sample []
 	return "", nil
 }
 
-// SummarizeTopic implements TopicSummarizer offline, deterministically
-// (plan §4.10): Headline — up to 3 first "- <Title>" lines joined by "\n"
-// (input order); Items — the first sentence of Text per item (Title when
-// Text is empty). No time/random/map iteration.
-func (o *Offline) SummarizeTopic(ctx context.Context, topicName string, items []feed.Item) (TopicSummary, error) {
-	_ = ctx
-	_ = topicName
-	const maxHeadlineLines = 3
-	lines := make([]string, 0, maxHeadlineLines)
-	for i, it := range items {
-		if i >= maxHeadlineLines {
-			break
-		}
-		lines = append(lines, "- "+it.Title)
-	}
-	ts := TopicSummary{Headline: strings.Join(lines, "\n")}
-	for i, it := range items {
-		summary := extractLead(it.Text)
-		if summary == "" {
-			summary = it.Title
-		}
-		ts.Items = append(ts.Items, ItemSummary{Index: i + 1, Summary: summary})
-	}
-	return ts, nil
-}
+// SummarizeTopic (TopicSummarizer, Этап 8) УДАЛЁН в 9D-2b: вызов C
+// (AggregateTopic ниже) заменил его в pipeline.Run; паттерн offline-headline
+// «первые ≤3 строки» живёт в firstSummaryLines/degradedTopicAggregate
+// (aggregate.go) и в digest.fallbackHeadline (пункт E мандата 9D-2b).
 
 // ClassifySummarize implements ClassifySummarizer offline (план §4.1):
 // детерминированная деградация без сети — все элементы class=other (реклама
@@ -131,4 +110,49 @@ func extractLead(text string) string {
 		text = text[:idx+1] // keep the period
 	}
 	return truncateRunes(text, leadRunes)
+}
+
+// AggregateTopic реализует TopicAggregator offline (план §4.7, вызов C):
+// headline темы — первые ≤3 строки «- <саммари сообщения>» из ВСЕХ топиков
+// (порядок среза входа, паттерн Offline.SummarizeTopic); саммари каждого
+// топика — первые ≤3 строки его собственного списка. Sections содержат
+// только топики с НЕПУСТЫМ саммари — контракт TopicAggregate (aggregate.go:
+// топики с пустым саммари в Sections ОТСУТСТВУЮТ; ревью 9D L4).
+// Детерминированно: два вызова на одном входе байт-в-байт одинаковы
+// (нет сети, random, time.Now, map-итераций).
+func (o *Offline) AggregateTopic(ctx context.Context, topicName string, sources []SourceBlock) (TopicAggregate, error) {
+	_ = ctx
+	_ = topicName
+	var all []string
+	for _, s := range sources {
+		all = append(all, s.Summaries...)
+	}
+	agg := TopicAggregate{
+		Headline: strings.Join(firstSummaryLines(all, aggregateFallbackLines), "\n"),
+	}
+	for _, s := range sources {
+		sum := strings.Join(firstSummaryLines(s.Summaries, aggregateFallbackLines), "\n")
+		if sum == "" {
+			continue // все саммари топика пусты → секции нет (ревью 9D L4)
+		}
+		agg.Sections = append(agg.Sections, TopicHeadline{SourceID: s.SourceID, Summary: sum})
+	}
+	return agg, nil
+}
+
+// AggregateOverall реализует OverallAggregator offline (план §4.7, вызов D):
+// выпуск — список «- <имя темы>: N материалов» (без саммари — offline не из
+// чего его строить). Пустое имя темы → «Без темы» (защита от пустой строки
+// списка). Детерминированно: два вызова на одном входе байт-в-байт одинаковы.
+func (o *Offline) AggregateOverall(ctx context.Context, topics []OverallTopic) (string, error) {
+	_ = ctx
+	lines := make([]string, 0, len(topics))
+	for _, t := range topics {
+		name := strings.TrimSpace(t.Name)
+		if name == "" {
+			name = "Без темы"
+		}
+		lines = append(lines, "- "+name+": "+itoa(t.ItemCount)+" материалов")
+	}
+	return strings.Join(lines, "\n"), nil
 }

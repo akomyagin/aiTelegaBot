@@ -681,8 +681,8 @@ func TestPipelineRun_RestartSurvival(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListDigestItems: %v", err)
 	}
-	l1 := RenderTopicL1(d.Body, ditems)
-	if !strings.Contains(l1, d.Body) || !strings.Contains(l1, "b-T1") {
+	l1 := RenderTopicView(d.Body, d.ID, d.RunID, TopicEntries(ditems, nil, ParseTopicSections(d.SectionsJSON))).Text
+	if !strings.Contains(l1, d.Body) || (len(ditems) > 0 && !strings.Contains(l1, "Топики:")) {
 		t.Errorf("restored L1 unexpected:\n%s", l1)
 	}
 	// Повторный прогон после рестарта: всё seen, доставки и вызовов A нет.
@@ -1942,28 +1942,6 @@ func TestPipelineRun_LinkSummaryConcatCappedAt600Runes(t *testing.T) {
 	}
 }
 
-// 9B кейс 6 (ревью F5, замена vacuous L3-golden): L2-golden с длинным
-// ↳-саммари РОВНО 600 рун. Строка собирается strings.Repeat БЕЗ вызова
-// truncateRunes — golden не должен дублировать логику pipeline. Существующие
-// golden не меняются; drill_l2_links.golden — осознанное ДОБАВЛЕНИЕ
-// (`go test ./internal/digest -run TestRenderDrillL2_LinkSummary_Golden -update`).
-func TestRenderDrillL2_LinkSummary_Golden(t *testing.T) {
-	const base = "Базовое саммари."       // 16 рун
-	long := strings.Repeat("детали ", 83) // 7 × 83 = ровно 581 руна
-	summary := base + "\n↳ " + long       // 16 + 3 + 581 = ровно 600 рун
-	if n := utf8.RuneCountInString(summary); n != 600 {
-		t.Fatalf("fixture broken: %d runes, want exactly 600", n)
-	}
-	item := storage.DigestItem{SourceID: 3, Title: "Новости Go", Summary: summary}
-	res := renderDrillL2("Тема 1", []l2Section{
-		{SourceID: 3, Name: "Habr", Items: []storage.DigestItem{item}},
-	}, 42)
-	if res == nil || res.Edit == nil {
-		t.Fatal("renderDrillL2 = nil, want callback result")
-	}
-	compareGolden(t, "drill_l2_links", res.Edit.Text)
-}
-
 // 9B: повторный Run после успешной доставки — 0 fetch, 0 E/F
 // (seen_items: прогон выходит до шага 4c).
 func TestPipelineRun_RepeatAfterDeliveryNoLinkWork(t *testing.T) {
@@ -2424,5 +2402,35 @@ func TestPipelineRun_DeliveryFailureThenRetryUsesLinkCache(t *testing.T) {
 	}
 	if len(ditems) != 1 || ditems[0].Summary != "s1\n↳ сжато: "+art {
 		t.Errorf("run2 digest_items = %+v, want «s1\\n↳ сжато: %s»", ditems, art)
+	}
+}
+
+// 9B кейс 6 (ревью F5, замена vacuous L3-golden; конвертирован в 9D-2a:
+// renderDrillL2 удалён — его преемник RenderSourceView): L2-блок с длинным
+// ↳-саммари РОВНО 600 рун. Строка собирается strings.Repeat БЕЗ вызова
+// truncateRunes — тест не должен дублировать логику pipeline. Golden
+// drill_l2_links.golden УДАЛЁН сознательно (флаг «Итога 9A/9B/9C»): полное
+// 600-рунное саммари с «↳»-хвостом входит в новый рендер ЦЕЛИКОМ (отступ
+// «  » у продолжения), без обрезки.
+func TestRenderSourceView_LinkSummary600(t *testing.T) {
+	const base = "Базовое саммари."       // 16 рун
+	long := strings.Repeat("детали ", 83) // 7 × 83 = ровно 581 руна
+	summary := base + "\n↳ " + long       // 16 + 3 + 581 = ровно 600 рун
+	if n := utf8.RuneCountInString(summary); n != 600 {
+		t.Fatalf("fixture broken: %d runes, want exactly 600", n)
+	}
+	item := storage.DigestItem{ID: 5, SourceID: 3, Title: "Новости Go", Summary: summary}
+	view := RenderSourceView("Тема 1", 42, 3, []SourceSection{
+		{SourceID: 3, Name: "Habr", Items: []storage.DigestItem{item}},
+	})
+	if view == nil {
+		t.Fatal("RenderSourceView = nil")
+	}
+	want := strings.ReplaceAll(strings.TrimSpace(summary), "\n", "\n  ")
+	if !strings.Contains(view.Text, want) {
+		t.Errorf("600-рунное ↳-саммари должно войти в L2-блок целиком (с отступом):\n%.300q", view.Text)
+	}
+	if n := utf8.RuneCountInString(view.Text); n > maxBodyRunes {
+		t.Errorf("text = %d runes, want ≤4096", n)
 	}
 }

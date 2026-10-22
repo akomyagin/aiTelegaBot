@@ -29,7 +29,7 @@ const digestItemFullTextRunes = 8000
 
 // digestSelect is the shared column list for digests reads. topic_id is read
 // through COALESCE(topic_id, 1): legacy NULL ≡ «Без темы».
-const digestSelect = "SELECT id, run_id, COALESCE(topic_id, 1), created_at, item_count, body, delivered"
+const digestSelect = "SELECT id, run_id, COALESCE(topic_id, 1), created_at, item_count, body, delivered, sections_json"
 
 // Digest is one persisted topic digest (a digests row).
 type Digest struct {
@@ -40,11 +40,21 @@ type Digest struct {
 	ItemCount int
 	Body      string // ready HTML L1 topic header (RenderTopicBody), stored at insert
 	Delivered bool
+	// SectionsJSON — саммари топиков вызова C (миграция v6, директива
+	// диспетчера 9D-2a): JSON-массив [{"source_id":N,"summary":"…"}], порядок =
+	// порядок collect. '' (legacy/v5-строки) или битый JSON → L1/L2 деградируют
+	// на строки без саммари (digest.ParseTopicSections), не ошибка.
+	SectionsJSON string
 }
 
 // DigestItem is one drill-down row of a digest (digest_items).
 type DigestItem struct {
-	ID          int64 // 0 on write; filled on read
+	ID int64 // 0 on write; filled on read
+	// DigestID заполняется ТОЛЬКО в GetDigestItem (Stage 9D, M:-view: кнопка
+	// «◀ Назад» S:<did>:<sid> берёт did из самой строки digest_items, план
+	// §4.6); List*-методы оставляют 0 — их вызывающим digest_id известен из
+	// запроса. При записи игнорируется (MarkDelivered вставляет свой digestID).
+	DigestID    int64
 	SourceID    int64 // 0 ↔ NULL (written as a nil argument)
 	DedupKey    string
 	Title       string
@@ -98,15 +108,21 @@ func NewDigestItem(it feed.Item, summary, class string) DigestItem {
 }
 
 // InsertDigest creates a digests row with delivered=0 and returns its id
-// (plan §4.3: delivery gates persistence).
-func (s *SQLiteStore) InsertDigest(ctx context.Context, runID, topicID int64, body string, itemCount int) (int64, error) {
+// (plan §4.3: delivery gates persistence). sectionsJSON (миграция v6, Этап
+// 9D-2a) — саммари топиков вызова C для L1/L2-view после рестарта; ” =
+// legacy/нет саммари. Параметр InsertDigest, а не отдельный SetDigestSections
+// (обоснование директивы диспетчера): sections известны в момент вставки —
+// pipeline строит body и sections из одного результата вызова C, поэтому одна
+// запись атомарна, нет окна «digest без sections» и нет второго round-trip.
+// В 9D-2a pipeline передаёт "" — полный wiring вызова C сделает 9D-2b.
+func (s *SQLiteStore) InsertDigest(ctx context.Context, runID, topicID int64, body string, itemCount int, sectionsJSON string) (int64, error) {
 	now := time.Now().UTC().Format(time.RFC3339)
 	// topicID 0 → NULL (review C1 L2): reads COALESCE(topic_id,1), so a
 	// literal 0 would bypass the «Без темы» normalization — defense even
 	// though pipeline Run maps 0→1 itself.
 	res, err := s.db.ExecContext(ctx,
-		"INSERT INTO digests(created_at, item_count, body, delivered, topic_id, run_id) VALUES(?,?,?,0,?,?)",
-		now, itemCount, body, nilIfZero(topicID), runID)
+		"INSERT INTO digests(created_at, item_count, body, delivered, topic_id, run_id, sections_json) VALUES(?,?,?,0,?,?,?)",
+		now, itemCount, body, nilIfZero(topicID), runID, sectionsJSON)
 	if err != nil {
 		return 0, fmt.Errorf("insert digest: %w", err)
 	}
@@ -277,7 +293,7 @@ type rowScanner interface {
 func scanDigest(row rowScanner) (Digest, int, error) {
 	var d Digest
 	var delivered int
-	if err := row.Scan(&d.ID, &d.RunID, &d.TopicID, &d.CreatedAt, &d.ItemCount, &d.Body, &delivered); err != nil {
+	if err := row.Scan(&d.ID, &d.RunID, &d.TopicID, &d.CreatedAt, &d.ItemCount, &d.Body, &delivered, &d.SectionsJSON); err != nil {
 		return Digest{}, 0, fmt.Errorf("scan digest: %w", err)
 	}
 	return d, delivered, nil
@@ -299,4 +315,68 @@ func truncateRunes(s string, n int) string {
 		return s
 	}
 	return string(r[:n])
+}
+
+// digestItemFullSelect — список колонок GetDigestItem: digestItemSelect +
+// digest_id (M:-view строит «◀ Назад» S:<did>:<sid> по самой строке, план
+// §4.6; List*-методы digest_id не читают — он известен из запроса).
+const digestItemFullSelect = `SELECT digest_id, id, COALESCE(source_id, 0), dedup_key, title, url, tg_peer, tg_msg_id, published_at, snippet, summary, full_text, class, media_kind, media_ref
+	 FROM digest_items`
+
+// GetDigestItem читает ОДНУ строку digest_items по id (Stage 9D, M:-view).
+// Неизвестный/crafted id → ok=false, НЕ ошибка (GetDigest-паттерн: crafted
+// callback id не должен ронять viewer — диспетчер ack'ит «Не получилось
+// открыть»). Заполняет DigestID (единственный метод, который это делает).
+func (s *SQLiteStore) GetDigestItem(ctx context.Context, itemID int64) (DigestItem, bool, error) {
+	row := s.db.QueryRowContext(ctx, digestItemFullSelect+" WHERE id=?", itemID)
+	var it DigestItem
+	err := row.Scan(&it.DigestID, &it.ID, &it.SourceID, &it.DedupKey, &it.Title, &it.URL,
+		&it.TgPeer, &it.TgMsgID, &it.PublishedAt, &it.Snippet, &it.Summary,
+		&it.FullText, &it.Class, &it.MediaKind, &it.MediaRef)
+	if errors.Is(err, sql.ErrNoRows) {
+		return DigestItem{}, false, nil
+	}
+	if err != nil {
+		return DigestItem{}, false, fmt.Errorf("scan digest_item %d: %w", itemID, err)
+	}
+	return it, true, nil
+}
+
+// UpsertRunSummary пишет общее саммари выпуска в runs (таблица миграции v5;
+// вызов D → runs.summary, план §4.7/§4.8.1 шаг 6). Идемпотентен по run_id:
+// повторный upsert того же прогона перезаписывает summary (created_at первой
+// записи сохраняется). run_id ≤ 0 → error: 0 — legacy-сентинел «не прогон»
+// (ListRunDigests), строки runs для него быть не должно.
+func (s *SQLiteStore) UpsertRunSummary(ctx context.Context, runID int64, summary string) error {
+	if runID <= 0 {
+		return fmt.Errorf("upsert run summary: invalid run_id %d", runID)
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO runs(run_id, summary, created_at) VALUES(?,?,?)
+		 ON CONFLICT(run_id) DO UPDATE SET summary=excluded.summary`,
+		runID, summary, now)
+	if err != nil {
+		return fmt.Errorf("upsert run %d summary: %w", runID, err)
+	}
+	return nil
+}
+
+// GetRunSummary читает общее саммари выпуска (восстановление TOC:<runID> —
+// план 9D: «нет строки → overall-блок отсутствует — legacy-прогоны»). Нет
+// строки → ("", false, nil), НЕ ошибка (GetDigest-паттерн). runID=0 →
+// legacy «не прогон», всегда miss (ListRunDigests-паттерн).
+func (s *SQLiteStore) GetRunSummary(ctx context.Context, runID int64) (string, bool, error) {
+	if runID == 0 {
+		return "", false, nil
+	}
+	var summary string
+	err := s.db.QueryRowContext(ctx, "SELECT summary FROM runs WHERE run_id=?", runID).Scan(&summary)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("select run %d summary: %w", runID, err)
+	}
+	return summary, true, nil
 }

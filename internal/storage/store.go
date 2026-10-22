@@ -48,8 +48,9 @@ type Store interface {
 	// dedup_key → empty result, not an error (Stage 9B).
 	ListItemLinks(ctx context.Context, dedupKey string) ([]ItemLink, error)
 	// InsertDigest creates a digests row with delivered=0 and returns its id
-	// (Stage 8 C, plan §4.3 — delivery gates persistence).
-	InsertDigest(ctx context.Context, runID, topicID int64, body string, itemCount int) (digestID int64, err error)
+	// (Stage 8 C, plan §4.3 — delivery gates persistence). sectionsJSON —
+	// саммари топиков вызова C (миграция v6, Этап 9D-2a); '' = legacy/нет.
+	InsertDigest(ctx context.Context, runID, topicID int64, body string, itemCount int, sectionsJSON string) (digestID int64, err error)
 	// MarkDelivered flips delivered=1, inserts the digest_items rows and marks
 	// the items seen — all in ONE transaction; any error rolls everything back.
 	MarkDelivered(ctx context.Context, digestID int64, items []DigestItem) error
@@ -65,6 +66,16 @@ type Store interface {
 	// ListRunDigests returns one run's digests ordered by topic_id ASC;
 	// runID=0 means «легаси, не прогон» and always yields an empty result.
 	ListRunDigests(ctx context.Context, runID int64) ([]Digest, error)
+	// GetDigestItem reads ONE digest_items row by id; unknown id → ok=false
+	// (NOT an error). Заполняет DigestItem.DigestID — единственный метод,
+	// который это делает (Stage 9D, M:-view «◀ Назад» S:<did>:<sid>).
+	GetDigestItem(ctx context.Context, itemID int64) (it DigestItem, ok bool, err error)
+	// UpsertRunSummary writes the run's overall summary (runs, migration v5;
+	// вызов D, Stage 9D). Идемпотентен по run_id; run_id ≤ 0 → error.
+	UpsertRunSummary(ctx context.Context, runID int64, summary string) error
+	// GetRunSummary reads the run's overall summary; нет строки → ("", false,
+	// nil) — legacy-прогоны рендерят TOC без overall-блока (Stage 9D).
+	GetRunSummary(ctx context.Context, runID int64) (summary string, ok bool, err error)
 	// GetMeta reads a scheduler/meta key; ok is false when the key is absent.
 	GetMeta(ctx context.Context, key string) (value string, ok bool, err error)
 	// SetMeta upserts a scheduler/meta key.

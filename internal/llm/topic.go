@@ -13,8 +13,9 @@ import (
 // existing (точное совпадение), либо новое короткое имя (≤40 рун).
 // Пустая строка = «предложить нечего» (offline/ошибка — не фатально).
 // Реализации: сетевой Client и Offline (вторая реализация → интерфейс
-// оправдан правилом SKILL.md). План §4.10, Этап 8 B. TopicSummarizer /
-// topicdigest.go — подэтап C, здесь их нет намеренно.
+// оправдан правилом SKILL.md). План §4.10, Этап 8 B. Историческая справка:
+// TopicSummarizer / llm/topicdigest.go удалены в 9D-2b — саммари топиков
+// строит вызов C (AggregateTopic, llm/aggregate.go, §4.7).
 type TopicSuggester interface {
 	SuggestTopic(ctx context.Context, existing []string, sample []feed.Item) (string, error)
 }

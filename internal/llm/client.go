@@ -168,62 +168,9 @@ func (c *Client) SuggestTopic(ctx context.Context, existing []string, sample []f
 	return "", fmt.Errorf("llm: topic suggestion unparseable after %d attempts: %w", maxParseAttempts, lastErr)
 }
 
-// SummarizeTopic implements TopicSummarizer over the chat-completions API —
-// the SuggestTopic pattern verbatim (plan §4.10 / Stage 8 C): strict JSON
-// {"headline":"…","items":[{"index":1,"summary":"…"}]}; transport/HTTP errors
-// surface immediately (doWithRetry already retried; fatal 400/401 are not
-// re-requested); an unparseable answer triggers exactly ONE repeat; if BOTH
-// answers are unparseable — fallback: Headline = the plain Summarize result,
-// Items empty (L2 then renders from item titles — degradation, not failure).
-// The API key is never logged.
-func (c *Client) SummarizeTopic(ctx context.Context, topicName string, items []feed.Item) (TopicSummary, error) {
-	msgs := buildTopicDigestPrompt(topicName, items)
-	body, err := json.Marshal(chatRequest{
-		Model:       c.model,
-		Messages:    msgs,
-		Temperature: 0.2,
-	})
-	if err != nil {
-		return TopicSummary{}, fmt.Errorf("llm: marshal request: %w", err)
-	}
-
-	url := c.baseURL + "/chat/completions"
-	makeReq := func() (*http.Request, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+c.apiKey) // apiKey never logged
-		return req, nil
-	}
-
-	const maxParseAttempts = 2 // initial request + one repeat on an unparseable answer
-	var lastErr error
-	for attempt := 0; attempt < maxParseAttempts; attempt++ {
-		resp, err := c.doWithRetry(ctx, makeReq)
-		if err != nil {
-			return TopicSummary{}, err
-		}
-		content, err := extractContent(resp)
-		if err != nil {
-			return TopicSummary{}, err
-		}
-		ts, perr := parseTopicSummary(content, len(items))
-		if perr == nil {
-			return ts, nil
-		}
-		lastErr = perr
-		c.log.Warn("llm topic summary unparseable", "attempt", attempt, "err", perr)
-	}
-	// Fallback (§4.10): plain Summarize as the headline, Items stay empty.
-	s, serr := c.Summarize(ctx, items)
-	if serr != nil {
-		return TopicSummary{}, fmt.Errorf("llm: topic summary unparseable after %d attempts (%v); fallback summarize failed: %w",
-			maxParseAttempts, lastErr, serr)
-	}
-	return TopicSummary{Headline: s}, nil
-}
+// SummarizeTopic (TopicSummarizer, Этап 8) УДАЛЁН в 9D-2b: вызов C
+// (AggregateTopic, aggregate.go) заменил его в pipeline.Run — production-
+// вызовов не осталось (пункт E мандата 9D-2b, решение зафиксировано в отчёте).
 
 // extractContent reads the first choice's content from an open chat-completions
 // response and closes the body.
@@ -445,4 +392,120 @@ func (c *Client) SummarizeLinks(ctx context.Context, pages []LinkPage) ([]LinkSu
 		c.log.Warn("llm link summaries unparseable", "attempt", attempt, "err", perr)
 	}
 	return nil, fmt.Errorf("llm: link summaries unparseable after %d attempts: %w", maxParseAttempts, lastErr)
+}
+
+// AggregateTopic реализует TopicAggregator (вызов C плана §4.8) поверх
+// chat-completions API — паттерн SummarizeTopic: строгий JSON
+// {"headline":"…","sections":[{"source_index":1,"summary":"…"}]}, fence-strip,
+// ровно ОДИН повтор при мусорном ответе, существующий retry/backoff транспорта
+// (doWithRetry). Пустой вход → пустой результат БЕЗ HTTP-запроса
+// (ClassifyLinks-паттерн).
+//
+// Ошибка транспорта/API → error немедленно (9D-2 обработает по плану:
+// fallback-headline темы, тема НЕ пропускается — шаг 4d). Двойной мусор → НЕ
+// ошибка: детерминированный fallback (план 9D, тест-кейс 1) — Headline =
+// первые ≤3 саммари сообщений списком «- …» (порядок среза входа), Sections
+// пусты (L1 рендерит строки топиков без саммари — деградация). API-ключ
+// никогда не логируется.
+func (c *Client) AggregateTopic(ctx context.Context, topicName string, sources []SourceBlock) (TopicAggregate, error) {
+	if len(sources) == 0 {
+		return TopicAggregate{}, nil
+	}
+	body, err := json.Marshal(chatRequest{
+		Model:       c.model,
+		Messages:    buildAggregateTopicPrompt(topicName, sources),
+		Temperature: 0.2,
+	})
+	if err != nil {
+		return TopicAggregate{}, fmt.Errorf("llm: marshal request: %w", err)
+	}
+
+	url := c.baseURL + "/chat/completions"
+	makeReq := func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+c.apiKey) // apiKey never logged
+		return req, nil
+	}
+
+	const maxParseAttempts = 2 // initial request + one repeat on an unparseable answer
+	var lastErr error
+	for attempt := 0; attempt < maxParseAttempts; attempt++ {
+		resp, err := c.doWithRetry(ctx, makeReq)
+		if err != nil {
+			// HTTP-level failures were already retried inside doWithRetry;
+			// fatal errors (400/401) must not be re-requested.
+			return TopicAggregate{}, err
+		}
+		content, err := extractContent(resp)
+		if err != nil {
+			return TopicAggregate{}, err
+		}
+		agg, perr := parseAggregateTopic(content, sources)
+		if perr == nil {
+			return agg, nil
+		}
+		lastErr = perr
+		c.log.Warn("llm topic aggregate unparseable", "attempt", attempt, "err", perr)
+	}
+	c.log.Warn("llm topic aggregate falling back to first summaries",
+		"sources", len(sources), "err", lastErr)
+	return degradedTopicAggregate(sources), nil
+}
+
+// AggregateOverall реализует OverallAggregator (вызов D плана §4.8) — один
+// запрос на прогон: строгий JSON {"summary":"…"}, fence-strip, ровно ОДИН
+// повтор при мусоре. РЕШЕНИЕ 9D-1 (план §4.8.1 шаг 6 — «сбой D — log-only,
+// L0 без общего саммари (деградация, не ошибка)»): двойной мусор → НЕ ошибка,
+// overall "" — TOC рендерится без overall-блока; ошибка транспорта/API →
+// error (9D-2 тоже обработает его log-only, но отличает транспортный сбой от
+// мусорного ответа в логах). Пустой вход → ("", nil) без HTTP-запроса.
+// API-ключ никогда не логируется.
+func (c *Client) AggregateOverall(ctx context.Context, topics []OverallTopic) (string, error) {
+	if len(topics) == 0 {
+		return "", nil
+	}
+	body, err := json.Marshal(chatRequest{
+		Model:       c.model,
+		Messages:    buildAggregateOverallPrompt(topics),
+		Temperature: 0.2,
+	})
+	if err != nil {
+		return "", fmt.Errorf("llm: marshal request: %w", err)
+	}
+
+	url := c.baseURL + "/chat/completions"
+	makeReq := func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+c.apiKey) // apiKey never logged
+		return req, nil
+	}
+
+	const maxParseAttempts = 2 // initial request + one repeat on an unparseable answer
+	var lastErr error
+	for attempt := 0; attempt < maxParseAttempts; attempt++ {
+		resp, err := c.doWithRetry(ctx, makeReq)
+		if err != nil {
+			return "", err
+		}
+		content, err := extractContent(resp)
+		if err != nil {
+			return "", err
+		}
+		s, perr := parseOverallSummary(content)
+		if perr == nil {
+			return s, nil
+		}
+		lastErr = perr
+		c.log.Warn("llm overall summary unparseable", "attempt", attempt, "err", perr)
+	}
+	c.log.Warn("llm overall summary falling back to empty", "topics", len(topics), "err", lastErr)
+	return "", nil
 }

@@ -50,8 +50,8 @@ func TestMigrate_FromV3ReachesLatest(t *testing.T) {
 	if err := st.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatalf("read user_version: %v", err)
 	}
-	if version != 5 {
-		t.Errorf("user_version = %d, want 5", version)
+	if version != 6 {
+		t.Errorf("user_version = %d, want 6", version)
 	}
 
 	// digest_items table and its index exist.
@@ -100,8 +100,8 @@ func TestMigrate_FromV3ReachesLatest(t *testing.T) {
 	if err := st2.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatalf("read user_version after reopen: %v", err)
 	}
-	if version != 5 {
-		t.Errorf("user_version after reopen = %d, want 5", version)
+	if version != 6 {
+		t.Errorf("user_version after reopen = %d, want 6", version)
 	}
 }
 
@@ -109,11 +109,11 @@ func TestInsertDigestAndGet(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
 
-	id1, err := st.InsertDigest(ctx, 100, 5, "<b>body</b>", 3)
+	id1, err := st.InsertDigest(ctx, 100, 5, "<b>body</b>", 3, "")
 	if err != nil {
 		t.Fatalf("InsertDigest 1: %v", err)
 	}
-	id2, err := st.InsertDigest(ctx, 100, 7, "body2", 1)
+	id2, err := st.InsertDigest(ctx, 100, 7, "body2", 1, "")
 	if err != nil {
 		t.Fatalf("InsertDigest 2: %v", err)
 	}
@@ -154,7 +154,7 @@ func TestMarkDelivered(t *testing.T) {
 	}
 	tgItem := feed.Item{Kind: "tg_botapi", Source: "@chan", Title: "T2", ID: "42", Text: "text two"}
 
-	digestID, err := st.InsertDigest(ctx, 200, 1, "body", 2)
+	digestID, err := st.InsertDigest(ctx, 200, 1, "body", 2, "")
 	if err != nil {
 		t.Fatalf("InsertDigest: %v", err)
 	}
@@ -223,7 +223,7 @@ func TestMarkDelivered_Rollback(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
 
-	digestID, err := st.InsertDigest(ctx, 300, 1, "body", 1)
+	digestID, err := st.InsertDigest(ctx, 300, 1, "body", 1, "")
 	if err != nil {
 		t.Fatalf("InsertDigest: %v", err)
 	}
@@ -261,18 +261,18 @@ func TestListRunDigests(t *testing.T) {
 	ctx := context.Background()
 
 	// Run 111: topics inserted out of order (5 before 1) — read back topic ASC.
-	if _, err := st.InsertDigest(ctx, 111, 5, "b5", 1); err != nil {
+	if _, err := st.InsertDigest(ctx, 111, 5, "b5", 1, ""); err != nil {
 		t.Fatalf("InsertDigest 111/5: %v", err)
 	}
-	if _, err := st.InsertDigest(ctx, 111, 1, "b1", 2); err != nil {
+	if _, err := st.InsertDigest(ctx, 111, 1, "b1", 2, ""); err != nil {
 		t.Fatalf("InsertDigest 111/1: %v", err)
 	}
 	// Run 222 must not mix in.
-	if _, err := st.InsertDigest(ctx, 222, 3, "b3", 1); err != nil {
+	if _, err := st.InsertDigest(ctx, 222, 3, "b3", 1, ""); err != nil {
 		t.Fatalf("InsertDigest 222/3: %v", err)
 	}
 	// Legacy run_id=0 row.
-	if _, err := st.InsertDigest(ctx, 0, 1, "legacy", 1); err != nil {
+	if _, err := st.InsertDigest(ctx, 0, 1, "legacy", 1, ""); err != nil {
 		t.Fatalf("InsertDigest 0/1: %v", err)
 	}
 
@@ -378,7 +378,7 @@ func TestDigests_RestartSurvival(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	digestID, err := st.InsertDigest(ctx, 400, 2, "body", 1)
+	digestID, err := st.InsertDigest(ctx, 400, 2, "body", 1, "")
 	if err != nil {
 		t.Fatalf("InsertDigest: %v", err)
 	}

@@ -1,17 +1,24 @@
-// Drill-down L2/L3 (Stage 8 D-2, план §D): парсинг сырого callback_data
-// («L2:<digestID>», «L3:<digestID>:<sourceID>»), рендеры и seam
-// telegram.WithDrillDown — NewDrillDown(store, sources-снапшот). Данные
-// строго из SQLite (rest-семантика §4.3): L2/L3-сообщения не хранятся и
-// рендерятся по запросу. Весь динамический текст через telegram.EscapeHTML
-// (§4.8); разметка создаётся только рендером; URL в <a href> — только
-// http/https, проверяется перед вставкой (§4.8). Ошибка seam'а (мусорные
-// data, неизвестный digest, сбой storage) → error: диспетчер D-1 сам
-// ack'ит «Не получилось открыть» и логирует, паник здесь не должно быть.
+// Диспетчер четырёхуровневой навигации (Этап 9D-2a, план §4.6 и «Подэтап 9D»):
+// seam telegram.WithDrillDown разбирает СЫРОЙ callback_data —
+// «S:<digestID>:<sourceID>» (топик, sourceID=0 → все топики одним списком с
+// подзаголовками), «M:<digestItemID>» (сообщение), «P:<digestItemID>» (фото —
+// в 9D заглушка: ack «Медиа недоступно», sendPhoto в 9E) и «PDEL» (закрыть
+// фото — в 9D ack-only, deleteMessage в 9E), ПЛЮС legacy-alias'ы кнопок СТАРЫХ
+// доставленных сообщений: «L2:<digestID>» → как «T:<digestID>» (ближайший
+// новый аналог — RenderTopicView), «L3:<digestID>:<sourceID>» →
+// «S:<digestID>:<sourceID>» (включая sourceID=0). «L1:» в seam не попадает —
+// это alias T:-пути в telegram-диспетчере. Данные строго из SQLite
+// (rest-семантика §4.3): view переживают рестарт бота — саммари топиков
+// читаются из digests.sections_json (миграция v6, директива диспетчера).
+// Ошибка seam'а (мусорные data, неизвестный id, сбой storage) → error:
+// диспетчер telegram сам ack'ит «Не получилось открыть» и логирует, паник
+// здесь не должно быть.
 
 package digest
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -23,61 +30,55 @@ import (
 )
 
 const (
-	// l2MaxSections — план §D: секций >15 → без кнопок секций, только
-	// «◀ Назад» + «Общий список» (L3:<did>:0) и пометка в тексте.
-	l2MaxSections = 15
-	// l3SnippetRunes — план §D: snippet в строке L3 ≤120 рун.
-	l3SnippetRunes = 120
-	// l2BtnSuffix/l2BtnBudget — лейбл кнопки секции «<источник> → сообщения».
-	// УТОЧНЕНИЕ ПЛАНА: план писал «≤60 рун» ДО урока A2 H1 — лимит Bot API
-	// 64 БАЙТА, поэтому бюджет динамической части байтовый:
-	// 64 − len(" → сообщения") − len("…") = 64 − 23 − 3 = 38 (worst-case
-	// лейбл 38+3+23 = ровно 64; TruncateButtonLabelTo режет на границе рун
-	// и дописывает "…" только при обрезке). Не «правь» 38 вверх — впритык.
-	l2BtnSuffix = " → сообщения"
-	l2BtnBudget = 64 - len(l2BtnSuffix) - len("…")
-	// drillBackLabel — кнопка «назад»: из L2 в L1, из L3 в L2 (§4.4).
+	// drillBackLabel — кнопка «◀ Назад» (используется и render_nav.go).
 	drillBackLabel = "◀ Назад"
-	// l2TooManyNote — пометка при >l2MaxSections секциях (план §D).
-	l2TooManyNote = "Слишком много источников — смотрите общий список."
-	// l3AllHeader — заголовок общего списка L3:<did>:0.
-	l3AllHeader = "Все сообщения"
+	// mediaUnavailableAck — 9D-заглушка «P:» (план 9D: фото отправляется в
+	// 9E); совпадает с telegram.photoUnavailableText (дублирование сознательное:
+	// telegram обрабатывает «P:» до seam'а, seam — защита для прямых вызовов).
+	mediaUnavailableAck = "Медиа недоступно"
 )
 
-// parseDrillDownData разбирает СЫРОЙ callback_data с префиксом (контракт
-// D-1): «L2:<digestID>» → level 2, «L3:<digestID>:<sourceID>» → level 3
-// (sourceID 0 = все элементы). Парсер — strings.CutPrefix + strings.Cut,
-// не regex (§4.4). Мусор, не-числа, неположительный digestID, отрицательный
-// sourceID и переполнение int64 → error, не паника.
-func parseDrillDownData(data string) (level int, digestID, sourceID int64, err error) {
-	if rest, ok := strings.CutPrefix(data, "L2:"); ok {
-		id, idErr := parseIDBounded(rest, 1)
-		if idErr != nil {
-			return 0, 0, 0, fmt.Errorf("drill-down: bad L2 data %q: %w", data, idErr)
-		}
-		return 2, id, 0, nil
+// parseSourceData разбирает «<prefix><digestID>:<sourceID>» для «S:» и legacy
+// «L3:» (alias §4.6): digestID ≥ 1, sourceID ≥ 0 (0 = все топики). Мусор,
+// не-числа, лишние сегменты и переполнение int64 → error, не паника
+// (strconv.ParseInt отвергает всё сам).
+func parseSourceData(data, prefix string) (digestID, sourceID int64, err error) {
+	rest, ok := strings.CutPrefix(data, prefix)
+	if !ok {
+		return 0, 0, fmt.Errorf("drill-down: data %q: want prefix %q", data, prefix)
 	}
-	if rest, ok := strings.CutPrefix(data, "L3:"); ok {
-		didStr, sidStr, found := strings.Cut(rest, ":")
-		if !found {
-			return 0, 0, 0, fmt.Errorf("drill-down: bad L3 data %q: want L3:<digestID>:<sourceID>", data)
-		}
-		did, idErr := parseIDBounded(didStr, 1)
-		if idErr != nil {
-			return 0, 0, 0, fmt.Errorf("drill-down: bad L3 digest id %q: %w", data, idErr)
-		}
-		sid, idErr := parseIDBounded(sidStr, 0)
-		if idErr != nil {
-			return 0, 0, 0, fmt.Errorf("drill-down: bad L3 source id %q: %w", data, idErr)
-		}
-		return 3, did, sid, nil
+	didStr, sidStr, found := strings.Cut(rest, ":")
+	if !found {
+		return 0, 0, fmt.Errorf("drill-down: bad %s data %q: want <digestID>:<sourceID>", prefix, data)
 	}
-	return 0, 0, 0, fmt.Errorf("drill-down: unknown callback data %q", data)
+	did, idErr := parseIDBounded(didStr, 1)
+	if idErr != nil {
+		return 0, 0, fmt.Errorf("drill-down: bad %s digest id %q: %w", prefix, data, idErr)
+	}
+	sid, idErr := parseIDBounded(sidStr, 0)
+	if idErr != nil {
+		return 0, 0, fmt.Errorf("drill-down: bad %s source id %q: %w", prefix, data, idErr)
+	}
+	return did, sid, nil
 }
 
-// parseIDBounded парсит десятичный id и требует value >= min (digestID ≥ 1,
-// sourceID ≥ 0). ParseInt сам отвергает мусор, «», переполнение int64 и
-// значения ниже min.
+// parseMessageData разбирает «<prefix><digestItemID>» для «M:», «P:» и legacy
+// «L2:» (один числовой аргумент ≥ 1). Мусор/overflow → error, не паника.
+func parseMessageData(data, prefix string) (int64, error) {
+	rest, ok := strings.CutPrefix(data, prefix)
+	if !ok {
+		return 0, fmt.Errorf("drill-down: data %q: want prefix %q", data, prefix)
+	}
+	id, err := parseIDBounded(rest, 1)
+	if err != nil {
+		return 0, fmt.Errorf("drill-down: bad %s id %q: %w", prefix, data, err)
+	}
+	return id, nil
+}
+
+// parseIDBounded парсит десятичный id и требует value >= min (digestID/
+// itemID ≥ 1, sourceID ≥ 0). ParseInt сам отвергает мусор, «», переполнение
+// int64 и значения ниже min.
 func parseIDBounded(s string, min int64) (int64, error) {
 	v, err := strconv.ParseInt(s, 10, 64)
 	if err != nil {
@@ -89,75 +90,245 @@ func parseIDBounded(s string, min int64) (int64, error) {
 	return v, nil
 }
 
-// l2Section — одна группа элементов L2 по источнику (порядок первого
-// появления, никаких map-итераций в рендер — golden детерминирован).
-type l2Section struct {
-	SourceID int64
-	Name     string
-	Items    []storage.DigestItem
-}
-
-// NewDrillDown собирает seam для telegram.WithDrillDown (план §D):
-// telegram.DrillDown = func(ctx, data string) (*CallbackResult, error),
-// data приходит СЫРЫМ с префиксом — парсинг здесь. sources — снапшот строк
-// sources для имён источников (в app: store.ListSources, один вызов на
-// drill-down, кэш не нужен — single-user, таблица маленькая); storage.Source
-// не имеет поля Name — отображаемое имя = Ref (RSS URL / username канала).
-// source_id без строки → «источник #N» (план §D).
+// NewDrillDown собирает seam для telegram.WithDrillDown (план §4.6, Этап 9D):
+// диспетчер S:/M:/P:/PDEL + legacy-alias'ы L2:/L3:. data приходит СЫРЫМ с
+// префиксом — парсинг здесь. sources — снапшот строк sources для имён топиков
+// (в app: store.ListSources, один вызов на view, кэш не нужен — single-user,
+// таблица маленькая); отображаемое имя = Ref c peer-Title fallback для tg_*
+// (SourceDisplayNames, план §4.6 строки 393–397).
 func NewDrillDown(store storage.Store, sources func(ctx context.Context) ([]storage.Source, error)) telegram.DrillDown {
 	return func(ctx context.Context, data string) (*telegram.CallbackResult, error) {
-		level, digestID, sourceID, err := parseDrillDownData(data)
-		if err != nil {
-			return nil, err
-		}
-		d, ok, err := store.GetDigest(ctx, digestID)
-		if err != nil {
-			return nil, fmt.Errorf("drill-down: GetDigest(%d): %w", digestID, err)
-		}
-		if !ok {
-			// Crafted/устаревший id — error (ack+лог диспетчера), НЕ паника.
-			return nil, fmt.Errorf("drill-down: digest %d не существует", digestID)
-		}
-		names, err := sourceNames(ctx, sources)
-		if err != nil {
-			return nil, err
-		}
-
-		if level == 2 {
-			topicName, err := drillTopicName(ctx, store, d.TopicID)
+		switch {
+		case strings.HasPrefix(data, "S:"):
+			did, sid, err := parseSourceData(data, "S:")
 			if err != nil {
 				return nil, err
 			}
-			items, err := store.ListDigestItems(ctx, digestID)
+			return drillSourceView(ctx, store, sources, did, sid)
+		case strings.HasPrefix(data, "M:"):
+			id, err := parseMessageData(data, "M:")
 			if err != nil {
-				return nil, fmt.Errorf("drill-down: ListDigestItems(%d): %w", digestID, err)
+				return nil, err
 			}
-			return renderDrillL2(topicName, groupBySource(items, names), digestID), nil
-		}
-
-		var items []storage.DigestItem
-		if sourceID == 0 {
-			items, err = store.ListDigestItems(ctx, digestID)
-		} else {
-			items, err = store.ListDigestItemsBySource(ctx, digestID, sourceID)
-		}
-		if err != nil {
-			return nil, fmt.Errorf("drill-down: items(%d,%d): %w", digestID, sourceID, err)
-		}
-		header := l3AllHeader
-		if sourceID != 0 {
-			name, ok := names[sourceID]
-			if !ok || strings.TrimSpace(name) == "" {
-				name = "источник #" + strconv.FormatInt(sourceID, 10)
+			return drillMessageView(ctx, store, id)
+		case strings.HasPrefix(data, "P:"):
+			// 9D-заглушка (план 9D): фото отправляется в 9E — только ack, БЕЗ
+			// edit. id валидируем для единой семантики мусора (error → ack
+			// «Не получилось открыть»), но от ответа он не зависит.
+			if _, err := parseMessageData(data, "P:"); err != nil {
+				return nil, err
 			}
-			header = name
+			return &telegram.CallbackResult{AckText: mediaUnavailableAck}, nil
+		case data == "PDEL":
+			// 9E удалит сообщение фото (CallbackResult.Send); в 9D — ack-only.
+			return &telegram.CallbackResult{}, nil
+		case strings.HasPrefix(data, "L2:"):
+			// Legacy alias §4.6: «L2:<did>» → как «T:<did>» (ближайший новый
+			// аналог «по источникам» — L1-view темы).
+			did, err := parseMessageData(data, "L2:")
+			if err != nil {
+				return nil, err
+			}
+			return drillTopicView(ctx, store, sources, did)
+		case strings.HasPrefix(data, "L3:"):
+			// Legacy alias §4.6: «L3:<did>:<sid>» → «S:<did>:<sid>».
+			did, sid, err := parseSourceData(data, "L3:")
+			if err != nil {
+				return nil, err
+			}
+			return drillSourceView(ctx, store, sources, did, sid)
 		}
-		return renderDrillL3(header, items, digestID), nil
+		return nil, fmt.Errorf("drill-down: unknown callback data %q", data)
 	}
 }
 
-// sourceNames — снапшот id → отображаемое имя источника.
-func sourceNames(ctx context.Context, sources func(ctx context.Context) ([]storage.Source, error)) (map[int64]string, error) {
+// drillTopicView — L1-view темы (T:-аналог для legacy «L2:<did>» и основа
+// viewer'а): шапка (digests.body как есть) + топики именами с саммари из
+// sections_json + кнопки S:<did>:<sid> и «◀ К оглавлению».
+func drillTopicView(ctx context.Context, store storage.Store, sources func(context.Context) ([]storage.Source, error), digestID int64) (*telegram.CallbackResult, error) {
+	d, ok, err := store.GetDigest(ctx, digestID)
+	if err != nil {
+		return nil, fmt.Errorf("drill-down: GetDigest(%d): %w", digestID, err)
+	}
+	if !ok {
+		// Crafted/устаревший id — error (ack+лог диспетчера), НЕ паника.
+		return nil, fmt.Errorf("drill-down: digest %d не существует", digestID)
+	}
+	items, err := store.ListDigestItems(ctx, digestID)
+	if err != nil {
+		return nil, fmt.Errorf("drill-down: ListDigestItems(%d): %w", digestID, err)
+	}
+	names, err := SourceDisplayNames(ctx, store, sources)
+	if err != nil {
+		return nil, err
+	}
+	nav := RenderTopicView(d.Body, digestID, d.RunID,
+		TopicEntries(items, names, ParseTopicSections(d.SectionsJSON)))
+	return navViewResult(nav), nil
+}
+
+// drillSourceView — L2-view топика («S:<did>:<sid>»; sid=0 → все топики с
+// подзаголовками): шапка «📰 <тема> / <имя топика>» + саммари топика из
+// sections_json + блоки сообщений с «перейти» и кнопками «Читать ▸» M:<itemID>.
+func drillSourceView(ctx context.Context, store storage.Store, sources func(context.Context) ([]storage.Source, error), digestID, sourceID int64) (*telegram.CallbackResult, error) {
+	d, ok, err := store.GetDigest(ctx, digestID)
+	if err != nil {
+		return nil, fmt.Errorf("drill-down: GetDigest(%d): %w", digestID, err)
+	}
+	if !ok {
+		return nil, fmt.Errorf("drill-down: digest %d не существует", digestID)
+	}
+	topicName, err := drillTopicName(ctx, store, d.TopicID)
+	if err != nil {
+		return nil, err
+	}
+	var items []storage.DigestItem
+	if sourceID == 0 {
+		items, err = store.ListDigestItems(ctx, digestID)
+	} else {
+		items, err = store.ListDigestItemsBySource(ctx, digestID, sourceID)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("drill-down: items(%d,%d): %w", digestID, sourceID, err)
+	}
+	names, err := SourceDisplayNames(ctx, store, sources)
+	if err != nil {
+		return nil, err
+	}
+	sections := SourceSections(items, names, ParseTopicSections(d.SectionsJSON))
+	return navViewResult(RenderSourceView(topicName, digestID, sourceID, sections)), nil
+}
+
+// drillMessageView — L3-view сообщения («M:<itemID>», план §4.6): full_text
+// (пуст → snippet + пометка legacy), блок «Ссылки:» из item_links+link_cache,
+// кнопки «🖼 Фото» P: (при media_ref≠”), «↗ Перейти в источник» (URL-кнопка)
+// и «◀ Назад» S:<did>:<sid> (did/sid из самой строки digest_items).
+func drillMessageView(ctx context.Context, store storage.Store, itemID int64) (*telegram.CallbackResult, error) {
+	it, ok, err := store.GetDigestItem(ctx, itemID)
+	if err != nil {
+		return nil, fmt.Errorf("drill-down: GetDigestItem(%d): %w", itemID, err)
+	}
+	if !ok {
+		return nil, fmt.Errorf("drill-down: digest item %d не существует", itemID)
+	}
+	links, err := messageLinks(ctx, store, it.DedupKey)
+	if err != nil {
+		return nil, err
+	}
+	return navViewResult(RenderMessageView(it, links)), nil
+}
+
+// messageLinks — блок «Ссылки:» L3-view: item_links (порядок ord ASC) +
+// title/summary из link_cache (9B). Пропавшая cache-строка → Title/Summary
+// пусты (рендер деградирует на домен, не ошибка). Kind — из item_links, при
+// пустом — из кеша.
+func messageLinks(ctx context.Context, store storage.Store, dedupKey string) ([]MessageLink, error) {
+	rows, err := store.ListItemLinks(ctx, dedupKey)
+	if err != nil {
+		return nil, fmt.Errorf("drill-down: ListItemLinks(%q): %w", dedupKey, err)
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	urls := make([]string, 0, len(rows))
+	for _, r := range rows {
+		urls = append(urls, r.URL)
+	}
+	cache, err := store.GetLinkCache(ctx, urls)
+	if err != nil {
+		return nil, fmt.Errorf("drill-down: GetLinkCache: %w", err)
+	}
+	out := make([]MessageLink, 0, len(rows))
+	for _, r := range rows {
+		l := MessageLink{URL: r.URL, Kind: r.Kind}
+		if c, ok := cache[r.URL]; ok {
+			if l.Kind == "" {
+				l.Kind = c.Kind
+			}
+			l.Title, l.Summary = c.Title, c.Summary
+		}
+		out = append(out, l)
+	}
+	return out, nil
+}
+
+// NavButtons собирает итоговые строки клавиатуры NavView (контракт d1.md):
+// i-я nil-строка Buttons — плейсхолдер URLButtons[i] → строка
+// {InlineButton{Text, URL}} (InlineButton.URL добавлен в 9D-2a). Инвариант
+// «число nil-строк == len(URLButtons)» зафиксирован тестом 9D-1; нарушение
+// инварианта здесь — пропуск плейсхолдера (защита, не паника).
+func NavButtons(v *NavView) [][]telegram.InlineButton {
+	if v == nil {
+		return nil
+	}
+	rows := make([][]telegram.InlineButton, 0, len(v.Buttons))
+	next := 0
+	for _, row := range v.Buttons {
+		if row == nil {
+			if next >= len(v.URLButtons) {
+				continue
+			}
+			ub := v.URLButtons[next]
+			next++
+			row = []telegram.InlineButton{{Text: ub.Text, URL: ub.URL}}
+		}
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+// navViewResult конвертирует NavView в CallbackResult: ack пустой, Edit —
+// текст + клавиатура с подставленными URL-кнопками (NavButtons).
+func navViewResult(v *NavView) *telegram.CallbackResult {
+	if v == nil {
+		return &telegram.CallbackResult{}
+	}
+	return &telegram.CallbackResult{Edit: &telegram.EditMessage{
+		Text:    v.Text,
+		Buttons: NavButtons(v),
+	}}
+}
+
+// TopicSection — элемент digests.sections_json (миграция v6): саммари топика
+// из вызова C; порядок массива = порядок collect.
+type TopicSection struct {
+	SourceID int64  `json:"source_id"`
+	Summary  string `json:"summary"`
+}
+
+// ParseTopicSections разбирает digests.sections_json в map source_id → саммари
+// топика. Пустая строка (legacy/v5-строки) или битый JSON → пустая map:
+// L1/L2 деградируют на строки без саммари (план §4.6), НЕ ошибка. Дубль
+// source_id — первый выигрыш; пустой summary → секции нет (стиль 9D-1 §C).
+func ParseTopicSections(sectionsJSON string) map[int64]string {
+	out := make(map[int64]string)
+	if strings.TrimSpace(sectionsJSON) == "" {
+		return out
+	}
+	var arr []TopicSection
+	if err := json.Unmarshal([]byte(sectionsJSON), &arr); err != nil {
+		return make(map[int64]string)
+	}
+	for _, s := range arr {
+		if _, dup := out[s.SourceID]; dup {
+			continue
+		}
+		if strings.TrimSpace(s.Summary) == "" {
+			continue
+		}
+		out[s.SourceID] = s.Summary
+	}
+	return out
+}
+
+// SourceDisplayNames — снапшот id → отображаемое имя источника (план §4.6,
+// строки 393–397): имя = Ref (RSS URL / username канала); для tg_*-источников
+// с Ref в форме «-100X» — Title из mtproto_peers (store.GetPeer), если строка
+// есть и Title непустой. Ошибка/промах GetPeer деградирует в Ref (кеш-таблица
+// не должна ронять view). Публичный username-Ref остаётся как есть: GetPeer
+// keyed by id, запроса по username в схеме нет (осознанное ограничение 9D-2a).
+// sources == nil → пустой снапшот (имена деградируют до «источник #N»).
+func SourceDisplayNames(ctx context.Context, store storage.Store, sources func(context.Context) ([]storage.Source, error)) (map[int64]string, error) {
 	names := make(map[int64]string)
 	if sources == nil {
 		// Защитная ветка (app всегда передаёт снапшот): все имена деградируют
@@ -169,9 +340,68 @@ func sourceNames(ctx context.Context, sources func(ctx context.Context) ([]stora
 		return nil, fmt.Errorf("drill-down: sources snapshot: %w", err)
 	}
 	for _, s := range rows {
-		names[s.ID] = s.Ref
+		names[s.ID] = sourceDisplayName(ctx, store, s)
 	}
 	return names, nil
+}
+
+// sourceDisplayName — имя одного источника с peer-Title fallback (см.
+// SourceDisplayNames).
+func sourceDisplayName(ctx context.Context, store storage.Store, s storage.Source) string {
+	if store != nil && strings.HasPrefix(s.Kind, "tg_") {
+		if rest, ok := strings.CutPrefix(s.Ref, "-100"); ok {
+			if x, err := strconv.ParseInt(rest, 10, 64); err == nil && x > 0 {
+				if p, found, err := store.GetPeer(ctx, x); err == nil && found && strings.TrimSpace(p.Title) != "" {
+					return p.Title
+				}
+			}
+		}
+	}
+	return s.Ref
+}
+
+// TopicEntries группирует digest_items в строки L1-view (порядок = id ASC,
+// первое появление источника задаёт строку — детерминированный рендер, никаких
+// map-итераций). Summary — саммари топика из sections_json (пусто → строка без
+// саммари, деградация плана).
+func TopicEntries(items []storage.DigestItem, names map[int64]string, sections map[int64]string) []TopicEntry {
+	idx := make(map[int64]int, len(items))
+	var out []TopicEntry
+	for _, it := range items {
+		if i, ok := idx[it.SourceID]; ok {
+			out[i].ItemCount++
+			continue
+		}
+		idx[it.SourceID] = len(out)
+		out = append(out, TopicEntry{
+			SourceID:  it.SourceID,
+			Name:      names[it.SourceID],
+			ItemCount: 1,
+			Summary:   sections[it.SourceID],
+		})
+	}
+	return out
+}
+
+// SourceSections группирует digest_items в секции L2-view (тот же порядок
+// первого появления); Summary — саммари топика из sections_json.
+func SourceSections(items []storage.DigestItem, names map[int64]string, sections map[int64]string) []SourceSection {
+	idx := make(map[int64]int, len(items))
+	var out []SourceSection
+	for _, it := range items {
+		if i, ok := idx[it.SourceID]; ok {
+			out[i].Items = append(out[i].Items, it)
+			continue
+		}
+		idx[it.SourceID] = len(out)
+		out = append(out, SourceSection{
+			SourceID: it.SourceID,
+			Name:     names[it.SourceID],
+			Summary:  sections[it.SourceID],
+			Items:    []storage.DigestItem{it},
+		})
+	}
+	return out
 }
 
 // drillTopicName — имя темы из ListTopics; нет строки → «Тема #<id>»
@@ -189,139 +419,6 @@ func drillTopicName(ctx context.Context, store storage.Store, topicID int64) (st
 	return "Тема #" + strconv.FormatInt(topicID, 10), nil
 }
 
-// groupBySource группирует элементы по SourceID с СОХРАНЕНИЕМ порядка
-// первого появления (план §D: детерминированный golden, без map-итераций).
-func groupBySource(items []storage.DigestItem, names map[int64]string) []l2Section {
-	idx := make(map[int64]int, len(items))
-	var sections []l2Section
-	for _, it := range items {
-		if i, ok := idx[it.SourceID]; ok {
-			sections[i].Items = append(sections[i].Items, it)
-			continue
-		}
-		name, ok := names[it.SourceID]
-		if !ok || strings.TrimSpace(name) == "" {
-			name = "источник #" + strconv.FormatInt(it.SourceID, 10)
-		}
-		idx[it.SourceID] = len(sections)
-		sections = append(sections, l2Section{
-			SourceID: it.SourceID,
-			Name:     name,
-			Items:    []storage.DigestItem{it},
-		})
-	}
-	return sections
-}
-
-// renderDrillL2 — рендер «L2:<digestID>» (план §D):
-//
-//	📰 <тема> — по источникам
-//
-//	<b><имя источника></b>
-//	• <summary>            ← пустой summary → title
-//	…
-//
-// Кнопки: по одной «<имя> → сообщения» (L3:<did>:<srcID>) на секцию +
-// «◀ Назад» (L1:<did>). Секций >15 — только «Общий список» (L3:<did>:0)
-// и «◀ Назад» + пометка в тексте.
-func renderDrillL2(topicName string, sections []l2Section, digestID int64) *telegram.CallbackResult {
-	did := strconv.FormatInt(digestID, 10)
-	header := "📰 " + telegram.EscapeHTML(topicName) + " — по источникам"
-	back := []telegram.InlineButton{{Text: drillBackLabel, Data: "L1:" + did}}
-
-	if len(sections) > l2MaxSections {
-		return &telegram.CallbackResult{Edit: &telegram.EditMessage{
-			// Ревью D L3: ветка тоже проходит guard 4096 (гигантское имя
-			// темы + пометка теоретически могут выйти за лимит).
-			Text: fitDrillDownList(header, []string{l2TooManyNote}, "\n\n"),
-			Buttons: [][]telegram.InlineButton{
-				{{Text: "Общий список", Data: "L3:" + did + ":0"}},
-				back,
-			},
-		}}
-	}
-
-	blocks := make([]string, 0, len(sections))
-	buttons := make([][]telegram.InlineButton, 0, len(sections)+1)
-	for _, s := range sections {
-		var b strings.Builder
-		b.WriteString("<b>")
-		b.WriteString(telegram.EscapeHTML(s.Name))
-		b.WriteString("</b>")
-		for _, it := range s.Items {
-			line := strings.TrimSpace(it.Summary)
-			if line == "" {
-				line = it.Title // пустой summary → title (план §D)
-			}
-			b.WriteString("\n• ")
-			b.WriteString(telegram.EscapeHTML(line))
-		}
-		blocks = append(blocks, b.String())
-		// Ревью D M1: SourceID==0 — элементы с неизвестной принадлежностью
-		// (NULL source_id → COALESCE 0), а «L3:<did>:0» — сентинел «ВСЕ
-		// элементы». Кнопка секции обещала бы фильтр, открывая общий список,
-		// поэтому для 0-секции кнопки нет (текст секции остаётся).
-		if s.SourceID != 0 {
-			buttons = append(buttons, []telegram.InlineButton{{
-				Text: telegram.TruncateButtonLabelTo(s.Name, l2BtnBudget) + l2BtnSuffix,
-				Data: "L3:" + did + ":" + strconv.FormatInt(s.SourceID, 10),
-			}})
-		}
-	}
-	buttons = append(buttons, back)
-
-	return &telegram.CallbackResult{Edit: &telegram.EditMessage{
-		Text:    fitDrillDownList(header, blocks, "\n\n"),
-		Buttons: buttons,
-	}}
-}
-
-// renderDrillL3 — рендер «L3:<digestID>:<sourceID|0>» (план §D):
-//
-//	📄 <имя источника|«Все сообщения»>
-//
-//	• <a href="LINK">title</a> — <snippet ≤120 рун>
-//
-// LINK: url со схемой http/https (§4.8) → url; иначе deep link из
-// tg_peer/tg_msg_id; и deep link пуст → БЕЗ <a>. Пустой snippet → строка
-// без « — ». Кнопка «◀ Назад» → L2:<digestID>. Guard >4096 рун —
-// fitDrillDownList («…и ещё K»).
-func renderDrillL3(headerName string, items []storage.DigestItem, digestID int64) *telegram.CallbackResult {
-	header := "📄 " + telegram.EscapeHTML(headerName)
-	lines := make([]string, 0, len(items))
-	for _, it := range items {
-		var b strings.Builder
-		b.WriteString("• ")
-		// Ревью D L7: пустой title при живой ссылке дал бы пустой <a></a> —
-		// fallback на placeholder, строка остаётся кликабельной.
-		raw := strings.TrimSpace(it.Title)
-		if raw == "" {
-			raw = "(без заголовка)"
-		}
-		title := telegram.EscapeHTML(raw)
-		if link := l3Link(it); link != "" {
-			b.WriteString(`<a href="`)
-			b.WriteString(link)
-			b.WriteString(`">`)
-			b.WriteString(title)
-			b.WriteString("</a>")
-		} else {
-			b.WriteString(title)
-		}
-		if snip := strings.TrimSpace(it.Snippet); snip != "" {
-			b.WriteString(" — ")
-			b.WriteString(telegram.EscapeHTML(truncateRunes(snip, l3SnippetRunes)))
-		}
-		lines = append(lines, b.String())
-	}
-	return &telegram.CallbackResult{Edit: &telegram.EditMessage{
-		Text: fitDrillDownList(header, lines, "\n"),
-		Buttons: [][]telegram.InlineButton{
-			{{Text: drillBackLabel, Data: "L2:" + strconv.FormatInt(digestID, 10)}},
-		},
-	}}
-}
-
 // l3Link — ссылка элемента для <a href> (план §D + §4.8): url != "" И
 // схема http/https (проверяется ПЕРЕД вставкой; url.Parse нормализует
 // схему в нижний регистр и отвергает управляющие символы) → url; иначе
@@ -337,13 +434,12 @@ func l3Link(it storage.DigestItem) string {
 	return telegram.DeepLink(it.TgPeer, it.TgMsgID)
 }
 
-// fitDrillDownList — локальный guard 4096 рун для L2/L3 (паттерн
-// RenderTopicL1, план §D «обрезка с хвоста с пометкой “…и ещё K”»;
-// сигнатура RenderTopicL1 заморожена для D, поэтому реализация локальная).
-// Хвостовые блоки отбрасываются по одному, K = число отброшенных БЛОКОВ
-// (в L2 блок = секция). Полоса M1 (ревью C1): цикл не тестирует «заголовок
-// allein» — если заголовок ≤4096 рун, он возвращается как есть; длиннее —
-// режется по рунам с «…».
+// fitDrillDownList — локальный guard 4096 рун для view навигации (паттерн
+// старого RenderTopicL1, план §D «обрезка с хвоста с пометкой “…и ещё K”»).
+// Хвостовые блоки отбрасываются по одному, K = число отброшенных БЛОКОВ.
+// Полоса M1 (ревью C1): цикл не тестирует «заголовок allein» — если
+// заголовок ≤4096 рун, он возвращается как есть; длиннее — режется по рунам
+// с «…».
 func fitDrillDownList(header string, blocks []string, sep string) string {
 	for dropped := 0; dropped <= len(blocks); dropped++ {
 		block := strings.Join(blocks[:len(blocks)-dropped], sep)

@@ -231,18 +231,38 @@ func TestHandleCallbackQuery_DigestViews(t *testing.T) {
 			}
 			if tt.wantBtns && len(rec.kbs) == 1 {
 				kb := rec.kbs[0]
-				// D-1 (граница C/D): telegram докомпановывает к L1-view кнопку
-				// «Подробнее →» (L2:<digestID>) РЯДОМ с кнопкой viewer'а
-				// «◀ К оглавлению» — тот же ряд, первой. Единственное
 				// отличие golden'а от C: добавленная кнопка.
-				if kb == nil || len(kb.InlineKeyboard) != 1 || len(kb.InlineKeyboard[0]) != 2 ||
-					kb.InlineKeyboard[0][0].Text != drillDownMoreLabel ||
-					kb.InlineKeyboard[0][0].CallbackData != "L2:42" ||
-					kb.InlineKeyboard[0][1].CallbackData != "TOC:77" {
-					t.Errorf("edit markup = %+v, want ряд [Подробнее → L2:42 | TOC:77]", kb)
+				if kb == nil || len(kb.InlineKeyboard) != 1 || len(kb.InlineKeyboard[0]) != 1 ||
+					kb.InlineKeyboard[0][0].CallbackData != "TOC:77" {
+					t.Errorf("edit markup = %+v, want ряд [TOC:77]", kb)
 				}
 			}
 		})
+	}
+}
+
+// Ревью 9D L5: T-view с пустыми Buttons (legacy run_id=0 без items) — editFn
+// получает NON-NIL пустой markup: Bot API убирает старые кнопки (inlineKeyboard
+// дал бы nil, и старый markup остался бы под новым текстом).
+func TestHandleDigestView_EmptyButtonsClearsKeyboard(t *testing.T) {
+	rec := &recorder{}
+	b := &Bot{chatID: 111, log: discardLogger(), ackFn: rec.ack, editFn: rec.edit,
+		digestViewer: func(ctx context.Context, req DigestViewRequest) (DigestView, bool, error) {
+			return DigestView{Text: "LEGACY BODY"}, true, nil // Buttons пусты
+		}}
+	b.handleCallbackQuery(context.Background(), cbQuery("T:42", 111, true))
+	if len(rec.texts) != 1 || rec.texts[0] != "LEGACY BODY" {
+		t.Fatalf("edits = %v, want [LEGACY BODY]", rec.texts)
+	}
+	if len(rec.kbs) != 1 {
+		t.Fatalf("kbs = %d, want 1", len(rec.kbs))
+	}
+	kb := rec.kbs[0]
+	if kb == nil {
+		t.Fatal("markup = nil, want non-nil пустой (старые кнопки должны быть убраны)")
+	}
+	if len(kb.InlineKeyboard) != 0 {
+		t.Errorf("markup = %+v, want пустой", kb)
 	}
 }
 
@@ -255,7 +275,7 @@ func TestHandleCallbackQuery_DigestViewFromDBAfterRestart(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 
-	digestID, err := st.InsertDigest(ctx, 555, 1, "STORED BODY", 1)
+	digestID, err := st.InsertDigest(ctx, 555, 1, "STORED BODY", 1, "")
 	if err != nil {
 		t.Fatalf("InsertDigest: %v", err)
 	}

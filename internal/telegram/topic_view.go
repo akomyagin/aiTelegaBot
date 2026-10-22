@@ -16,19 +16,29 @@ import (
 	"github.com/go-telegram/bot/models"
 )
 
-// Callback data prefixes (plan §4.4): «TOC:» and «T:» do not intersect (the
-// second byte differs) and do not conflict with ad:/dp:/ts:/tl:/tn: or the
-// future L1:/L2:/L3:. Worst case "TOC:" + 19 digits = 23 bytes < 64. The
-// dispatcher checks TOC: before T: for readability.
+// Callback data prefixes (plan §4.4/§4.6, Этап 9D): все префиксы попарно не
+// пересекаются (второй байт различается) и не конфликтуют с ad:/dp:/ts:/tl:/
+// tn:. Worst case «TOC:» + 19 цифр = 23 байта, «S:» + 19 + 1 + 19 = 41 байт —
+// оба < 64 (property-тест тест-кейса 5 плана). Диспетчер проверяет TOC: раньше
+// T: (читаемость); «PDEL» не начинается с «P:», порядок P:→PDEL не критичен.
 const (
 	cbPrefixTOC       = "TOC:"
 	cbPrefixTopicOpen = "T:"
+	// Этап 9D (§4.6): «S:<digestID>:<sourceID>» — топик (sourceID=0 → все
+	// топики одним списком с подзаголовками), «M:<digestItemID>» — сообщение,
+	// «P:<digestItemID>» — фото (9D: ack-заглушка «Медиа недоступно»,
+	// sendPhoto — 9E), «PDEL» — закрыть фото (9D: ack-only, deleteMessage — 9E).
+	cbPrefixSource  = "S:"
+	cbPrefixMessage = "M:"
+	cbPrefixPhoto   = "P:"
+	cbPhotoDelete   = "PDEL"
 )
 
-// Stage 8 D drill-down prefixes (plan §4.4): «L1:<digestID>» (назад из L2 —
-// alias T:-пути), «L2:<digestID>» (по источникам), «L3:<digestID>:<sourceID>»
-// (элементы источника; sourceID=0 → общий список). Не пересекаются с TOC:/T:/
-// ad:/dp:/ts:/tl:/tn:. Worst case "L3:" + 19 + 1 + 19 цифр = 42 байта < 64.
+// Legacy drill-down prefixes Этапа 8 D — в 9D остаются ALIAS'ами кнопок СТАРЫХ
+// доставленных сообщений (§4.6): «L1:<did>» → как «T:<did>» (viewer-путь,
+// диспетчер dialogs.go), «L2:<did>» → как «T:<did>» (ближайший новый аналог,
+// диспетчер digest.NewDrillDown), «L3:<did>:<sid>» → «S:<did>:<sid>» (включая
+// sid=0). Worst case «L3:» + 19 + 1 + 19 цифр = 42 байта < 64.
 const (
 	cbPrefixL1 = "L1:"
 	cbPrefixL2 = "L2:"
@@ -50,9 +60,9 @@ const (
 const (
 	drillDownErrorText       = "Не получилось открыть"
 	drillDownUnavailableText = "Drill-down недоступен."
-	// drillDownMoreLabel — статическая подпись L1-кнопки: 24 байта < 64
-	// (лимит Bot API, урок A2 H1), усечение не нужно.
-	drillDownMoreLabel = "Подробнее →"
+	// photoUnavailableText — 9D-заглушка «P:» (план 9D: фото отправляется в
+	// 9E): только ack, БЕЗ edit.
+	photoUnavailableText = "Медиа недоступно"
 )
 
 // handleTopicOpen processes "T:<digestID>": the topic L1 view.
@@ -93,29 +103,21 @@ func (b *Bot) handleDigestView(ctx context.Context, q *models.CallbackQuery, arg
 		b.editCallbackMessage(ctx, msg, digestViewNotFoundText, nil)
 		return
 	}
-	buttons := view.Buttons
+	// Этап 9D: клавиатуру T:-view полностью собирает viewer (RenderTopicView:
+	// кнопки-имена топиков S:<did>:<sid> + «◀ К оглавлению» TOC:<runID>);
+	// telegram ничего не докомпановывает — «Подробнее →» из Этапа 8 D больше
+	// нет (L1-view сам перечисляет топики). T: и L1: (alias в диспетчере)
+	// дают одинаковый view.
+	//
+	// Ревью 9D L5: T-view идёт через drillDownKeyboard — при пустых Buttons
+	// inlineKeyboard дал бы nil, и editCallbackMessage сохранил бы СТАРЫЙ
+	// markup (legacy run_id=0 без items: старые кнопки под новым текстом);
+	// non-nil пустой markup заставляет Bot API убрать старые кнопки.
 	if kind == ViewKindTopic {
-		// Граница C/D (Итог C): RenderTopicL1 в digest заморожен — композицию
-		// «Подробнее →» + «◀ К оглавлению» делает telegram-слой. T: и L1:
-		// (alias выше в диспетчере) дают одинаковый view.
-		buttons = withDrillDownButton(buttons, id)
+		b.editCallbackMessage(ctx, msg, view.Text, drillDownKeyboard(view.Buttons))
+		return
 	}
-	b.editCallbackMessage(ctx, msg, view.Text, inlineKeyboard(buttons))
-}
-
-// withDrillDownButton adds the L1-view «Подробнее →» (L2:<digestID>) button
-// NEXT TO the viewer's first-row button («◀ К оглавлению»), before it; with no
-// viewer buttons it becomes the single row. view.Buttons is not mutated in
-// place (rows are copied) — the viewer stub may reuse its slices.
-func withDrillDownButton(buttons [][]InlineButton, digestID int64) [][]InlineButton {
-	more := InlineButton{Text: drillDownMoreLabel, Data: cbPrefixL2 + strconv.FormatInt(digestID, 10)}
-	if len(buttons) == 0 {
-		return [][]InlineButton{{more}}
-	}
-	out := make([][]InlineButton, len(buttons))
-	copy(out, buttons)
-	out[0] = append([]InlineButton{more}, out[0]...)
-	return out
+	b.editCallbackMessage(ctx, msg, view.Text, inlineKeyboard(view.Buttons))
 }
 
 // handleDrillDown processes "L2:…" / "L3:…" callbacks through the DrillDown

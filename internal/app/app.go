@@ -37,8 +37,9 @@ func Run(ctx context.Context, cfg *config.Config) error {
 
 	// LLM: BYOK — offline summarizer when no key is configured. Stage 9A:
 	// pipeline потребляет вызов A (ClassifySummarizer); *llm.Client и
-	// *llm.Offline реализуют его (SummarizeTopic в llm/topicdigest.go живёт
-	// до 9D, но в Run больше не подключается).
+	// *llm.Offline реализуют его. Этап 9D-2b: старый TopicSummarizer
+	// (llm/topicdigest.go, Этап 8) удалён — вызов C (AggregateTopic) заменил
+	// его в Run; вызовы C/D подключаются через newAggregators (та же вилка).
 	if cfg.Offline {
 		slog.Info("no LLM API key configured; using offline summarizer")
 	}
@@ -186,11 +187,15 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	// Этап 9B: вызовы E/F и fetcher внешних ссылок — та же offline-вилка, что
 	// и у newSummarizer (паттерн wiring Этапа 9A).
 	linkClassify, linkSummary, linkFetch := newLinkStack(cfg)
+	// Этап 9D-2b: вызовы C/D (агрегация саммари) — та же offline-вилка.
+	topicAgg, overallAgg := newAggregators(cfg)
 	pipeline := &digest.Pipeline{
 		SourceProvider:    sourceProvider,
 		Store:             store,
 		Classify:          summarizer,
 		Dedup:             newDeduper(cfg),
+		Aggregate:         topicAgg,
+		Overall:           overallAgg,
 		LinkClassify:      linkClassify,
 		LinkSummary:       linkSummary,
 		LinkFetch:         linkFetch,
@@ -340,6 +345,20 @@ func newDeduper(cfg *config.Config) llm.Deduper {
 		return llm.NewOffline()
 	}
 	return llm.NewClient(cfg.LLMAPIKey, cfg.LLMBaseURL, cfg.LLMModel, cfg.LLMMaxRetries)
+}
+
+// newAggregators выбирает реализации вызовов C/D (Этап 9D, план §4.7/§4.8):
+// cfg.Offline → детерминированный *llm.Offline (fallback-строки §4.7, без
+// сети), иначе сетевой *llm.Client. Та же offline-вилка и тот же клиент, что
+// у newSummarizer/newDeduper/newLinkStack (паттерн wiring Этапа 9A): один
+// *llm.Client на все вызовы прогона.
+func newAggregators(cfg *config.Config) (llm.TopicAggregator, llm.OverallAggregator) {
+	if cfg.Offline {
+		off := llm.NewOffline()
+		return off, off
+	}
+	cl := llm.NewClient(cfg.LLMAPIKey, cfg.LLMBaseURL, cfg.LLMModel, cfg.LLMMaxRetries)
+	return cl, cl
 }
 
 // newLinkStack — wiring шага 4c (Этап 9B, план §4.3): вызов E (LinkClassifier)

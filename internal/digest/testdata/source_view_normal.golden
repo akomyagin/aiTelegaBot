@@ -1,0 +1,18 @@
+📰 Тема &amp; &lt;1&gt; / Канал &lt;A&gt;
+
+Саммари топика.
+
+• <a href="https://example.com/1">Новость &amp; &lt;1&gt;</a>
+  Саммари первой.
+  ↳ Статья: суть.
+  ↪ <a href="https://example.com/1">перейти</a>
+
+• Без ссылки
+  Без ссылки
+
+• 🎓 Курс: Go — основы
+  ↪ <a href="https://example.com/course">перейти</a>
+
+• 🖼 <a href="https://example.com/p">С фото</a>
+  Фото-пост
+  ↪ <a href="https://example.com/p">перейти</a>
