@@ -1,5 +1,5 @@
 // Тесты вызовов C/D (Этап 9D-1, план 9D тест-кейсы 1–2): httptest-паттерн
-// classify_test.go (chatBody — общий хелпер topicdigest_test.go), fallback'и и
+// classify_test.go (chatBody — общий хелпер helpers_test.go), fallback'и и
 // детерминизм Offline. Транспортная ошибка моделируется HTTP 400 (fatal —
 // техдолг 9A: retry 429/5xx покрыт общими тестами doWithRetry).
 

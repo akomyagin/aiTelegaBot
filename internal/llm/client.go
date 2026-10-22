@@ -168,62 +168,9 @@ func (c *Client) SuggestTopic(ctx context.Context, existing []string, sample []f
 	return "", fmt.Errorf("llm: topic suggestion unparseable after %d attempts: %w", maxParseAttempts, lastErr)
 }
 
-// SummarizeTopic implements TopicSummarizer over the chat-completions API —
-// the SuggestTopic pattern verbatim (plan §4.10 / Stage 8 C): strict JSON
-// {"headline":"…","items":[{"index":1,"summary":"…"}]}; transport/HTTP errors
-// surface immediately (doWithRetry already retried; fatal 400/401 are not
-// re-requested); an unparseable answer triggers exactly ONE repeat; if BOTH
-// answers are unparseable — fallback: Headline = the plain Summarize result,
-// Items empty (L2 then renders from item titles — degradation, not failure).
-// The API key is never logged.
-func (c *Client) SummarizeTopic(ctx context.Context, topicName string, items []feed.Item) (TopicSummary, error) {
-	msgs := buildTopicDigestPrompt(topicName, items)
-	body, err := json.Marshal(chatRequest{
-		Model:       c.model,
-		Messages:    msgs,
-		Temperature: 0.2,
-	})
-	if err != nil {
-		return TopicSummary{}, fmt.Errorf("llm: marshal request: %w", err)
-	}
-
-	url := c.baseURL + "/chat/completions"
-	makeReq := func() (*http.Request, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+c.apiKey) // apiKey never logged
-		return req, nil
-	}
-
-	const maxParseAttempts = 2 // initial request + one repeat on an unparseable answer
-	var lastErr error
-	for attempt := 0; attempt < maxParseAttempts; attempt++ {
-		resp, err := c.doWithRetry(ctx, makeReq)
-		if err != nil {
-			return TopicSummary{}, err
-		}
-		content, err := extractContent(resp)
-		if err != nil {
-			return TopicSummary{}, err
-		}
-		ts, perr := parseTopicSummary(content, len(items))
-		if perr == nil {
-			return ts, nil
-		}
-		lastErr = perr
-		c.log.Warn("llm topic summary unparseable", "attempt", attempt, "err", perr)
-	}
-	// Fallback (§4.10): plain Summarize as the headline, Items stay empty.
-	s, serr := c.Summarize(ctx, items)
-	if serr != nil {
-		return TopicSummary{}, fmt.Errorf("llm: topic summary unparseable after %d attempts (%v); fallback summarize failed: %w",
-			maxParseAttempts, lastErr, serr)
-	}
-	return TopicSummary{Headline: s}, nil
-}
+// SummarizeTopic (TopicSummarizer, Этап 8) УДАЛЁН в 9D-2b: вызов C
+// (AggregateTopic, aggregate.go) заменил его в pipeline.Run — production-
+// вызовов не осталось (пункт E мандата 9D-2b, решение зафиксировано в отчёте).
 
 // extractContent reads the first choice's content from an open chat-completions
 // response and closes the body.

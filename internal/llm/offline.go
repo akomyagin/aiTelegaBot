@@ -58,31 +58,10 @@ func (o *Offline) SuggestTopic(ctx context.Context, existing []string, sample []
 	return "", nil
 }
 
-// SummarizeTopic implements TopicSummarizer offline, deterministically
-// (plan §4.10): Headline — up to 3 first "- <Title>" lines joined by "\n"
-// (input order); Items — the first sentence of Text per item (Title when
-// Text is empty). No time/random/map iteration.
-func (o *Offline) SummarizeTopic(ctx context.Context, topicName string, items []feed.Item) (TopicSummary, error) {
-	_ = ctx
-	_ = topicName
-	const maxHeadlineLines = 3
-	lines := make([]string, 0, maxHeadlineLines)
-	for i, it := range items {
-		if i >= maxHeadlineLines {
-			break
-		}
-		lines = append(lines, "- "+it.Title)
-	}
-	ts := TopicSummary{Headline: strings.Join(lines, "\n")}
-	for i, it := range items {
-		summary := extractLead(it.Text)
-		if summary == "" {
-			summary = it.Title
-		}
-		ts.Items = append(ts.Items, ItemSummary{Index: i + 1, Summary: summary})
-	}
-	return ts, nil
-}
+// SummarizeTopic (TopicSummarizer, Этап 8) УДАЛЁН в 9D-2b: вызов C
+// (AggregateTopic ниже) заменил его в pipeline.Run; паттерн offline-headline
+// «первые ≤3 строки» живёт в firstSummaryLines/degradedTopicAggregate
+// (aggregate.go) и в digest.fallbackHeadline (пункт E мандата 9D-2b).
 
 // ClassifySummarize implements ClassifySummarizer offline (план §4.1):
 // детерминированная деградация без сети — все элементы class=other (реклама

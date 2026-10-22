@@ -21,9 +21,11 @@ package digest
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/akomyagin/aiTelegaBot/internal/feed"
@@ -61,6 +63,19 @@ type Pipeline struct {
 	// (обратная совместимость с pipeline-тестами 9A/9B). Ошибка B — деградация
 	// (log.Warn + все primary), тема НЕ пропускается — в отличие от ошибки A.
 	Dedup llm.Deduper
+	// Aggregate — вызов C плана §4.8 (headline темы + саммари топиков, Этап
+	// 9D, шаг 4d). Нил-сейв: nil → вызов C пропускается, headline пуст
+	// (fallback-ветка RenderTopicBody с заголовками элементов — байт-в-байт
+	// тело темы 9A–9C), sections_json пуст. ОШИБКА ТРАНСПОРТА C — НЕ пропуск
+	// темы (в отличие от ошибки A): headline = fallback из первых ≤3 саммари
+	// списком «- …» (§4.7, тест-кейс 8 подэтапа 9D), sections пусты.
+	Aggregate llm.TopicAggregator
+	// Overall — вызов D плана §4.8 (общее саммари выпуска, шаг 6, ОДИН на
+	// прогон). Нил-сейв: nil → TOC без overall-блока (поведение 9A–9C). Сбой
+	// (error ИЛИ пустой summary) — log-only деградация: строка runs.summary
+	// НЕ пишется, TOC доставляется без общего саммари, Run продолжается
+	// (§4.8.1 шаг 6 — деградация, не ошибка).
+	Overall llm.OverallAggregator
 	// LinkPerMessageMax — ≤N ссылок на сообщение (LINK_PER_MESSAGE_MAX,
 	// дефолт 5); LinkFetchTotalMax — бюджет fetch'ей ОБЩИЙ НА ПРОГОН
 	// (LINK_FETCH_TOTAL_MAX, дефолт 30); сверх бюджета ссылки остаются в
@@ -273,7 +288,8 @@ func (p *Pipeline) Run(ctx context.Context) error {
 	linkFetchBudget := p.LinkFetchTotalMax
 	var pending []pendingTopic
 	entries := make([]TOCEntry, 0, len(topicIDs))
-	var droppedKeys []string // ad + персистентные дубли (seen ДО доставки)
+	headlines := make([]string, 0, len(topicIDs)) // параллельно entries — вход вызова D
+	var droppedKeys []string                      // ad + персистентные дубли (seen ДО доставки)
 	failed := 0
 	for _, tid := range topicIDs {
 		topicItems := groups[tid]
@@ -559,18 +575,40 @@ func (p *Pipeline) Run(ctx context.Context) error {
 		// Любая ошибка E/fetch/F — деградация (log.Warn), тема НЕ пропускается.
 		p.processTopicLinks(ctx, kept, &linkFetchBudget)
 
-		// Fallback titles (C1 отклонение 2): в 9A headline-вызова нет (вызов C
-		// и полная агрегация — в 9D), тело темы рендерится существующей
-		// fallback-веткой RenderTopicBody с пустым Headline (решение
-		// диспетчера, отчёт 9A-2).
+		// 4d (Этап 9D, план §4.8.1 шаг 4 позиция d): вызов C — headline темы
+		// + саммари топиков из саммари kept-элементов (primary-не-ad),
+		// сгруппированных по source_id В ПОРЯДКЕ COLLECT (первое появление;
+		// никакой map-итерации в промпт — §6, механика 9D строки 960–963).
+		// Саммари — из message_state/вызова A (поле kept.summary; после шага
+		// 4c оно включает ↳-добавки ссылок — план ставит 4d ПОСЛЕ 4c).
+		// Ошибка транспорта → тема НЕ пропускается: fallback-headline
+		// (первые ≤3 саммари списком «- …», паттерн offline-строки §4.7),
+		// sections пусты (L1 деградирует на строки без саммари топиков).
+		blocks := sourceBlocksFromKept(kept)
+		var headline, sectionsJSON string
+		if p.Aggregate != nil {
+			agg, aerr := p.Aggregate.AggregateTopic(ctx, name, blocks)
+			if aerr != nil {
+				log.Error("topic aggregation failed; fallback headline",
+					"topic_id", tid, "err", aerr)
+				headline = fallbackHeadline(kept)
+			} else {
+				headline = agg.Headline
+				sectionsJSON = topicSectionsJSON(blocks, agg.Sections)
+			}
+		}
+
+		// Fallback titles (C1 отклонение 2): сохраняются для ПУСТОГО headline
+		// (Aggregate не подключён или вернул пустую строку) — fallback-ветка
+		// RenderTopicBody с буллетами первых заголовков.
 		limit := min(len(kept), 10)
 		fallbackTitles := make([]string, 0, limit)
 		for _, k := range kept[:limit] {
 			fallbackTitles = append(fallbackTitles, k.it.Title)
 		}
-		body := RenderTopicBody(name, "", len(kept), now, fallbackTitles...)
+		body := RenderTopicBody(name, headline, len(kept), now, fallbackTitles...)
 
-		digestID, err := p.Store.InsertDigest(ctx, runID, tid, body, len(kept), "")
+		digestID, err := p.Store.InsertDigest(ctx, runID, tid, body, len(kept), sectionsJSON)
 		if err != nil {
 			log.Error("insert digest failed; topic skipped", "topic_id", tid, "err", err)
 			failed++
@@ -584,6 +622,7 @@ func (p *Pipeline) Run(ctx context.Context) error {
 		entries = append(entries, TOCEntry{
 			DigestID: digestID, TopicName: name, ItemCount: len(kept),
 		})
+		headlines = append(headlines, headline)
 	}
 
 	// Реклама и персистентные дубли (dropped_dup) получают seen СРАЗУ
@@ -614,10 +653,40 @@ func (p *Pipeline) Run(ctx context.Context) error {
 		return nil
 	}
 
+	// 6 (Этап 9D, план §4.8.1 шаг 6): вызов D — общее саммари выпуска из
+	// headline'ов тем (порядок = порядок entries), ОДИН на прогон, после всех
+	// тем и ДО доставки. Сбой D (error ИЛИ пустой summary) — log-only:
+	// overall="", TOC без общего саммари, Run продолжается (деградация, не
+	// ошибка). РЕШЕНИЕ 9D-2b: строка runs.summary пишется ТОЛЬКО при непустом
+	// summary — при сбое строки НЕТ (viewer TOC: нет строки → overall-блок
+	// отсутствует; GetRunSummary-промах и пустая строка различимы в логах).
+	var overall string
+	if p.Overall != nil {
+		ots := make([]llm.OverallTopic, 0, len(entries))
+		for i, e := range entries {
+			ots = append(ots, llm.OverallTopic{
+				Name: e.TopicName, ItemCount: e.ItemCount, Headline: headlines[i],
+			})
+		}
+		s, oerr := p.Overall.AggregateOverall(ctx, ots)
+		switch {
+		case oerr != nil:
+			log.Error("overall aggregation failed; TOC without overall",
+				"run_id", runID, "err", oerr)
+		case strings.TrimSpace(s) == "":
+			log.Warn("overall summary empty; TOC without overall", "run_id", runID)
+		default:
+			overall = s
+			if uerr := p.Store.UpsertRunSummary(ctx, runID, overall); uerr != nil {
+				log.Error("upsert run summary failed", "run_id", runID, "err", uerr)
+			}
+		}
+	}
+
 	// 7. Deliver ONE TOC message with per-topic «Открыть» buttons. Delivery
 	// error → run error: all rows stay delivered=0, items unseen, slot
 	// unmarked — the next run rebuilds the TOC.
-	text := RenderTOC(entries, now.Format("02 Jan 2006"))
+	text := RenderTOC(entries, now.Format("02 Jan 2006"), overall)
 	buttons := TOCButtons(entries)
 	if err := p.Poster.DeliverWithButtons(ctx, p.ChatID, text, buttons); err != nil {
 		return fmt.Errorf("deliver toc: %w", err)
@@ -672,4 +741,89 @@ func (t taggedSource) Collect(ctx context.Context) ([]feed.Item, error) {
 		stamped[i].TopicID = t.topicID
 	}
 	return stamped, err
+}
+
+// sourceBlocksFromKept (шаг 4d, Этап 9D) группирует kept-элементы темы по
+// source_id для входа вызова C. ДЕТЕРМИНИРОВАННО: блоки — в порядке ПЕРВОГО
+// появления source_id в срезе kept (порядок collect), саммари внутри блока —
+// в порядке collect; map используется только для точечного lookup, никогда
+// для итерации в промпт (§6, механика 9D). Name — поле Source первого
+// элемента группы (имя источника из collect).
+func sourceBlocksFromKept(kept []keptItem) []llm.SourceBlock {
+	pos := make(map[int64]int, len(kept))
+	blocks := make([]llm.SourceBlock, 0, len(kept))
+	for _, k := range kept {
+		sid := k.it.SourceID
+		if i, ok := pos[sid]; ok {
+			blocks[i].Summaries = append(blocks[i].Summaries, k.summary)
+			continue
+		}
+		pos[sid] = len(blocks)
+		blocks = append(blocks, llm.SourceBlock{
+			SourceID:  sid,
+			Name:      k.it.Source,
+			Summaries: []string{k.summary},
+		})
+	}
+	return blocks
+}
+
+// fallbackHeadline — детерминированный fallback вызова C при ошибке
+// транспорта (тест-кейс 8 подэтапа 9D): первые ≤3 непустых саммари темы
+// списком «- …» в порядке collect — паттерн offline-строки §4.7 и
+// llm.degradedTopicAggregate (двойной мусор). Пусто при отсутствии саммари —
+// RenderTopicBody деградирует на буллеты заголовков.
+func fallbackHeadline(kept []keptItem) string {
+	const maxLines = 3 // aggregateFallbackLines в llm (§4.7: первые ≤3 строки)
+	lines := make([]string, 0, maxLines)
+	for _, k := range kept {
+		if len(lines) >= maxLines {
+			break
+		}
+		if s := strings.TrimSpace(k.summary); s != "" {
+			lines = append(lines, "- "+s)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// topicSection — элемент digests.sections_json (миграция v6): формат
+// [{"source_id":N,"summary":"…"}], совместимый с ParseTopicSections
+// (контракт 9D-2a заморожен — порядок ключей в объекте не значим).
+type topicSection struct {
+	SourceID int64  `json:"source_id"`
+	Summary  string `json:"summary"`
+}
+
+// topicSectionsJSON сериализует саммари топиков вызова C в sections_json.
+// Порядок массива = порядок COLLECT (порядок blocks), а не порядок ответа
+// LLM — контракт 9D-2a; дубль source_id → первый выигрыш, пустой summary →
+// секции нет (паттерн parseAggregateTopic). Пустой результат → "" (пустая
+// строка = «секций нет» для ParseTopicSections; [] не пишем).
+func topicSectionsJSON(blocks []llm.SourceBlock, sections []llm.TopicHeadline) string {
+	bySource := make(map[int64]string, len(sections))
+	for _, s := range sections {
+		sum := strings.TrimSpace(s.Summary)
+		if sum == "" {
+			continue
+		}
+		if _, dup := bySource[s.SourceID]; dup {
+			continue
+		}
+		bySource[s.SourceID] = sum
+	}
+	out := make([]topicSection, 0, len(bySource))
+	for _, b := range blocks {
+		if sum, ok := bySource[b.SourceID]; ok {
+			out = append(out, topicSection{SourceID: b.SourceID, Summary: sum})
+		}
+	}
+	if len(out) == 0 {
+		return ""
+	}
+	data, err := json.Marshal(out)
+	if err != nil {
+		return "" // недостижимо для string-полей; защитная деградация, не ошибка
+	}
+	return string(data)
 }
