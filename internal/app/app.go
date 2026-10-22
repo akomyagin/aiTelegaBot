@@ -201,6 +201,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		LinkFetch:         linkFetch,
 		LinkPerMessageMax: cfg.LinkPerMessageMax,
 		LinkFetchTotalMax: cfg.LinkFetchTotalMax,
+		MediaReuploadMax:  cfg.MTMediaReuploadMax, // подэтап 9E: бюджет re-upload'ов (MT_MEDIA_REUPLOAD_MAX)
 		ChatID:            cfg.TelegramChatID,
 	}
 
@@ -292,6 +293,17 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		return err
 	}
 	pipeline.Poster = bot
+	// Подэтап 9E (план §4.5.1): боевой media-resolver проводится ТОЛЬКО когда
+	// есть и MTProto-клиент (download), и бот (re-upload + deleteMessage
+	// служебного сообщения). Без любого из них Media остаётся nil → шаг медиа
+	// в pipeline работает как no-op (медиа только от источников — botapi
+	// file_id / URL; first-class деградация, как /dialogs без MTProto).
+	// *telegram.Bot удовлетворяет mtproto.PhotoUploader СТРУКТУРНО: mtproto
+	// НЕ импортирует telegram (обратный импорт был бы циклом) — инверсия
+	// зависимости, тот же паттерн, что у PeerCache.
+	if mtClient != nil {
+		pipeline.Media = mtproto.NewMediaResolver(mtClient, bot, slog.Default())
+	}
 
 	// Bridge SQLite meta to the scheduler for slot idempotency across restarts.
 	getSlot := func(ctx context.Context) (string, error) {

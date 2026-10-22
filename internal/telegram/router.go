@@ -65,6 +65,16 @@ func (b *Bot) handleUpdate(ctx context.Context, api *bot.Bot, u *models.Update) 
 			key = strconv.FormatInt(post.Chat.ID, 10)
 		}
 		item := channelPostToItem(key, username, post.ID, post.Text, int64(post.Date))
+		// Медиа (plan §4.5, Stage 9E): из ChannelPost.Photo берём largest-size
+		// file_id. Альбом (MediaGroupID ≠ "") — фото несёт только ПЕРВЫЙ пост
+		// группы: последующие посты той же группы идут с пустыми медиа-полями,
+		// детектор «первый» — seen-множество ChannelBuffer (см.
+		// MarkMediaGroupFirst: апдейты батча обрабатываются последовательно).
+		if fileID := largestPhotoFileID(post.Photo); fileID != "" &&
+			(post.MediaGroupID == "" || b.channelBuf.MarkMediaGroupFirst(post.MediaGroupID)) {
+			item.MediaKind = "photo"
+			item.MediaFileID = fileID
+		}
 		b.channelBuf.Push(key, item)
 		return
 	}

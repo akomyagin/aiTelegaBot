@@ -41,6 +41,32 @@ type MessagePoster interface {
 		buttons [][]telegram.InlineButton) error
 }
 
+// MediaResolver — шаг медиа подэтапа 9E (план §4.5.1/§4.8.1 шаг 4 между c и
+// d). ДВЕ реализации оправдывают интерфейс (правило «на второй реализации»):
+// боевая *mtproto.MediaResolver (download → re-upload ботом → file_id) и
+// no-op (offline / нет MTProto — поле Media == nil, шаг только разносит медиа,
+// которое принёс источник).
+//
+// Контракт: Resolve заполняет MediaFileID IN PLACE у элементов items (копия
+// среза kept темы — pipeline копирует результат обратно) — для tg_mtproto-
+// элементов с MediaKind="photo" и пустым media-полем; кеш message_state
+// проверяет PIPELINE до вызова (закешированный элемент приходит уже с
+// MediaFileID, resolver его пропускает — download не вызывается). budget —
+// оставшийся лимит re-upload'ов ЭТОГО прогона; возвращает использованное
+// количество (pipeline уменьшает общий счётчик).
+//
+// ОТКЛОНЕНИЕ от эскиза плана (строка 1090: `Resolve(ctx, items, states)`),
+// зафиксировано в отчёте 9E-2b: (а) параметра states нет — чтение кеша
+// message_state и ВСЮ запись file_id в storage владеет pipeline (один
+// владелец storage; mtproto не импортирует storage — та же инверсия, что у
+// PeerCache); (б) добавлены budget/used — план §4.8.1 требует «лимит 3/прогон
+// ОБЩИЙ на run (счётчик в pipeline)», а шаг вызывается на тему, поэтому
+// счётчик не может жить внутри одного вызова Resolve (паттерн
+// LinkFetchTotalMax/processTopicLinks).
+type MediaResolver interface {
+	Resolve(ctx context.Context, items []feed.Item, budget int) (used int, err error)
+}
+
 // Pipeline holds the dependencies for one digest run.
 type Pipeline struct {
 	// SourceProvider returns the tracked source set for THIS run. It is called
@@ -83,10 +109,18 @@ type Pipeline struct {
 	// item_links без саммари (деградация, не ошибка).
 	LinkPerMessageMax int
 	LinkFetchTotalMax int
-	Poster            MessagePoster
-	ChatID            string
-	Log               *slog.Logger     // optional; defaults to slog.Default()
-	Now               func() time.Time // optional; defaults to time.Now (for tests)
+	// Media — шаг медиа (подэтап 9E, план §4.8.1 шаг 4 между c и d).
+	// Нил-сейв: nil (offline / нет MTProto-клиента или бота — app.go не
+	// проводит resolver) → Resolve не вызывается, поведение Run не отличается
+	// от 9A–9D. MediaReuploadMax — бюджет re-upload'ов ОБЩИЙ НА ПРОГОН
+	// (MT_MEDIA_REUPLOAD_MAX, дефолт 3); ≤0 → resolver не вызывается даже при
+	// непустом Media (страховка вручную собранного Pipeline).
+	Media            MediaResolver
+	MediaReuploadMax int
+	Poster           MessagePoster
+	ChatID           string
+	Log              *slog.Logger     // optional; defaults to slog.Default()
+	Now              func() time.Time // optional; defaults to time.Now (for tests)
 }
 
 // log returns the configured logger or the default.
@@ -287,6 +321,11 @@ func (p *Pipeline) Run(ctx context.Context) error {
 	// ≤LinkFetchTotalMax GET'ов; темы обрабатываются последовательно —
 	// гонки нет, указатель передаётся в processTopicLinks).
 	linkFetchBudget := p.LinkFetchTotalMax
+	// mediaBudget — счётчик re-upload'ов шага 4c-bis, ОБЩИЙ НА ПРОГОН (план
+	// §4.8.1: «лимит 3/прогон общий на run (счётчик в pipeline)»; темы
+	// обрабатываются последовательно — гонки нет, передача указателем как у
+	// linkFetchBudget).
+	mediaBudget := p.MediaReuploadMax
 	var pending []pendingTopic
 	entries := make([]TOCEntry, 0, len(topicIDs))
 	headlines := make([]string, 0, len(topicIDs)) // параллельно entries — вход вызова D
@@ -576,6 +615,13 @@ func (p *Pipeline) Run(ctx context.Context) error {
 		// Любая ошибка E/fetch/F — деградация (log.Warn), тема НЕ пропускается.
 		p.processTopicLinks(ctx, kept, &linkFetchBudget)
 
+		// 4c-bis (подэтап 9E, план §4.8.1 шаг 4 между c и d): медиа — кеш
+		// message_state → Media-resolver (бюджет общий на прогон) →
+		// media_kind/media_ref в message_state (батч Upsert) и в digest_items
+		// (через NewDigestItem ниже — per-run снапшот, навигация P: читает
+		// digest_items). Ошибка — деградация, тема НЕ пропускается (§4.5.1).
+		p.processTopicMedia(ctx, kept, states, &mediaBudget)
+
 		// 4d (Этап 9D, план §4.8.1 шаг 4 позиция d): вызов C — headline темы
 		// + саммари топиков из саммари kept-элементов (primary-не-ad),
 		// сгруппированных по source_id В ПОРЯДКЕ COLLECT (первое появление;
@@ -827,4 +873,121 @@ func topicSectionsJSON(blocks []llm.SourceBlock, sections []llm.TopicHeadline) s
 		return "" // недостижимо для string-полей; защитная деградация, не ошибка
 	}
 	return string(data)
+}
+
+// processTopicMedia — шаг 4c-bis (подэтап 9E, план §4.8.1 шаг 4 между c и d):
+// (1) кеш message_state — tg_mtproto-элемент с MediaKind≠” и пустым ref
+// берёт file_id из кеша (download НЕ вызывается — «кеш по dedup_key:
+// re-upload не повторяется между прогонами», §4.5); (2) элементы без кеша →
+// Media.Resolve (download → re-upload ботом → file_id), бюджет ОБЩИЙ на
+// прогон; (3) результат пишется в message_state (батч Upsert — существующий
+// паттерн) И попадает в digest_items через NewDigestItem (per-run снапшот —
+// навигация P: читает digest_items, §4.5).
+//
+// ВЛАДЕЛЕЦ ЗАПИСИ В STORAGE — pipeline, не resolver: states/батчи уже живут
+// здесь, resolver остаётся чистой сетевой операцией (проще фейкать, нет
+// дублирования транзакционного паттерна). Порядок обработки — порядок collect
+// (§6, никакой map-итерации). Любая ошибка — деградация (log), тема НЕ
+// пропускается (§4.5.1).
+func (p *Pipeline) processTopicMedia(ctx context.Context, kept []keptItem,
+	states map[string]storage.MessageState, budget *int) {
+	log := p.log()
+
+	// (1) Кеш: file_id из message_state → в элемент. Только tg_mtproto без
+	// ref: у botapi/public/rss медиа-поля заполнил источник, а их media_ref в
+	// кеше может быть URL — перезапись MediaFileID исказила бы приоритет.
+	needResolve := false
+	for i := range kept {
+		it := &kept[i].it
+		if it.MediaKind == "" || it.Kind != "tg_mtproto" {
+			continue
+		}
+		if it.MediaFileID != "" || it.MediaURL != "" {
+			continue
+		}
+		if st, ok := states[it.DedupKey()]; ok && st.MediaRef != "" {
+			it.MediaFileID = st.MediaRef // кеш-попадание: download не вызывается
+			continue
+		}
+		needResolve = true
+	}
+
+	// (2) Resolver: только при незакрытом кеше, подключённом Media и живом
+	// бюджете. Элементы передаются КОПИЕЙ среза (контракт Resolve — мутация
+	// in-place), результат копируется обратно в kept.
+	if needResolve && p.Media != nil {
+		if *budget <= 0 {
+			// Бюджет прогона исчерпан предыдущими темами — Resolve не
+			// вызывается (нечего тратить), деградация видна в логе (§4.5.1).
+			log.Info("media step: re-upload budget exhausted; topic items stay without photo",
+				"budget", *budget)
+		} else {
+			items := make([]feed.Item, len(kept))
+			for i := range kept {
+				items[i] = kept[i].it
+			}
+			used, err := p.Media.Resolve(ctx, items, *budget)
+			*budget -= used
+			if err != nil {
+				// Боевой resolver деградирует без error; ветка — защита от
+				// третьей реализации (прогон жив в любом случае, §4.5.1).
+				log.Warn("media resolve failed; items stay without photo", "err", err)
+			}
+			for i := range kept {
+				kept[i].it.MediaFileID = items[i].MediaFileID
+			}
+		}
+	}
+
+	// (3) message_state: media_kind/media_ref (file_id приоритетнее URL —
+	// §4.5). Пишутся ТОЛЬКО строки, которые уже есть в states (кеш прошлых
+	// прогонов или A-батч этого): у degraded-элементов строки нет и не
+	// появится — деградация не фиксируется навсегда (§4.9). Неизменённые
+	// строки не перезаписываются (updated_at не шумит). Принятый риск (ревью
+	// 9E, фикс 3): строки здесь СОЗНАТЕЛЬНО не создаём (созданием владеет
+	// A-батч) → если A-батч упал, mtproto-фото будет повторно re-upload'иться
+	// каждый прогон (в пределах бюджета), пока A-батч не запишет строку.
+	var batch []storage.MessageState
+	for i := range kept {
+		it := kept[i].it
+		if it.MediaKind == "" {
+			continue
+		}
+		ref := it.MediaFileID
+		if ref == "" {
+			ref = it.MediaURL
+		}
+		if ref == "" {
+			continue // resolver не смог / бюджет исчерпан → элемент без медиа
+		}
+		key := it.DedupKey()
+		st, ok := states[key]
+		if !ok {
+			// ref здесь гарантированно непустой (проверка выше) — свежее медиа
+			// не кешируется: log вместо молчаливого skip (ревью 9E, фикс 3).
+			log.Warn("media cache write skipped: no message_state row", "dedup_key", key)
+			continue
+		}
+		if st.MediaKind == it.MediaKind && st.MediaRef == ref {
+			continue
+		}
+		st.MediaKind = it.MediaKind
+		st.MediaRef = ref
+		batch = append(batch, st)
+	}
+	if len(batch) == 0 {
+		return
+	}
+	if err := p.Store.UpsertMessageState(ctx, batch); err != nil {
+		// Кеш медиа не записался — следующий прогон повторит (для mtproto —
+		// в пределах бюджета); digest_items ЭТОГО прогона уже не страдают:
+		// снапшот пишется из kept, не из message_state.
+		log.Error("cache media message_state failed", "items", len(batch), "err", err)
+		return
+	}
+	// Write-back в states ТОЛЬКО по записанным строкам (L7-паттерн A/B-батчей):
+	// кросс-топик дубль dedup_key в том же прогоне видит медиа из кеша.
+	for _, st := range batch {
+		states[st.DedupKey] = st
+	}
 }

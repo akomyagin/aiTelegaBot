@@ -2,8 +2,9 @@
 // seam telegram.WithDrillDown разбирает СЫРОЙ callback_data —
 // «S:<digestID>:<sourceID>» (топик, sourceID=0 → все топики одним списком с
 // подзаголовками), «M:<digestItemID>» (сообщение), «P:<digestItemID>» (фото —
-// в 9D заглушка: ack «Медиа недоступно», sendPhoto в 9E) и «PDEL» (закрыть
-// фото — в 9D ack-only, deleteMessage в 9E), ПЛЮС legacy-alias'ы кнопок СТАРЫХ
+// Этап 9E: CallbackResult{Send} → sendPhoto в owner-чат) и «PDEL» (закрыть
+// фото — в проде перехватывает telegram-диспетчер; здесь защита прямых
+// вызовов, ack-only), ПЛЮС legacy-alias'ы кнопок СТАРЫХ
 // доставленных сообщений: «L2:<digestID>» → как «T:<digestID>» (ближайший
 // новый аналог — RenderTopicView), «L3:<digestID>:<sourceID>» →
 // «S:<digestID>:<sourceID>» (включая sourceID=0). «L1:» в seam не попадает —
@@ -32,10 +33,19 @@ import (
 const (
 	// drillBackLabel — кнопка «◀ Назад» (используется и render_nav.go).
 	drillBackLabel = "◀ Назад"
-	// mediaUnavailableAck — 9D-заглушка «P:» (план 9D: фото отправляется в
-	// 9E); совпадает с telegram.photoUnavailableText (дублирование сознательное:
-	// telegram обрабатывает «P:» до seam'а, seam — защита для прямых вызовов).
-	mediaUnavailableAck = "Медиа недоступно"
+	// Этап 9E (план §4.5.2): фото-сообщение «P:» — лейбл «✖ Закрыть»
+	// (callback_data «PDEL» = 4 байта ≤ 64) и рунные верхние капы компонентов
+	// caption (первая ступень ДО байтового ужатия). Caption —
+	// «<b>title</b>\n<summary>\n↪ <a href>источник</a>», жёсткий лимит Bot API
+	// 1024 БАЙТА — telegram.PhotoCaptionMaxBytes (единственная константа,
+	// ревью 9E фикс 8); гарантируется НЕ финальной байтовой резкой готового
+	// HTML (рвёт сущности/теги), а ужатием компонентов ДО сборки
+	// (photoCaption): EscapeHTML РАСТЯГИВАЕТ текст (& → &amp;, до 5x),
+	// поэтому бюджет считается по байтам ЭСКЕЙПНУТОГО фрагмента.
+	photoCloseLabel          = "✖ Закрыть"
+	photoDeleteCallbackData  = "PDEL"
+	photoCaptionTitleRunes   = 120
+	photoCaptionSummaryRunes = 200
 )
 
 // parseSourceData разбирает «<prefix><digestID>:<sourceID>» для «S:» и legacy
@@ -112,15 +122,19 @@ func NewDrillDown(store storage.Store, sources func(ctx context.Context) ([]stor
 			}
 			return drillMessageView(ctx, store, id)
 		case strings.HasPrefix(data, "P:"):
-			// 9D-заглушка (план 9D): фото отправляется в 9E — только ack, БЕЗ
-			// edit. id валидируем для единой семантики мусора (error → ack
-			// «Не получилось открыть»), но от ответа он не зависит.
-			if _, err := parseMessageData(data, "P:"); err != nil {
+			// Этап 9E (план §4.5.2): фото материала — отдельное sendPhoto-
+			// сообщение (CallbackResult.Send); 9D-заглушка «Медиа недоступно»
+			// удалена (осознанная смена контракта 9E).
+			id, err := parseMessageData(data, "P:")
+			if err != nil {
 				return nil, err
 			}
-			return &telegram.CallbackResult{AckText: mediaUnavailableAck}, nil
-		case data == "PDEL":
-			// 9E удалит сообщение фото (CallbackResult.Send); в 9D — ack-only.
+			return drillPhotoSend(ctx, store, id)
+		case data == photoDeleteCallbackData:
+			// Защита прямых вызовов seam'а (как в 9D): в проде «PDEL»
+			// перехватывает telegram-диспетчер РАНЬШЕ seam'а (handlePhotoDelete:
+			// deleteMessage того же сообщения + ack, аргументов нет) — эта
+			// ветка недостижима и остаётся ack-only.
 			return &telegram.CallbackResult{}, nil
 		case strings.HasPrefix(data, "L2:"):
 			// Legacy alias §4.6: «L2:<did>» → как «T:<did>» (ближайший новый
@@ -464,4 +478,135 @@ func fitDrillDownList(header string, blocks []string, sep string) string {
 		return header
 	}
 	return string(r[:maxBodyRunes-1]) + "…"
+}
+
+// drillPhotoSend — «P:<itemID>» (Этап 9E, план §4.5.2): тот же storage-запрос,
+// что у M:-view (GetDigestItem), media_ref=” (или item не найден) → error —
+// telegram-диспетчер ack'ит «Не получилось открыть» (существующая семантика
+// ошибки DrillDown; «🖼 Фото» без media_ref не рендерится, но crafted-callback
+// и гонка с миграцией возможны). Иначе — CallbackResult{Send}: sendPhoto в
+// owner-чат (сторона telegram), caption «<b>title</b>\n<summary>\n↪ <a
+// href="LINK">источник</a>» (≤1024 байт), клавиатура — «✖ Закрыть» PDEL.
+func drillPhotoSend(ctx context.Context, store storage.Store, itemID int64) (*telegram.CallbackResult, error) {
+	it, ok, err := store.GetDigestItem(ctx, itemID)
+	if err != nil {
+		return nil, fmt.Errorf("drill-down: GetDigestItem(%d): %w", itemID, err)
+	}
+	if !ok {
+		return nil, fmt.Errorf("drill-down: digest item %d не существует", itemID)
+	}
+	if strings.TrimSpace(it.MediaRef) == "" {
+		return nil, fmt.Errorf("drill-down: digest item %d: media_ref пуст", itemID)
+	}
+	return &telegram.CallbackResult{Send: &telegram.SendAction{
+		PhotoMediaRef: it.MediaRef,
+		PhotoCaption:  photoCaption(it),
+		PhotoButtons: [][]telegram.InlineButton{
+			{{Text: photoCloseLabel, Data: photoDeleteCallbackData}},
+		},
+	}}, nil
+}
+
+// photoCaption — caption фото-сообщения (план §4.5.2/9E): «<b>title</b>\n
+// <summary ≤200 рун>\n↪ <a href="LINK">источник</a>». ГАРАНТИЯ (ревью 9E,
+// фикс 1): результат ВСЕГДА well-formed HTML ≤1024 байт
+// (telegram.PhotoCaptionMaxBytes) — компоненты ужимаются КАК PLAIN TEXT ДО
+// сборки и только потом EscapeHTML; байтовая резка готового HTML (старый
+// truncateToBytes) рвала «<a href="…» и сущности → Telegram 400 «can't parse
+// entities». href — l3Link (только http/https, кавычка отвергнута, fallback
+// t.me deep link; пуст → строка «↪» не рендерится). Приоритет ужатия при
+// переполнении: (1) summary, (2) title — оба по байтам ЭСКЕЙПНУТОГО
+// фрагмента с «…» на границе рун, (3) ОТБРОСИТЬ строку «↪ <a …>источник</a>»
+// ЦЕЛИКОМ (обрезанный URL — битая ссылка) с пережатием title/summary в
+// освободившийся бюджет. Порядок компонентов не меняется.
+func photoCaption(it storage.DigestItem) string {
+	title := strings.TrimSpace(it.Title)
+	if title == "" {
+		title = "(без заголовка)" // паттерн RenderMessageView
+	}
+	title = navTruncateTitle(title, photoCaptionTitleRunes)
+	summary := truncateRunes(strings.TrimSpace(it.Summary), photoCaptionSummaryRunes)
+	srcLine := ""
+	if link := l3Link(it); link != "" {
+		srcLine = "\n↪ <a href=\"" + link + "\">источник</a>"
+	}
+	cap := buildPhotoCaption(title, summary, srcLine, true)
+	if len(cap) > telegram.PhotoCaptionMaxBytes {
+		// (3): строка источника не влезает даже после ужатия title/summary —
+		// отбрасываем её целиком и пережимаем компоненты в полный бюджет.
+		cap = buildPhotoCaption(title, summary, "", false)
+	}
+	return cap
+}
+
+// buildPhotoCaption собирает caption из plain-text компонентов: title/summary
+// ужимаются fitEscapedBytes в оставшийся бюджет (БАЙТЫ эскейпнутого
+// фрагмента), srcLine — готовый фрагмент (l3Link уже экранирован/валидирован,
+// резать его нельзя — битый URL). withSrc=false → srcLine игнорируется.
+// Результат ≤PhotoCaptionMaxBytes и well-formed: теги добавляются ПОСЛЕ
+// ужатия, сущности не режутся (резка по plain text до EscapeHTML).
+func buildPhotoCaption(title, summary, srcLine string, withSrc bool) string {
+	const fixed = len("<b>") + len("</b>")
+	src := 0
+	if withSrc {
+		src = len(srcLine)
+	}
+	escTitle := telegram.EscapeHTML(title)
+	escSummary := ""
+	if summary != "" {
+		// (1) summary: бюджет — что осталось после title и srcLine.
+		budget := telegram.PhotoCaptionMaxBytes - fixed - len(escTitle) - len("\n") - src
+		if budget >= len("…") {
+			escSummary = telegram.EscapeHTML(fitEscapedBytes(summary, budget))
+		}
+	}
+	sumPart := 0
+	if escSummary != "" {
+		sumPart = len("\n") + len(escSummary)
+	}
+	// (2) title: бюджет — что осталось после summary и srcLine.
+	if budget := telegram.PhotoCaptionMaxBytes - fixed - sumPart - src; len(escTitle) > budget {
+		escTitle = telegram.EscapeHTML(fitEscapedBytes(title, budget))
+	}
+	var b strings.Builder
+	b.WriteString("<b>")
+	b.WriteString(escTitle)
+	b.WriteString("</b>")
+	if escSummary != "" {
+		b.WriteString("\n")
+		b.WriteString(escSummary)
+	}
+	if withSrc {
+		b.WriteString(srcLine)
+	}
+	return b.String()
+}
+
+// fitEscapedBytes ужимает s (plain text) до len(EscapeHTML(результата)) ≤
+// budget: бинарный поиск по рунам (длина эскейпнутого префикса монотонна —
+// детерминированно terminates), при обрезке добавляется «…» (EscapeHTML её
+// не экранирует, входит в бюджет). Даже одна руна с «…» не влезает → ""
+// (компонент отброшен). Резка ДО эскейпа — сущность «&amp;» не рвётся.
+func fitEscapedBytes(s string, budget int) string {
+	if budget < len("…") {
+		return ""
+	}
+	if len(telegram.EscapeHTML(s)) <= budget {
+		return s // в лимит уже укладывается — резать нечего
+	}
+	runes := []rune(s)
+	lo, hi, best := 0, len(runes), -1
+	for lo <= hi {
+		mid := (lo + hi) / 2
+		if len(telegram.EscapeHTML(string(runes[:mid])))+len("…") <= budget {
+			best = mid
+			lo = mid + 1
+		} else {
+			hi = mid - 1
+		}
+	}
+	if best < 0 {
+		return ""
+	}
+	return string(runes[:best]) + "…"
 }

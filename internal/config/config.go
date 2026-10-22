@@ -58,6 +58,10 @@ type Config struct {
 	LinkPerMessageMax int           // env LINK_PER_MESSAGE_MAX, default 5, >0
 	LinkFetchTotalMax int           // env LINK_FETCH_TOTAL_MAX, default 30, >0
 
+	// MTProto-медиа (подэтап 9E, план §4.5.1): лимит re-upload'ов фото
+	// приватных каналов на прогон (download → re-upload ботом → file_id).
+	MTMediaReuploadMax int // env MT_MEDIA_REUPLOAD_MAX, default 3, >0
+
 	// Scheduling.
 	DigestTime string // daily slot, e.g. "09:00"
 	Timezone   string // IANA TZ, e.g. "Europe/Moscow"
@@ -100,6 +104,9 @@ func Load() (*Config, error) {
 		LinkFetchMaxBytes: parseInt64Or(os.Getenv("LINK_FETCH_MAX_BYTES"), 2<<20),
 		LinkPerMessageMax: parsePositiveIntOr(os.Getenv("LINK_PER_MESSAGE_MAX"), 5),
 		LinkFetchTotalMax: parsePositiveIntOr(os.Getenv("LINK_FETCH_TOTAL_MAX"), 30),
+
+		// Подэтап 9E (план §4.5.1): лимит re-upload'ов MTProto-медиа на прогон.
+		MTMediaReuploadMax: parsePositiveIntOr(os.Getenv("MT_MEDIA_REUPLOAD_MAX"), 3),
 	}
 	cfg.Offline = cfg.LLMAPIKey == ""
 

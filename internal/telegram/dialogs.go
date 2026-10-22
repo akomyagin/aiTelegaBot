@@ -234,7 +234,8 @@ func (b *Bot) handleCallbackQuery(ctx context.Context, q *models.CallbackQuery) 
 	// Этап 9D (план §4.6, «Подэтап 9D»): порядок CutPrefix — TOC: → T: → S: →
 	// M: → P: → PDEL → L1: → L2: → L3: → ad:/dp:/ts:/tl:/tn: → fallback. Все
 	// префиксы попарно не пересекаются (второй байт различается), порядок
-	// задан планом; owner-чек и ack-контур — выше.
+	// задан планом; owner-чек и ack-контур — выше. 9E: «P:» больше не
+	// заглушка — уходит в drillDown seam (CallbackResult.Send → sendPhoto).
 	if rest, ok := strings.CutPrefix(q.Data, cbPrefixTOC); ok {
 		b.handleTOC(ctx, q, rest)
 		return
@@ -249,20 +250,19 @@ func (b *Bot) handleCallbackQuery(ctx context.Context, q *models.CallbackQuery) 
 	// S:<did>:<sid>). Аргументы НЕ парсятся здесь — q.Data передаётся как есть,
 	// включая мусор (сторона seam'а отвечает ошибкой → ack «Не получилось
 	// открыть»).
+	// 9E: «P:» (фото) уходит в тот же drillDown seam — digest возвращает
+	// CallbackResult{Send} (sendPhoto в owner-чат), 9D-заглушка удалена.
 	if strings.HasPrefix(q.Data, cbPrefixSource) || strings.HasPrefix(q.Data, cbPrefixMessage) ||
+		strings.HasPrefix(q.Data, cbPrefixPhoto) ||
 		strings.HasPrefix(q.Data, cbPrefixL2) || strings.HasPrefix(q.Data, cbPrefixL3) {
 		b.handleDrillDown(ctx, q)
 		return
 	}
-	// P: (фото) — 9D-заглушка: ack «Медиа недоступно», БЕЗ edit (sendPhoto —
-	// 9E, CallbackResult.Send в 9D всегда nil). PDEL — ack-only без
-	// deleteMessage (9E): фото-сообщений в 9D не появляется.
-	if strings.HasPrefix(q.Data, cbPrefixPhoto) {
-		b.answerCallback(ctx, q.ID, photoUnavailableText)
-		return
-	}
+	// «PDEL» (закрыть фото) обрабатывается БЕЗ seam'а (Этап 9E, план §4.5.2):
+	// аргументов нет — message_id берётся из самого CallbackQuery, deleteMessage
+	// + пустой ack. Digest-ветка PDEL остаётся защитой прямых вызовов seam'а.
 	if q.Data == cbPhotoDelete {
-		b.answerCallback(ctx, q.ID, "")
+		b.handlePhotoDelete(ctx, q)
 		return
 	}
 	// L1: — legacy alias T:-пути (viewer seam; owner/ack/inaccessible-механики

@@ -3,7 +3,8 @@
 // S:/M: и legacy L2:/L3: data → CallbackResult; peer-Title fallback имён;
 // РЕСТАРТ (закрытый и заново открытый store, новый seam) — S:/M: рендерятся из
 // БД, включая саммари топиков из sections_json и блок «Ссылки:» (план 9D
-// тест-кейс 7); P: → ack «Медиа недоступно»; M: на отсутствующий id → error.
+// тест-кейс 7); P: → CallbackResult{Send} (9E: sendPhoto отдельным сообщением);
+// M: на отсутствующий id → error.
 
 package app
 
@@ -176,10 +177,21 @@ func TestDrillDownWiringSmoke9D(t *testing.T) {
 	if res, err := dd(ctx, "M:99999999"); err == nil || res != nil {
 		t.Errorf("M:missing = %+v, %v, want error/nil", res, err)
 	}
-	// «P:» → ack-заглушка «Медиа недоступно» (фото в 9E), без Edit.
+	// «P:» → 9E: CallbackResult{Send} (sendPhoto отдельным сообщением исполняет
+	// telegram), без Edit/AckText-заглушки; media_ref из digest_items.
 	pv, err := dd(ctx, "P:"+iid)
-	if err != nil || pv == nil || pv.AckText != "Медиа недоступно" || pv.Edit != nil {
-		t.Errorf("P = %+v, %v, want ack «Медиа недоступно»", pv, err)
+	if err != nil || pv == nil || pv.Send == nil || pv.Edit != nil {
+		t.Fatalf("P = %+v, %v, want Send без Edit", pv, err)
+	}
+	if pv.Send.PhotoMediaRef != "AgADBAAD" {
+		t.Errorf("PhotoMediaRef = %q, want AgADBAAD", pv.Send.PhotoMediaRef)
+	}
+	if len(pv.Send.PhotoButtons) != 1 || len(pv.Send.PhotoButtons[0]) != 1 ||
+		pv.Send.PhotoButtons[0][0].Data != "PDEL" || pv.Send.PhotoButtons[0][0].Text != "✖ Закрыть" {
+		t.Errorf("PhotoButtons = %+v, want [✖ Закрыть PDEL]", pv.Send.PhotoButtons)
+	}
+	if pv.Send.PhotoCaption == "" {
+		t.Error("PhotoCaption пуст")
 	}
 
 	// РЕСТАРТ (тест-кейс 7 плана): store закрыт и открыт заново, новый seam —

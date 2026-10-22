@@ -25,9 +25,10 @@ const (
 	cbPrefixTOC       = "TOC:"
 	cbPrefixTopicOpen = "T:"
 	// Этап 9D (§4.6): «S:<digestID>:<sourceID>» — топик (sourceID=0 → все
-	// топики одним списком с подзаголовками), «M:<digestItemID>» — сообщение,
-	// «P:<digestItemID>» — фото (9D: ack-заглушка «Медиа недоступно»,
-	// sendPhoto — 9E), «PDEL» — закрыть фото (9D: ack-only, deleteMessage — 9E).
+	// топики одним списком с подзаголовками), «M:<digestItemID>» — сообщение.
+	// Этап 9E: «P:<digestItemID>» — фото (drillDown seam → CallbackResult.Send
+	// → sendPhoto в owner-чат), «PDEL» — закрыть фото (handlePhotoDelete:
+	// deleteMessage того же сообщения + пустой ack, БЕЗ seam'а — аргументов нет).
 	cbPrefixSource  = "S:"
 	cbPrefixMessage = "M:"
 	cbPrefixPhoto   = "P:"
@@ -60,9 +61,12 @@ const (
 const (
 	drillDownErrorText       = "Не получилось открыть"
 	drillDownUnavailableText = "Drill-down недоступен."
-	// photoUnavailableText — 9D-заглушка «P:» (план 9D: фото отправляется в
-	// 9E): только ack, БЕЗ edit.
-	photoUnavailableText = "Медиа недоступно"
+	// Этап 9E (план §4.5.2): ошибка sendPhoto → ack «Не удалось показать фото»
+	// (L3-сообщение не трогаем — деградация); ошибка deleteMessage «✖ Закрыть»
+	// → ack «Не удалось закрыть» + log.Warn. 9D-заглушка photoUnavailableText
+	// («Медиа недоступно») удалена — ветка «P:» стала реальной.
+	photoSendFailedText   = "Не удалось показать фото"
+	photoDeleteFailedText = "Не удалось закрыть"
 )
 
 // handleTopicOpen processes "T:<digestID>": the topic L1 view.
@@ -153,11 +157,51 @@ func (b *Bot) handleDrillDown(ctx context.Context, q *models.CallbackQuery) {
 		b.answerCallback(ctx, q.ID, "")
 		return
 	}
+	if res.Send != nil {
+		// Этап 9E (план §4.5.2): side-эффект «отдельное фото-сообщение» —
+		// sendPhoto в owner-чат (chatID ""), Edit НЕ выполняется (текстовое
+		// сообщение нельзя edit'ом превратить в фото; L3-вью не трогаем).
+		// Порядок здесь — ack ПОСЛЕ sendPhoto (отклонение от «ack раньше edit»
+		// веток A2/B/C/D, сознательное): ошибка показа обязана дать ack
+		// «Не удалось показать фото» (план 9E), а ack'нуть можно ровно один
+		// раз. Ошибка SendPhoto → только ack, сообщение L3 не меняется.
+		if _, err := b.SendPhoto(ctx, "", res.Send.PhotoMediaRef, res.Send.PhotoCaption, res.Send.PhotoButtons); err != nil {
+			b.log.Error("sending photo failed", "data", q.Data, "error", err)
+			b.answerCallback(ctx, q.ID, photoSendFailedText)
+			return
+		}
+		if res.Send.DeleteMessageID > 0 {
+			if err := b.DeleteMessage(ctx, "", res.Send.DeleteMessageID); err != nil {
+				b.log.Warn("deleting message failed", "message_id", res.Send.DeleteMessageID, "error", err)
+			}
+		}
+		b.answerCallback(ctx, q.ID, res.AckText)
+		return
+	}
 	b.answerCallback(ctx, q.ID, res.AckText) // ack first, edit second
 	if res.Edit == nil {
 		return // nil Edit → только ack (контракт CallbackResult)
 	}
 	b.editCallbackMessage(ctx, msg, res.Edit.Text, drillDownKeyboard(res.Edit.Buttons))
+}
+
+// handlePhotoDelete — «PDEL» (Этап 9E, план §4.5.2): «✖ Закрыть» на
+// фото-сообщении удаляет ТО ЖЕ сообщение (message_id из CallbackQuery,
+// аргументов у callback нет — seam не нужен) + пустой ack. Inaccessible
+// сообщение → только ack (удалять нечего). Ошибка deleteMessage → ack
+// «Не удалось закрыть» + log.Warn; ack ровно один раз в каждой ветке.
+func (b *Bot) handlePhotoDelete(ctx context.Context, q *models.CallbackQuery) {
+	msg, ok := callbackMessage(q)
+	if !ok {
+		b.answerCallback(ctx, q.ID, "")
+		return
+	}
+	if err := b.DeleteMessage(ctx, strconv.FormatInt(msg.Chat.ID, 10), int64(msg.ID)); err != nil {
+		b.log.Warn("deleting photo message failed", "message_id", msg.ID, "error", err)
+		b.answerCallback(ctx, q.ID, photoDeleteFailedText)
+		return
+	}
+	b.answerCallback(ctx, q.ID, "")
 }
 
 // drillDownKeyboard builds the markup that REPLACES the edited message's old

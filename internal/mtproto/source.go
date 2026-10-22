@@ -66,7 +66,7 @@ func TrialItem(msg tg.Message, ref string) feed.Item {
 // PeerSource: the cached username decides public vs t.me/c form), so the link
 // is built exactly once (review L8).
 func messageToFeedItem(msg tg.Message, source, url string) feed.Item {
-	return feed.Item{
+	item := feed.Item{
 		Kind:      "tg_mtproto",
 		Source:    source,
 		ID:        strconv.Itoa(msg.ID),
@@ -75,6 +75,18 @@ func messageToFeedItem(msg tg.Message, source, url string) feed.Item {
 		Text:      msg.Message,
 		Published: time.Unix(int64(msg.Date), 0).UTC(),
 	}
+	// Медиа (plan §4.5, Stage 9E): фото приватного канала нельзя показать ни
+	// по URL, ни чужим file_id — несём только MediaKind="photo", а сам
+	// file_id резолвится в прогоне (download → re-upload ботом, §4.5.1,
+	// часть 2b подэтапа 9E). Остальные типы медиа (video/document и т.д.)
+	// игнорируем — план §2: видео не несём. msg.Media без медиа = nil,
+	// type-assertion на nil-интерфейсе даёт ok=false.
+	if m, ok := msg.Media.(*tg.MessageMediaPhoto); ok && m.Photo != nil {
+		if _, empty := m.Photo.(*tg.PhotoEmpty); !empty {
+			item.MediaKind = "photo"
+		}
+	}
+	return item
 }
 
 // channelDeepLink builds the t.me URL for one message given the source ref.

@@ -2,8 +2,9 @@
 // S:/M:/P:/PDEL + legacy-alias'ы L2:/L3:, парсеры (мусор/не-числа/overflow →
 // error, не паника), бюджет callback_data ≤64 байт на 19-значных id,
 // sections_json (деградация на битом JSON), peer-Title fallback имён,
-// M:-view (GetDigestItem miss → error, блок «Ссылки:»), P:-заглушка
-// «Медиа недоступно», крайний случай «digest без items».
+// M:-view (GetDigestItem miss → error, блок «Ссылки:»), P: (9E: item miss →
+// error; sendPhoto-кейсы — photo_caption_test.go), PDEL-защита прямых
+// вызовов, крайний случай «digest без items».
 
 package digest
 
@@ -244,17 +245,16 @@ func TestNewDrillDown_Dispatch9D(t *testing.T) {
 		t.Errorf("S:42:0 buttons = %+v, want 4 rows", res.Edit.Buttons)
 	}
 
-	// «P:» → ack-заглушка «Медиа недоступно», БЕЗ edit (фото в 9E).
-	res, err = dd(ctx, "P:11")
-	if err != nil || res == nil {
-		t.Fatalf("P:11 = %+v, %v", res, err)
+	// «P:» (9E): GetDigestItem miss (hasItem=false у этого store) → error —
+	// ack «Не получилось открыть» на стороне telegram. Полноценные
+	// sendPhoto-кейсы (file_id/URL/caption/golden) — photo_caption_test.go.
+	if res, err := dd(ctx, "P:11"); err == nil || res != nil {
+		t.Errorf("P:11 (item miss) = %+v, %v, want error/nil", res, err)
 	}
-	if res.AckText != "Медиа недоступно" || res.Edit != nil || res.Send != nil {
-		t.Errorf("P:11 = %+v, want ack «Медиа недоступно» без Edit/Send", res)
-	}
-	// «PDEL» → ack-only (deleteMessage в 9E).
+	// «PDEL» → ack-only защита прямых вызовов seam'а (в проде telegram
+	// перехватывает PDEL раньше — handlePhotoDelete, Этап 9E).
 	res, err = dd(ctx, "PDEL")
-	if err != nil || res == nil || res.AckText != "" || res.Edit != nil {
+	if err != nil || res == nil || res.AckText != "" || res.Edit != nil || res.Send != nil {
 		t.Errorf("PDEL = %+v, %v, want empty ack-only", res, err)
 	}
 	// Неизвестный префикс и мусор → error, не паника.

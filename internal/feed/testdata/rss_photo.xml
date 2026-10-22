@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:media="http://search.yahoo.com/mrss/">
+  <channel>
+    <title>Photo feed</title>
+    <item>
+      <title>Item with image</title>
+      <link>https://example.com/img</link>
+      <enclosure url="https://example.com/pic.jpg" length="12345" type="image/jpeg"/>
+    </item>
+    <item>
+      <title>Item with PDF</title>
+      <link>https://example.com/pdf</link>
+      <enclosure url="https://example.com/paper.pdf" length="999" type="application/pdf"/>
+    </item>
+    <item>
+      <title>Item without enclosure</title>
+      <link>https://example.com/plain</link>
+    </item>
+    <item>
+      <title>Item with file:// enclosure</title>
+      <link>https://example.com/local</link>
+      <enclosure url="file:///etc/passwd" length="1" type="image/png"/>
+    </item>
+    <item>
+      <title>Item with ftp:// media:content</title>
+      <link>https://example.com/ftp</link>
+      <media:content url="ftp://files.example/pic.jpg" medium="image"/>
+    </item>
+  </channel>
+</rss>

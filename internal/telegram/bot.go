@@ -13,7 +13,10 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -91,7 +94,16 @@ type Bot struct {
 	sendFn func(ctx context.Context, chatID int64, text string, kb *models.InlineKeyboardMarkup) error
 	ackFn  func(ctx context.Context, callbackQueryID, text string) error
 	editFn func(ctx context.Context, chatID int64, messageID int, text string, kb *models.InlineKeyboardMarkup) error
-	log    *slog.Logger
+	// Этап 9E seams (план §4.5.2): транспорт sendPhoto/deleteMessage; nil =>
+	// b.api. Без seam'а И без api методы возвращают error (НЕ silent no-op —
+	// тот же контракт, что у DeliverWithButtons).
+	sendPhotoFn func(ctx context.Context, chatID int64, photo models.InputFile, caption string, kb *models.InlineKeyboardMarkup) (messageID int64, err error)
+	deleteMsgFn func(ctx context.Context, chatID int64, messageID int64) error
+	// uploadPhotoFn — test-seam загрузки локального файла (9E-2b, план §4.5.1
+	// п.2 — re-upload resolver'а): возвращает id служебного сообщения и
+	// Photo-размеры ответа (largest → file_id). nil => b.api.
+	uploadPhotoFn func(ctx context.Context, chatID int64, photo models.InputFile) (messageID int64, sizes []models.PhotoSize, err error)
+	log           *slog.Logger
 }
 
 // Option configures the Bot.
@@ -306,23 +318,31 @@ type EditMessage struct {
 // AnswerCallbackQuery (always — every callback is acked, план §4.7); Edit is
 // nil for «ack only» (nothing to edit).
 //
-// Send (Этап 9D, план §4.5.2) — side-эффект «отдельное сообщение»: тип
-// объявлен в 9D, но поле всегда nil — обработка (sendPhoto «P:» /
-// deleteMessage «PDEL») появится в 9E.
+// Send (план §4.5.2, активирован в Этапе 9E) — side-эффект «отдельное
+// сообщение»: ≠nil → handleDrillDown шлёт sendPhoto в owner-чат (Edit при этом
+// НЕ выполняется — текстовое сообщение нельзя edit'ом превратить в фото).
+// ВАЖНО: эскиз §4.5.2 плана (PhotoRef{FileID,URL}/SendPhotoResult) УСТАРЕЛ —
+// фактический контракт объявлен ещё в 9D-2a как SendAction{PhotoMediaRef,
+// PhotoCaption, PhotoButtons, DeleteMessageID}; 9E следует ему.
 type CallbackResult struct {
 	AckText string
 	Edit    *EditMessage // nil → только ack, без edit
-	Send    *SendAction  // nil в 9D (обработка — 9E)
+	Send    *SendAction  // ≠nil → sendPhoto в owner-чат (9E), Edit игнорируется
 }
 
-// SendAction — side-эффект callback-результата (план §4.5.2, обработка в 9E):
+// SendAction — side-эффект callback-результата (план §4.5.2, обработка — 9E):
 // отдельное sendPhoto-сообщение («P:» → фото материала) и/или удаление
-// сообщения («PDEL» → закрыть фото). В 9D только объявлен тип.
+// сообщения (DeleteMessageID > 0). PDEL в проде перехватывает telegram-
+// диспетчер (deleteMessage того же сообщения без seam'а — аргументов нет).
 type SendAction struct {
-	PhotoMediaRef   string           // digest_items.media_ref: tg file_id ИЛИ http(s) URL
-	PhotoCaption    string           // готовый HTML (ParseMode HTML)
-	PhotoButtons    [][]InlineButton // клавиатура фото-сообщения (9E: «✖ Закрыть» → PDEL)
-	DeleteMessageID int64            // >0 → удалить сообщение (PDEL-поток, 9E)
+	PhotoMediaRef string           // digest_items.media_ref: tg file_id ИЛИ http(s) URL
+	PhotoCaption  string           // готовый HTML (ParseMode HTML)
+	PhotoButtons  [][]InlineButton // клавиатура фото-сообщения (9E: «✖ Закрыть» → PDEL)
+	// Зарезервировано (контракт 9D, не удалять): прод-поток PDEL
+	// перехватывается в telegram до seam'а (handlePhotoDelete —
+	// deleteMessage того же сообщения, аргументов нет); поле используется
+	// только прямыми вызовами seam'а/тестами.
+	DeleteMessageID int64 // >0 → удалить сообщение
 }
 
 // DrillDown resolves an "L2:…" / "L3:…" callback (Stage 8 D). data is the raw
@@ -405,4 +425,173 @@ func inlineKeyboard(buttons [][]InlineButton) *models.InlineKeyboardMarkup {
 		rows = append(rows, btns)
 	}
 	return &models.InlineKeyboardMarkup{InlineKeyboard: rows}
+}
+
+// PhotoCaptionMaxBytes — жёсткий лимит Bot API на caption (план §4.5.2),
+// единственная константа 1024 для обоих пакетов (ревью 9E, фикс 8: digest
+// импортирует telegram и берёт лимит отсюда). Резка в SendPhoto — страховка
+// от прямых внешних вызовов: digest.photoCaption всегда возвращает
+// well-formed HTML ≤1024 байт (ужатие компонентов ДО сборки).
+const PhotoCaptionMaxBytes = 1024
+
+// SendPhoto шлёт отдельное фото-сообщение (Этап 9E, план §4.5.2): mediaRef —
+// digest_items.media_ref (tg file_id ИЛИ http(s) URL) — уходит КАК ЕСТЬ как
+// models.InputFileString{Data}: URL это или file_id, решает сервер Telegram,
+// схема здесь НАМЕРЕННО не проверяется (file_id теоретически может начинаться
+// с «http»; gate схемы http/https для внешних URL — на стороне источников:
+// feed.mediaImageURL / findMessagePhoto). Не-http строка трактуется
+// Telegram'ом как file_id, битый — отвергается Bot API → ошибка доходит до
+// ack «Не удалось показать фото» (деградация плана, не паника). chatID "" →
+// owner-чат (семантика Deliver/DeliverWithButtons). ParseMode HTML; buttons →
+// inline-клавиатура (тот же inlineKeyboard-маппинг, InlineButton.URL
+// поддержан с 9D). Возвращает messageID отправленного сообщения (нужен
+// DeleteMessage-потоку). Транспорт — test-seam sendPhotoFn; без seam'а и без
+// api → error, НЕ silent no-op.
+func (b *Bot) SendPhoto(ctx context.Context, chatID, mediaRef, caption string, buttons [][]InlineButton) (int64, error) {
+	if strings.TrimSpace(mediaRef) == "" {
+		return 0, fmt.Errorf("telegram send photo: empty media ref")
+	}
+	target := b.chatID
+	if chatID != "" {
+		id, err := strconv.ParseInt(chatID, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("telegram send photo: invalid chat id: %w", err)
+		}
+		target = id
+	}
+	// mediaRef уходит как есть строкой — отклонение от эскиза плана
+	// (InputFileURL/InputFileID): в go-telegram/bot v1.22 отдельных типов
+	// нет — Bot API принимает и file_id, и URL строкой, и библиотека
+	// моделирует оба случая как *models.InputFileString{Data} (seam-тесты
+	// фиксируют Data). Схема НЕ проверяется намеренно (см. док SendPhoto):
+	// URL-vs-file_id решает сервер Telegram; не-http строка трактуется как
+	// file_id, битый file_id отвергается Bot API → деградация «Не удалось
+	// показать фото», не паника.
+	photo := &models.InputFileString{Data: mediaRef}
+	// Защитная резка caption ≤1024 БАЙТ на границе рун — СТРАХОВКА от прямых
+	// внешних вызовов: caption из digest.photoCaption всегда well-formed и
+	// ≤1024 (ужатие компонентов ДО сборки), в прод-пути резка здесь
+	// недостижима. Байтовая резка способна порвать HTML-сущность — для
+	// внешнего входа это осознанно приемлемо (TruncateButtonLabelTo — общая
+	// логика, бюджет БЕЗ учёта «…»; ровно 1024 не режется).
+	if len(caption) > PhotoCaptionMaxBytes {
+		caption = TruncateButtonLabelTo(caption, PhotoCaptionMaxBytes-len("…"))
+	}
+	kb := inlineKeyboard(buttons)
+
+	if b.sendPhotoFn != nil {
+		id, err := b.sendPhotoFn(ctx, target, photo, caption, kb)
+		if err != nil {
+			return 0, fmt.Errorf("telegram send photo: %w", err)
+		}
+		return id, nil
+	}
+	if b.api == nil {
+		return 0, fmt.Errorf("telegram send photo: no transport (neither api nor test seam)")
+	}
+	params := &bot.SendPhotoParams{
+		ChatID:    target,
+		Photo:     photo,
+		Caption:   caption,
+		ParseMode: models.ParseModeHTML,
+	}
+	if kb != nil {
+		params.ReplyMarkup = kb
+	}
+	msg, err := b.api.SendPhoto(ctx, params)
+	if err != nil {
+		return 0, fmt.Errorf("telegram send photo: %w", err)
+	}
+	return int64(msg.ID), nil
+}
+
+// DeleteMessage удаляет сообщение (Этап 9E, план §4.5.2 — «✖ Закрыть»
+// фото-сообщения и чистка служебных сообщений resolver'а). chatID "" →
+// owner-чат. Транспорт — test-seam deleteMsgFn; без seam'а и без api → error.
+func (b *Bot) DeleteMessage(ctx context.Context, chatID string, messageID int64) error {
+	target := b.chatID
+	if chatID != "" {
+		id, err := strconv.ParseInt(chatID, 10, 64)
+		if err != nil {
+			return fmt.Errorf("telegram delete message: invalid chat id: %w", err)
+		}
+		target = id
+	}
+	if b.deleteMsgFn != nil {
+		if err := b.deleteMsgFn(ctx, target, messageID); err != nil {
+			return fmt.Errorf("telegram delete message: %w", err)
+		}
+		return nil
+	}
+	if b.api == nil {
+		return fmt.Errorf("telegram delete message: no transport (neither api nor test seam)")
+	}
+	if _, err := b.api.DeleteMessage(ctx, &bot.DeleteMessageParams{
+		ChatID:    target,
+		MessageID: int(messageID),
+	}); err != nil {
+		return fmt.Errorf("telegram delete message: %w", err)
+	}
+	return nil
+}
+
+// UploadPhoto (подэтап 9E, план §4.5.1 п.2) шлёт ЛОКАЛЬНЫЙ файл (multipart —
+// models.InputFileUpload{Filename, Data}) в owner-чат БЕЗ caption/клавиатуры и
+// возвращает id служебного сообщения плюс file_id largest-размера Photo ответа
+// (переиспользует largestPhotoFileID из 9E-2a). Это re-upload MTProto-
+// resolver'а: фото приватного канала становится bot-овским file_id, а
+// служебное сообщение удаляет ВЫЗЫВАЮЩИЙ (DeleteMessage). Семантика chatID —
+// как у Deliver ("" → owner-чат); fileName "" → базовое имя filePath.
+// Транспорт — test-seam uploadPhotoFn; без seam'а и без api → error, НЕ
+// silent no-op (тот же контракт, что у SendPhoto).
+func (b *Bot) UploadPhoto(ctx context.Context, chatID, filePath, fileName string) (int64, string, error) {
+	if strings.TrimSpace(filePath) == "" {
+		return 0, "", fmt.Errorf("telegram upload photo: empty file path")
+	}
+	target := b.chatID
+	if chatID != "" {
+		id, err := strconv.ParseInt(chatID, 10, 64)
+		if err != nil {
+			return 0, "", fmt.Errorf("telegram upload photo: invalid chat id: %w", err)
+		}
+		target = id
+	}
+	if fileName == "" {
+		fileName = filepath.Base(filePath)
+	}
+	f, err := os.Open(filePath)
+	if err != nil {
+		return 0, "", fmt.Errorf("telegram upload photo: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+	upload := &models.InputFileUpload{Filename: fileName, Data: f}
+
+	if b.uploadPhotoFn != nil {
+		id, sizes, err := b.uploadPhotoFn(ctx, target, upload)
+		if err != nil {
+			return 0, "", fmt.Errorf("telegram upload photo: %w", err)
+		}
+		return uploadPhotoResult(int64(id), sizes)
+	}
+	if b.api == nil {
+		return 0, "", fmt.Errorf("telegram upload photo: no transport (neither api nor test seam)")
+	}
+	msg, err := b.api.SendPhoto(ctx, &bot.SendPhotoParams{ChatID: target, Photo: upload})
+	if err != nil {
+		return 0, "", fmt.Errorf("telegram upload photo: %w", err)
+	}
+	return uploadPhotoResult(int64(msg.ID), msg.Photo)
+}
+
+// uploadPhotoResult достаёт largest file_id из ответа sendPhoto; пустое Photo
+// — ошибка (послали фото, ответ обязан его содержать — иначе file_id для
+// media_ref не получить). messageID при этом ВОЗВРАЩАЕТСЯ и в ошибке
+// (ревью 9E, фикс 6): служебное сообщение уже отправлено, вызывающий
+// (mtproto.resolveOne) удаляет его по id — утечки в owner-чате не остаётся.
+func uploadPhotoResult(messageID int64, sizes []models.PhotoSize) (int64, string, error) {
+	fileID := largestPhotoFileID(sizes)
+	if fileID == "" {
+		return messageID, "", fmt.Errorf("telegram upload photo: response contains no photo")
+	}
+	return messageID, fileID, nil
 }
