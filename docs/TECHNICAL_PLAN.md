@@ -299,6 +299,16 @@ ALTER TABLE digest_items ADD COLUMN full_text TEXT NOT NULL DEFAULT '';  -- до
 ALTER TABLE digest_items ADD COLUMN class     TEXT NOT NULL DEFAULT '';
 ALTER TABLE digest_items ADD COLUMN media_kind TEXT NOT NULL DEFAULT '';
 ALTER TABLE digest_items ADD COLUMN media_ref  TEXT NOT NULL DEFAULT '';
+
+-- v6 (Этап 9D): персистенция саммари топиков (секций) вызова C — без неё
+-- L1/L2-views теряли бы саммари после рестарта бота (тест-кейс 7 плана 9D,
+-- §4.3 Этапа 8 «drill-down переживает рестарт»). Уточнение к комментарию v5:
+-- схема v5 оказалась неполной, v6 добавлена директивой диспетчера в 9D-2a
+-- (v5 к тому моменту не была задеплоена на прод — обе миграции применяются
+-- штатно и идемпотентно).
+ALTER TABLE digests ADD COLUMN sections_json TEXT NOT NULL DEFAULT '';
+-- sections_json: JSON [{"source_id":N,"summary":"…"}] — саммари топиков
+-- темы из вызова C, порядок = порядок collect; '' = нет/legacy.
 ```
 
 Дедуп-ключ (`internal/feed` / `internal/storage`): для веб-источников — канонический
@@ -461,7 +471,20 @@ URL или `<guid>`; для Telegram — `tg:<channel>:<messageID>`. Ретен�
   защитная ветка primary=ad → детерминированное переназначение (в 9C
   недостижима); offline: точное совпадение normalizeTitle в пределах среза,
   primary = первый в порядке collect);
-  9D (4-уровневая навигация: вызовы C/D, runs), 9E (медиа) — **впереди**.
+  **9D** (4-уровневая навигация + агрегация — **сделан по коду**: вызов C
+  `AggregateTopic` (headline темы + саммари топиков, вход — саммари primary
+  после 4c-конкатенации, группировка по source_id в порядке collect; сбой C →
+  fallback-headline = первые ≤3 саммари, тема не пропускается) + вызов D
+  `AggregateOverall` (общее саммари выпуска → runs.summary; сбой D →
+  log-only, TOC без overall-блока); миграция v6 digests.sections_json;
+  навигация S:<did>:<sid> (топик) / M:<itemID> (сообщение: full_text с
+  legacy-деградацией, блок «Ссылки:», кнопки 🖼 P: (заглушка до 9E) / ↗ URL /
+  ◀ Назад) / legacy-alias'ы L1:→T:, L2:→T:, L3:→S: (старые кнопки
+  доставленных сообщений работают); T:-view = RenderTopicView — топики
+  человекочитаемыми именами (текст + кнопки-имена ≤64 байт); RenderTOC c
+  overall; InlineButton.URL (Data/URL взаимоисключающи); мёртвый
+  TopicSummarizer/SummarizeTopic Этапа 8 удалён (заменён вызовами A+C));
+  9E (медиа) — **впереди**.
   *Env-переменные 9B* (основная таблица env — «Переменные окружения» в
   README.md; строки добавит диспетчер — README вне списка файлов этой части):
   `LINK_FETCH_TIMEOUT` — таймаут одного GET статьи, дефолт `15s`;
