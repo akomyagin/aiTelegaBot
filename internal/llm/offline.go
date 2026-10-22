@@ -132,3 +132,46 @@ func extractLead(text string) string {
 	}
 	return truncateRunes(text, leadRunes)
 }
+
+// AggregateTopic реализует TopicAggregator offline (план §4.7, вызов C):
+// headline темы — первые ≤3 строки «- <саммари сообщения>» из ВСЕХ топиков
+// (порядок среза входа, паттерн Offline.SummarizeTopic); саммари каждого
+// топика — первые ≤3 строки его собственного списка. Sections содержат по
+// одной строке на топик входа (пустые саммари дают Summary="" — L1 деградирует
+// на строку без саммари). Детерминированно: два вызова на одном входе
+// байт-в-байт одинаковы (нет сети, random, time.Now, map-итераций).
+func (o *Offline) AggregateTopic(ctx context.Context, topicName string, sources []SourceBlock) (TopicAggregate, error) {
+	_ = ctx
+	_ = topicName
+	var all []string
+	for _, s := range sources {
+		all = append(all, s.Summaries...)
+	}
+	agg := TopicAggregate{
+		Headline: strings.Join(firstSummaryLines(all, aggregateFallbackLines), "\n"),
+	}
+	for _, s := range sources {
+		agg.Sections = append(agg.Sections, TopicHeadline{
+			SourceID: s.SourceID,
+			Summary:  strings.Join(firstSummaryLines(s.Summaries, aggregateFallbackLines), "\n"),
+		})
+	}
+	return agg, nil
+}
+
+// AggregateOverall реализует OverallAggregator offline (план §4.7, вызов D):
+// выпуск — список «- <имя темы>: N материалов» (без саммари — offline не из
+// чего его строить). Пустое имя темы → «Без темы» (защита от пустой строки
+// списка). Детерминированно: два вызова на одном входе байт-в-байт одинаковы.
+func (o *Offline) AggregateOverall(ctx context.Context, topics []OverallTopic) (string, error) {
+	_ = ctx
+	lines := make([]string, 0, len(topics))
+	for _, t := range topics {
+		name := strings.TrimSpace(t.Name)
+		if name == "" {
+			name = "Без темы"
+		}
+		lines = append(lines, "- "+name+": "+itoa(t.ItemCount)+" материалов")
+	}
+	return strings.Join(lines, "\n"), nil
+}

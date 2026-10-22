@@ -65,6 +65,16 @@ type Store interface {
 	// ListRunDigests returns one run's digests ordered by topic_id ASC;
 	// runID=0 means «легаси, не прогон» and always yields an empty result.
 	ListRunDigests(ctx context.Context, runID int64) ([]Digest, error)
+	// GetDigestItem reads ONE digest_items row by id; unknown id → ok=false
+	// (NOT an error). Заполняет DigestItem.DigestID — единственный метод,
+	// который это делает (Stage 9D, M:-view «◀ Назад» S:<did>:<sid>).
+	GetDigestItem(ctx context.Context, itemID int64) (it DigestItem, ok bool, err error)
+	// UpsertRunSummary writes the run's overall summary (runs, migration v5;
+	// вызов D, Stage 9D). Идемпотентен по run_id; run_id ≤ 0 → error.
+	UpsertRunSummary(ctx context.Context, runID int64, summary string) error
+	// GetRunSummary reads the run's overall summary; нет строки → ("", false,
+	// nil) — legacy-прогоны рендерят TOC без overall-блока (Stage 9D).
+	GetRunSummary(ctx context.Context, runID int64) (summary string, ok bool, err error)
 	// GetMeta reads a scheduler/meta key; ok is false when the key is absent.
 	GetMeta(ctx context.Context, key string) (value string, ok bool, err error)
 	// SetMeta upserts a scheduler/meta key.

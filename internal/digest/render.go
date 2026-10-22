@@ -151,6 +151,10 @@ func RenderTopicL1(body string, items []storage.DigestItem) string {
 //
 //	📋 Дайджест — <date>   ← date="" → строка без «— <date>»
 //
+//	<overall>             ← общее саммари выпуска (вызов D / runs.summary);
+//	                        пусто/не передано → блок ОТСУТСТВУЕТ — legacy-
+//	                        прогоны и поведение Этапа 8/9A–9C байт-в-байт
+//
 //	Тем: N
 //
 //	• <b>TopicName</b> — <ItemCount> материалов   (по теме, порядок entries)
@@ -158,7 +162,15 @@ func RenderTopicL1(body string, items []storage.DigestItem) string {
 // At run time date = now.Format("02 Jan 2006"); on restore (C2/D) — the first
 // ListRunDigests row's CreatedAt parsed as RFC3339 and formatted the same way
 // (parse error → date="").
-func RenderTOC(entries []TOCEntry, date string) string {
+//
+// Сигнатура 9D-1 (ОТКЛОНЕНИЕ от буквального «параметр overall string» плана,
+// зафиксировано в отчёте): overall — вариативный хвост. internal/app/
+// digest_nav.go (вне зоны 9D-1, трогать запрещено) и существующие тесты зовут
+// RenderTOC с двумя аргументами; вариативность сохраняет их компиляцию и
+// байт-в-байт прежний TOC без overall. 9D-2 начнёт передавать overall явно
+// (run-пайплайн из runs.summary, viewer — из GetRunSummary) и может сделать
+// параметр обязательным при переподключении viewer'а.
+func RenderTOC(entries []TOCEntry, date string, overall ...string) string {
 	var b strings.Builder
 	b.WriteString("📋 Дайджест")
 	if date != "" {
@@ -166,6 +178,12 @@ func RenderTOC(entries []TOCEntry, date string) string {
 		// date comes from time.Format (run time) or a parsed CreatedAt
 		// (restore, C2/D) — escaped defensively (review C1 L4).
 		b.WriteString(telegram.EscapeHTML(date))
+	}
+	if len(overall) > 0 {
+		if o := strings.TrimSpace(overall[0]); o != "" {
+			b.WriteString("\n\n")
+			b.WriteString(telegram.EscapeHTML(truncateRunes(o, tocOverallRunes)))
+		}
 	}
 	b.WriteString("\n\nТем: ")
 	b.WriteString(strconv.Itoa(len(entries)))
