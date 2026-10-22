@@ -2,6 +2,10 @@
 // Stage 9A, план §4.8.1): collect items from all tracked sources → filter
 // unseen → read the message_state processing cache → group by topic →
 // classify+summarize uncached items via llm.ClassifySummarizer (вызов A) →
+// semantic dedup of freshly classified items via llm.Deduper (вызов B, Этап
+// 9C: non-primaries → dropped_dup + seen immediately; кластер с хотя бы одним
+// degraded-членом НЕ персистится и его дубли не seen — следующий прогон
+// пересмотрит) →
 // drop ads (seen immediately) → persist per-topic digests → deliver ONE
 // table-of-contents message with per-topic buttons → mark delivered.
 // See docs/plans/stage-9-bottom-up-digest.md «Подэтап 9A».
@@ -52,6 +56,11 @@ type Pipeline struct {
 	LinkClassify llm.LinkClassifier // вызов E — виды ссылок, батч на тему
 	LinkSummary  llm.LinkSummarizer // вызов F — саммари свежесобранных страниц
 	LinkFetch    LinkFetcher        // ≤1 GET на URL; nil в offline
+	// Dedup — вызов B плана §4.4/§4.8 (семантический дедуп, Этап 9C).
+	// Нил-сейф: nil → дедуп пропускается ЦЕЛИКОМ, все элементы primary
+	// (обратная совместимость с pipeline-тестами 9A/9B). Ошибка B — деградация
+	// (log.Warn + все primary), тема НЕ пропускается — в отличие от ошибки A.
+	Dedup llm.Deduper
 	// LinkPerMessageMax — ≤N ссылок на сообщение (LINK_PER_MESSAGE_MAX,
 	// дефолт 5); LinkFetchTotalMax — бюджет fetch'ей ОБЩИЙ НА ПРОГОН
 	// (LINK_FETCH_TOTAL_MAX, дефолт 30); сверх бюджета ссылки остаются в
@@ -76,7 +85,7 @@ func (p *Pipeline) log() *slog.Logger {
 const (
 	stateDone       = "done"
 	stateDroppedAd  = "dropped_ad"
-	stateDroppedDup = "dropped_dup" // пишется с 9C; здесь — только чтение кеша
+	stateDroppedDup = "dropped_dup" // non-primary вызова B (9C); из кеша — с 9A
 )
 
 // isClassifiedState сообщает, что элемент НЕ требует LLM-работы в этом прогоне:
@@ -102,10 +111,66 @@ func messageStateFromClassify(it feed.Item, tid int64, r llm.ItemClassSummary) s
 		TopicID:  tid,
 		Class:    r.Class,
 		Summary:  r.Summary,
-		// Дедупа/кластеров ещё нет (придут в 9C) — всё primary.
+		// A-батч пишет всё primary с пустым cluster_id; члены кластеров
+		// перезаписываются вторым B-батчем вызова B (9C, шаг 4a-bis).
 		IsPrimary: true,
 		Status:    status,
 	}
+}
+
+// chooseDupPrimary — детерминированный выбор первоисточника среди членов
+// кластера вызова B (критерий §4.4): самая ранняя Published → самый полный
+// текст → меньший SourceID. Нулевой Published трактуется как ПОЗДНЕЙШИЙ
+// (фикс 9C-ревью: элемент без даты проигрывает любому датированному; два
+// нулевых — решаются следующими критериями). Используется защитной веткой
+// переназначения primary=ad (в 9C недостижима — B идёт после A, ad исключены
+// из входа).
+// indices — 1-based номера в items (уже валидированы: ⊆ 1..len(items)).
+func chooseDupPrimary(items []llm.DedupItem, indices []int) int {
+	best := indices[0]
+	for _, v := range indices[1:] {
+		a, b := items[best-1], items[v-1]
+		switch {
+		case !a.Published.Equal(b.Published):
+			switch {
+			case a.Published.IsZero(): // best без даты — «позднейший»: датированный претендент побеждает
+				best = v
+			case b.Published.IsZero(): // претендент без даты проигрывает датированному best
+			case b.Published.Before(a.Published):
+				best = v
+			}
+		case len([]rune(b.Text)) != len([]rune(a.Text)):
+			if len([]rune(b.Text)) > len([]rune(a.Text)) {
+				best = v
+			}
+		case b.SourceID < a.SourceID:
+			best = v
+		}
+	}
+	return best
+}
+
+// dupClusterValid — L4-guard контракта Deduper (фикс 9C-ревью): все Indices в
+// 1..n, без дублей индексов внутри кластера, Primary ∈ Indices. Прод-реализации
+// гарантируют это парсером-валидатором (parseDedupResponse); guard защищает от
+// третьей реализации или багованного фейка — невалидный кластер отбрасывается
+// ЦЕЛИКОМ (log.Error у вызывающего, не panic), тема продолжается с остальными.
+func dupClusterValid(cl llm.DupCluster, n int) bool {
+	seen := make(map[int]struct{}, len(cl.Indices))
+	hasPrimary := false
+	for _, v := range cl.Indices {
+		if v < 1 || v > n {
+			return false
+		}
+		if _, dup := seen[v]; dup {
+			return false
+		}
+		seen[v] = struct{}{}
+		if v == cl.Primary {
+			hasPrimary = true
+		}
+	}
+	return hasPrimary // пустой Indices или Primary ∉ Indices → невалиден
 }
 
 // pendingTopic is one summarized+persisted topic awaiting the TOC delivery:
@@ -208,7 +273,7 @@ func (p *Pipeline) Run(ctx context.Context) error {
 	linkFetchBudget := p.LinkFetchTotalMax
 	var pending []pendingTopic
 	entries := make([]TOCEntry, 0, len(topicIDs))
-	var adKeys []string
+	var droppedKeys []string // ad + персистентные дубли (seen ДО доставки)
 	failed := 0
 	for _, tid := range topicIDs {
 		topicItems := groups[tid]
@@ -303,6 +368,141 @@ func (p *Pipeline) Run(ctx context.Context) error {
 			}
 		}
 
+		// 4a-bis (Этап 9C, план §4.8.1 шаг 4a: вызов B ПОСЛЕ A): семантический
+		// дедуп элементов, классифицированных A в ЭТОМ прогоне, class ∉ {ad},
+		// в порядке collect. РЕШЕНИЕ ДИСПЕТЧЕРА (план §2 + тест-кейс 3):
+		// закешированные (done/dropped_*) элементы в B НЕ участвуют —
+		// кросс-прогонный семантический дедуп вне этапа; повторный Run делает
+		// 0 вызовов B по закешированным. Ошибка B (транспорт или двойной
+		// мусор) → деградация: ВСЕ элементы темы primary, тема НЕ
+		// пропускается, Run продолжается (отличается от семантики ошибки A —
+		// тест-кейс 1 плана 9C).
+		//
+		// Фикс 9C-ревью (решение диспетчера): IN-RUN исключение дублей
+		// (dupDropped → kept-цикл) применяется для ВСЕХ валидных кластеров —
+		// дедуп видим в дайджесте текущего прогона; но ПЕРСИСТ (строки B-батча
+		// cluster_id/is_primary/dropped_dup) и seen (dup-ключи в потоке
+		// MarkSeenBatch) — ТОЛЬКО для кластеров, где ВСЕ члены не-degraded.
+		// Кластер с любым degraded-членом: строки не пишутся, seen не делается —
+		// следующий прогон пересмотрит (симметрично §4.9 «деградация не
+		// фиксируется навсегда»). Дубль при этом остаётся done/is_primary=1 от
+		// A-батча и в следующем прогоне будет показан, если не перекластеризуется
+		// — приемлемая деградация «дубль виден» вместо «элемент потерян».
+		// Значение dupDropped: true → строка dropped_dup персистентна (нужен
+		// seen), false → только in-run-исключение (degraded-кластер).
+		dupDropped := make(map[int]bool) // индекс в topicItems → не-primary
+		if p.Dedup != nil {
+			var dItems []llm.DedupItem
+			var dAt []int    // индекс в topicItems
+			var dUncls []int // позиция в uncls
+			for j := range uncls {
+				if !res.Degraded[j] && res.Items[j].Class == llm.ClassAd {
+					continue // реклама в кластеризацию не участвует (§4.4)
+				}
+				it := uncls[j]
+				dItems = append(dItems, llm.DedupItem{
+					Title: it.Title, Text: it.Text, SourceName: it.Source,
+					Published: it.Published, SourceID: it.SourceID,
+				})
+				dAt = append(dAt, unclsAt[j])
+				dUncls = append(dUncls, j)
+			}
+			if len(dItems) >= 2 {
+				clusters, derr := p.Dedup.FindDuplicates(ctx, dItems)
+				if derr != nil {
+					log.Warn("dedup failed; topic kept without dedup",
+						"topic_id", tid, "items", len(dItems), "err", derr)
+				} else if len(clusters) > 0 {
+					// L4: guard контракта Deduper — ДО любых обращений
+					// Primary-1/Indices-1 (включая защитную ad-ветку ниже).
+					// Невалидный кластер отбрасывается ЦЕЛИКОМ (log.Error, не
+					// panic), тема продолжается с остальными кластерами.
+					valid := make([]llm.DupCluster, 0, len(clusters))
+					for _, cl := range clusters {
+						if dupClusterValid(cl, len(dItems)) {
+							valid = append(valid, cl)
+							continue
+						}
+						log.Error("dedup cluster violates contract; cluster dropped",
+							"topic_id", tid, "indices", cl.Indices, "primary", cl.Primary)
+					}
+					clusters = valid
+				}
+				if len(clusters) > 0 {
+					// Защитная ветка (§4.4): primary, оказавшийся ad,
+					// переназначается детерминированно. В 9C недостижима —
+					// B идёт ПОСЛЕ A и ad исключены из входа; оставлена
+					// планом (вызовы A и B независимы).
+					for ci := range clusters {
+						cl := &clusters[ci]
+						pj := dUncls[cl.Primary-1]
+						if !res.Degraded[pj] && res.Items[pj].Class == llm.ClassAd {
+							cl.Primary = chooseDupPrimary(dItems, cl.Indices)
+						}
+					}
+					// cluster_id = '<runID>:<n>', n — порядковый номер кластера
+					// в валидированном ответе (1-based, §4.4). Второй
+					// UpsertMessageState батч на тему ПОСЛЕ A-батча —
+					// осознанное отклонение от буквального «A(+B) → один
+					// Upsert» плана: крах между A и B не теряет классификацию
+					// (инвариант «упавший прогон не теряет работу», 9A M1).
+					batch := make([]storage.MessageState, 0, 2*len(clusters))
+					for ci, cl := range clusters {
+						cid := fmt.Sprintf("%d:%d", runID, ci+1)
+						// Кластер персистится+seen ТОЛЬКО если ВСЕ его члены
+						// не-degraded (фикс 9C-ревью): при любом degraded строки
+						// не пишутся ВОВСЕ (в т.ч. для не-degraded дублей) —
+						// иначе деградация зафиксируется навсегда (§4.9).
+						// In-run-исключение (dupDropped) применяется в любом
+						// случае; write-back ниже — только по записанным строкам.
+						persist := true
+						for _, idx := range cl.Indices {
+							if res.Degraded[dUncls[idx-1]] {
+								persist = false
+								break
+							}
+						}
+						for _, idx := range cl.Indices {
+							j := dUncls[idx-1]
+							isPrimary := idx == cl.Primary
+							if !isPrimary {
+								dupDropped[dAt[idx-1]] = persist
+							}
+							if !persist {
+								continue // следующий прогон пересмотрит кластер
+							}
+							row := messageStateFromClassify(uncls[j], tid, res.Items[j])
+							row.ClusterID = cid
+							row.IsPrimary = isPrimary
+							if !isPrimary {
+								row.Status = stateDroppedDup // сразу seen (§4.4)
+							}
+							batch = append(batch, row)
+						}
+					}
+					if len(batch) > 0 {
+						if uerr := p.Store.UpsertMessageState(ctx, batch); uerr != nil {
+							// Без персистентности dropped_dup помечать дубли seen
+							// нельзя — деградация к «тема БЕЗ дедупа» (все
+							// primary), как при ошибке B. Откат ЦЕЛИКОМ: in-run-
+							// исключения degraded-кластеров тоже сбрасываются.
+							log.Error("cache dedup message_state failed; topic kept without dedup",
+								"topic_id", tid, "err", uerr)
+							dupDropped = make(map[int]bool)
+						} else {
+							// states write-back (решение 9B/L7): только по
+							// фактически записанным строкам — dup/primary-
+							// изменения видны кросс-топик дублям dedup_key в
+							// том же прогоне (поведение как у A-батча).
+							for _, e := range batch {
+								states[e.DedupKey] = e
+							}
+						}
+					}
+				}
+			}
+		}
+
 		// 4b/4e. Собрать исход темы: ad → dropped (seen ДО доставки, в
 		// digest_items не попадает); course → обычная строка с однофразным
 		// summary из промпта A; остальные — полный цикл. Summary/class — из
@@ -316,15 +516,27 @@ func (p *Pipeline) Run(ctx context.Context) error {
 		for i, it := range topicItems {
 			if st, hit := cached[i]; hit {
 				if st.Status != stateDone { // dropped_ad / dropped_dup
-					adKeys = append(adKeys, it.DedupKey())
+					droppedKeys = append(droppedKeys, it.DedupKey())
 					continue
 				}
 				kept = append(kept, keptItem{it: it, summary: st.Summary, class: st.Class})
 				continue
 			}
+			if persisted, dup := dupDropped[i]; dup {
+				// Non-primary по результату вызова B: in-run-исключение из
+				// digest_items всегда (шаг 4c по ссылкам автоматически работает
+				// только по kept), но seen ДО доставки (§4.4, тот же
+				// MarkSeenBatch-поток, что и ad) — ТОЛЬКО если строка
+				// dropped_dup персистентна: дубли degraded-кластера остаются
+				// unseen, следующий прогон пересмотрит (фикс 9C-ревью).
+				if persisted {
+					droppedKeys = append(droppedKeys, it.DedupKey())
+				}
+				continue
+			}
 			r := res.Items[pos[i]]
 			if !res.Degraded[pos[i]] && r.Class == llm.ClassAd {
-				adKeys = append(adKeys, it.DedupKey())
+				droppedKeys = append(droppedKeys, it.DedupKey())
 				continue
 			}
 			class := r.Class
@@ -374,12 +586,13 @@ func (p *Pipeline) Run(ctx context.Context) error {
 		})
 	}
 
-	// Реклама получает seen СРАЗУ (§4.2/§4.9) — до доставки и независимо от
-	// неё: ad-элементы не доставляются, «потерять» их нельзя. Ошибка log-only:
-	// непомеченный ad следующий прогон повторно выбросит уже из кеша (без LLM).
-	if len(adKeys) > 0 {
-		if err := p.Store.MarkSeenBatch(ctx, adKeys); err != nil {
-			log.Error("mark ads seen failed", "ads", len(adKeys), "err", err)
+	// Реклама и персистентные дубли (dropped_dup) получают seen СРАЗУ
+	// (§4.2/§4.9) — до доставки и независимо от неё: сброшенные элементы не
+	// доставляются, «потерять» их нельзя. Ошибка log-only: непомеченный
+	// следующий прогон повторно выбросит уже из кеша (без LLM).
+	if len(droppedKeys) > 0 {
+		if err := p.Store.MarkSeenBatch(ctx, droppedKeys); err != nil {
+			log.Error("mark dropped seen failed", "dropped", len(droppedKeys), "err", err)
 		}
 	}
 

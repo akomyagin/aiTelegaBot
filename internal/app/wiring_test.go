@@ -80,3 +80,37 @@ func TestNewLinkStack_ClientConfig(t *testing.T) {
 		t.Error("LinkFetch = nil, want fetcher in online mode")
 	}
 }
+
+// --- Wiring вызова B (Этап 9C): newDeduper по конфигу ---
+
+func TestNewDeduper_OfflineConfig(t *testing.T) {
+	d := newDeduper(&config.Config{Offline: true})
+	off, ok := d.(*llm.Offline)
+	if !ok {
+		t.Fatalf("newDeduper(offline) = %T, want *llm.Offline", d)
+	}
+	// Без сети: FindDuplicates детерминированно кластеризует одинаковые
+	// нормализованные заголовки без единого httptest-сервера.
+	clusters, err := off.FindDuplicates(context.Background(), []llm.DedupItem{
+		{Title: "Новость!"}, {Title: "новость"}, {Title: "Другое"},
+	})
+	if err != nil {
+		t.Fatalf("FindDuplicates: %v", err)
+	}
+	if len(clusters) != 1 || clusters[0].Primary != 1 ||
+		len(clusters[0].Indices) != 2 || clusters[0].Indices[1] != 2 {
+		t.Fatalf("clusters = %+v, want [{[1 2] 1}]", clusters)
+	}
+}
+
+func TestNewDeduper_ClientConfig(t *testing.T) {
+	d := newDeduper(&config.Config{
+		LLMAPIKey:     "test-key",
+		LLMBaseURL:    "http://127.0.0.1:1/v1", // недостижим; конструирование без сети
+		LLMModel:      "test-model",
+		LLMMaxRetries: 2,
+	})
+	if _, ok := d.(*llm.Client); !ok {
+		t.Fatalf("newDeduper(client) = %T, want *llm.Client", d)
+	}
+}
