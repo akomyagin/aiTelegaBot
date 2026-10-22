@@ -330,3 +330,119 @@ func (c *Client) classifyChunk(ctx context.Context, chunk []ClassifyItem) (Class
 		"chunk_items", len(chunk), "err", lastErr)
 	return degradedClassifyResult(chunk), nil
 }
+
+// ClassifyLinks implements LinkClassifier (вызов E плана §4.8) over the
+// chat-completions API — один запрос на тему (план: гранулярность «1 на тему»,
+// чанкования нет). Паттерн SuggestTopic/SummarizeTopic: строгий JSON
+// {"links":[{"msg":1,"link":2,"kind":"article"}]}, fence-strip, ровно ОДИН
+// повтор при мусорном ответе (максимум 2 запроса), существующий retry/backoff
+// транспорта (doWithRetry).
+//
+// В отличие от вызова A, двойной мусор → ERROR без fallback-результата:
+// деградирует вызывающий (pipeline оставит ссылки в item_links с
+// kind=other по умолчанию — план §4.3). Ошибка транспорта/API → error
+// немедленно. Контракт покрытия LinkClassifier: РОВНО по одному LinkKind на
+// пару (msg,link) входа; отсутствующая в ответе пара → kind=other. Пустой
+// вход (нет ни одной пары) → пустой результат БЕЗ HTTP-запроса.
+// API-ключ никогда не логируется.
+func (c *Client) ClassifyLinks(ctx context.Context, msgs []MsgLinks) ([]LinkKind, error) {
+	pairs := allLinkPairs(msgs)
+	if len(pairs) == 0 {
+		return nil, nil
+	}
+	body, err := json.Marshal(chatRequest{
+		Model:       c.model,
+		Messages:    buildLinkClassifyPrompt(msgs),
+		Temperature: 0.2,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("llm: marshal request: %w", err)
+	}
+
+	url := c.baseURL + "/chat/completions"
+	makeReq := func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+c.apiKey) // apiKey never logged
+		return req, nil
+	}
+
+	const maxParseAttempts = 2 // initial request + one repeat on an unparseable answer
+	var lastErr error
+	for attempt := 0; attempt < maxParseAttempts; attempt++ {
+		resp, err := c.doWithRetry(ctx, makeReq)
+		if err != nil {
+			// HTTP-level failures were already retried inside doWithRetry;
+			// fatal errors (400/401) must not be re-requested.
+			return nil, err
+		}
+		content, err := extractContent(resp)
+		if err != nil {
+			return nil, err
+		}
+		kinds, perr := parseLinksResponse(content, msgs)
+		if perr == nil {
+			return kinds, nil
+		}
+		lastErr = perr
+		c.log.Warn("llm links classify unparseable", "attempt", attempt, "err", perr)
+	}
+	return nil, fmt.Errorf("llm: links classify unparseable after %d attempts: %w", maxParseAttempts, lastErr)
+}
+
+// SummarizeLinks implements LinkSummarizer (вызов F плана §4.8) over the
+// chat-completions API — ClassifyLinks-паттерн: один запрос на тему, строгий
+// JSON {"items":[{"index":1,"summary":"…"}]}, fence-strip, ровно ОДИН повтор
+// при мусоре, затем ERROR (деградация вызывающего: ссылки останутся без
+// саммари, план §4.3). Text каждой страницы обрезается до
+// linkSummaryTextRunes (1500) рун в промпте. Контракт покрытия: РОВНО по
+// одному LinkSummary на страницу, Index 1..n; отсутствующий индекс →
+// Summary="" (не ошибка). Пустой вход → пустой результат без HTTP-запроса.
+// API-ключ никогда не логируется.
+func (c *Client) SummarizeLinks(ctx context.Context, pages []LinkPage) ([]LinkSummary, error) {
+	if len(pages) == 0 {
+		return nil, nil
+	}
+	body, err := json.Marshal(chatRequest{
+		Model:       c.model,
+		Messages:    buildLinkSummaryPrompt(pages),
+		Temperature: 0.2,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("llm: marshal request: %w", err)
+	}
+
+	url := c.baseURL + "/chat/completions"
+	makeReq := func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+c.apiKey) // apiKey never logged
+		return req, nil
+	}
+
+	const maxParseAttempts = 2 // initial request + one repeat on an unparseable answer
+	var lastErr error
+	for attempt := 0; attempt < maxParseAttempts; attempt++ {
+		resp, err := c.doWithRetry(ctx, makeReq)
+		if err != nil {
+			return nil, err
+		}
+		content, err := extractContent(resp)
+		if err != nil {
+			return nil, err
+		}
+		sums, perr := parseLinkSummaries(content, len(pages))
+		if perr == nil {
+			return sums, nil
+		}
+		lastErr = perr
+		c.log.Warn("llm link summaries unparseable", "attempt", attempt, "err", perr)
+	}
+	return nil, fmt.Errorf("llm: link summaries unparseable after %d attempts: %w", maxParseAttempts, lastErr)
+}

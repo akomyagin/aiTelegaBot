@@ -45,3 +45,38 @@ func TestNewSummarizer_ClientConfig(t *testing.T) {
 		t.Fatalf("newSummarizer(client) = %T, want *llm.Client", s)
 	}
 }
+
+// --- Wiring шага 4c (Этап 9B): newLinkStack по конфигу ---
+
+func TestNewLinkStack_OfflineConfig(t *testing.T) {
+	e, f, fetch := newLinkStack(&config.Config{Offline: true})
+	if _, ok := e.(*llm.Offline); !ok {
+		t.Errorf("LinkClassifier = %T, want *llm.Offline", e)
+	}
+	if _, ok := f.(*llm.Offline); !ok {
+		t.Errorf("LinkSummarizer = %T, want *llm.Offline", f)
+	}
+	if fetch != nil {
+		t.Errorf("offline LinkFetch = %+v, want nil (fetch-фаза пропускается)", fetch)
+	}
+}
+
+func TestNewLinkStack_ClientConfig(t *testing.T) {
+	e, f, fetch := newLinkStack(&config.Config{
+		LLMAPIKey:     "test-key",
+		LLMBaseURL:    "http://127.0.0.1:1/v1", // недостижим; конструирование без сети
+		LLMModel:      "test-model",
+		LLMMaxRetries: 2,
+		// LinkFetchTimeout=0 — проверка страховки дефолта (Load даёт 15s);
+		// fetch не выполняется, сеть не нужна.
+	})
+	if _, ok := e.(*llm.Client); !ok {
+		t.Errorf("LinkClassifier = %T, want *llm.Client", e)
+	}
+	if _, ok := f.(*llm.Client); !ok {
+		t.Errorf("LinkSummarizer = %T, want *llm.Client", f)
+	}
+	if fetch == nil {
+		t.Error("LinkFetch = nil, want fetcher in online mode")
+	}
+}
