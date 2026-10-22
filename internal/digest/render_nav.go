@@ -374,7 +374,8 @@ type MessageLink struct {
 // Резка 4096: сначала жертвуется блок «Ссылки:» (ссылка доступна из L2
 // «перейти»), затем full_text режется по рунам с пометкой «…полный текст — в
 // источнике». Кнопки (порядок плана §4.6): «🖼 Фото» P:<itemID> — только при
-// media_ref≠” (обработка — 9E, в 9D диспетчер ack'ит «Медиа недоступно»);
+// media_ref≠” (Этап 9E: seam возвращает CallbackResult{Send} — отдельное
+// sendPhoto-сообщение c caption и кнопкой «✖ Закрыть» PDEL);
 // «↗ Перейти в источник» — URLButton (nil-плейсхолдер в Buttons, см. NavView);
 // «◀ Назад» S:<DigestID>:<SourceID> — did/sid из самой строки digest_items
 // (DigestID заполняет GetDigestItem).

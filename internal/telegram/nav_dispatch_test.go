@@ -1,10 +1,11 @@
 // Тесты 9D-2a на telegram-уровне (план «Подэтап 9D» тест-кейс 6): диспетчер
 // S:/M:/P:/PDEL в handleCallbackQuery — seam-маршрутизация S:/M: (data
 // насквозь, ack раньше edit), не-owner/inaccessible → seam не вызывается,
-// ошибка seam'а → ack «Не получилось открыть» без edit, P: → ack «Медиа
-// недоступно» БЕЗ edit (9E), PDEL → ack-only, seam nil → деградация;
-// inlineKeyboard маппит InlineButton.URL (Data игнорируется при непустом URL).
-// Используются существующие seam-хелперы пакета: recorder, drillStub, cbQuery.
+// ошибка seam'а → ack «Не получилось открыть» без edit, P: → 9E: тот же
+// seam-путь, что S:/M: (sendPhoto-контур и PDEL — photo_test.go), seam nil →
+// деградация; inlineKeyboard маппит InlineButton.URL (Data игнорируется при
+// непустом URL). Используются существующие seam-хелперы пакета: recorder,
+// drillStub, cbQuery.
 
 package telegram
 
@@ -51,10 +52,10 @@ func TestHandleCallbackQuery_Nav9D(t *testing.T) {
 			res: okResult, wantLog: []string{"ack:" + cbNotOwnerText}, wantText: "", wantData: ""},
 		{name: "M: inaccessible → только ack, seam не вызывается", data: "M:11", from: owner, access: false,
 			res: okResult, wantLog: []string{"ack:"}, wantText: "", wantData: ""},
-		{name: "P: — ack «Медиа недоступно», БЕЗ edit, seam не вызывается (9E)",
+		{name: "P: — 9E: маршрутизуется в seam как S:/M: (sendPhoto-контур — photo_test.go)",
 			data: "P:11", from: owner, access: true, res: okResult,
-			wantLog: []string{"ack:" + photoUnavailableText}, wantText: "", wantData: ""},
-		{name: "PDEL — ack-only, без edit и без deleteMessage (9E)", data: "PDEL", from: owner, access: true,
+			wantLog: []string{"ack:готово", "edit"}, wantText: "NAV VIEW", wantData: "P:11"},
+		{name: "P: inaccessible → только ack, seam не вызывается", data: "P:11", from: owner, access: false,
 			res: okResult, wantLog: []string{"ack:"}, wantText: "", wantData: ""},
 		{name: "S: seam nil → ack + edit «Drill-down недоступен.»", data: "S:42:7", from: owner, access: true,
 			nilSeam: true, wantLog: []string{"ack:", "edit"}, wantText: drillDownUnavailableText, wantData: ""},
@@ -126,14 +127,4 @@ func TestInlineKeyboard_URLMapping(t *testing.T) {
 	if dataBtn.CallbackData != "S:1:2" || dataBtn.URL != "" {
 		t.Errorf("data button = %+v, want CallbackData S:1:2, no URL", dataBtn)
 	}
-}
-
-// CallbackResult.Send объявлен в 9D и всегда nil (обработка — 9E): компиляция
-// и нулевое значение фиксируют контракт.
-func TestCallbackResult_SendDeclaredNilIn9D(t *testing.T) {
-	res := &CallbackResult{AckText: "x"}
-	if res.Send != nil {
-		t.Errorf("Send = %+v, want nil в 9D", res.Send)
-	}
-	var _ *SendAction = res.Send
 }

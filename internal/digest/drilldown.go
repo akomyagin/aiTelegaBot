@@ -2,8 +2,9 @@
 // seam telegram.WithDrillDown разбирает СЫРОЙ callback_data —
 // «S:<digestID>:<sourceID>» (топик, sourceID=0 → все топики одним списком с
 // подзаголовками), «M:<digestItemID>» (сообщение), «P:<digestItemID>» (фото —
-// в 9D заглушка: ack «Медиа недоступно», sendPhoto в 9E) и «PDEL» (закрыть
-// фото — в 9D ack-only, deleteMessage в 9E), ПЛЮС legacy-alias'ы кнопок СТАРЫХ
+// Этап 9E: CallbackResult{Send} → sendPhoto в owner-чат) и «PDEL» (закрыть
+// фото — в проде перехватывает telegram-диспетчер; здесь защита прямых
+// вызовов, ack-only), ПЛЮС legacy-alias'ы кнопок СТАРЫХ
 // доставленных сообщений: «L2:<digestID>» → как «T:<digestID>» (ближайший
 // новый аналог — RenderTopicView), «L3:<digestID>:<sourceID>» →
 // «S:<digestID>:<sourceID>» (включая sourceID=0). «L1:» в seam не попадает —
@@ -32,10 +33,19 @@ import (
 const (
 	// drillBackLabel — кнопка «◀ Назад» (используется и render_nav.go).
 	drillBackLabel = "◀ Назад"
-	// mediaUnavailableAck — 9D-заглушка «P:» (план 9D: фото отправляется в
-	// 9E); совпадает с telegram.photoUnavailableText (дублирование сознательное:
-	// telegram обрабатывает «P:» до seam'а, seam — защита для прямых вызовов).
-	mediaUnavailableAck = "Медиа недоступно"
+	// Этап 9E (план §4.5.2): фото-сообщение «P:» — лейбл «✖ Закрыть»
+	// (callback_data «PDEL» = 4 байта ≤ 64) и пределы caption. Caption —
+	// «<b>title</b>\n<summary>\n↪ <a href>источник</a>», жёсткий лимит Bot API
+	// 1024 БАЙТА (photoCaptionMaxBytes) гарантируется финальной резкой
+	// truncateToBytes; рунные пределы title/summary ДО EscapeHTML (урок 9D M1:
+	// navHeaderTitleRunes) держат типовой caption далеко внутри лимита:
+	// worst-case 120×4 + 200×4 + «↪ <a href="…">источник</a>» (~1300 байт при
+	// pathological-эскейпе и длинном URL) → режется truncateToBytes.
+	photoCloseLabel          = "✖ Закрыть"
+	photoDeleteCallbackData  = "PDEL"
+	photoCaptionMaxBytes     = 1024
+	photoCaptionTitleRunes   = 120
+	photoCaptionSummaryRunes = 200
 )
 
 // parseSourceData разбирает «<prefix><digestID>:<sourceID>» для «S:» и legacy
@@ -112,15 +122,19 @@ func NewDrillDown(store storage.Store, sources func(ctx context.Context) ([]stor
 			}
 			return drillMessageView(ctx, store, id)
 		case strings.HasPrefix(data, "P:"):
-			// 9D-заглушка (план 9D): фото отправляется в 9E — только ack, БЕЗ
-			// edit. id валидируем для единой семантики мусора (error → ack
-			// «Не получилось открыть»), но от ответа он не зависит.
-			if _, err := parseMessageData(data, "P:"); err != nil {
+			// Этап 9E (план §4.5.2): фото материала — отдельное sendPhoto-
+			// сообщение (CallbackResult.Send); 9D-заглушка «Медиа недоступно»
+			// удалена (осознанная смена контракта 9E).
+			id, err := parseMessageData(data, "P:")
+			if err != nil {
 				return nil, err
 			}
-			return &telegram.CallbackResult{AckText: mediaUnavailableAck}, nil
-		case data == "PDEL":
-			// 9E удалит сообщение фото (CallbackResult.Send); в 9D — ack-only.
+			return drillPhotoSend(ctx, store, id)
+		case data == photoDeleteCallbackData:
+			// Защита прямых вызовов seam'а (как в 9D): в проде «PDEL»
+			// перехватывает telegram-диспетчер РАНЬШЕ seam'а (handlePhotoDelete:
+			// deleteMessage того же сообщения + ack, аргументов нет) — эта
+			// ветка недостижима и остаётся ack-only.
 			return &telegram.CallbackResult{}, nil
 		case strings.HasPrefix(data, "L2:"):
 			// Legacy alias §4.6: «L2:<did>» → как «T:<did>» (ближайший новый
@@ -464,4 +478,68 @@ func fitDrillDownList(header string, blocks []string, sep string) string {
 		return header
 	}
 	return string(r[:maxBodyRunes-1]) + "…"
+}
+
+// drillPhotoSend — «P:<itemID>» (Этап 9E, план §4.5.2): тот же storage-запрос,
+// что у M:-view (GetDigestItem), media_ref=” (или item не найден) → error —
+// telegram-диспетчер ack'ит «Не получилось открыть» (существующая семантика
+// ошибки DrillDown; «🖼 Фото» без media_ref не рендерится, но crafted-callback
+// и гонка с миграцией возможны). Иначе — CallbackResult{Send}: sendPhoto в
+// owner-чат (сторона telegram), caption «<b>title</b>\n<summary>\n↪ <a
+// href="LINK">источник</a>» (≤1024 байт), клавиатура — «✖ Закрыть» PDEL.
+func drillPhotoSend(ctx context.Context, store storage.Store, itemID int64) (*telegram.CallbackResult, error) {
+	it, ok, err := store.GetDigestItem(ctx, itemID)
+	if err != nil {
+		return nil, fmt.Errorf("drill-down: GetDigestItem(%d): %w", itemID, err)
+	}
+	if !ok {
+		return nil, fmt.Errorf("drill-down: digest item %d не существует", itemID)
+	}
+	if strings.TrimSpace(it.MediaRef) == "" {
+		return nil, fmt.Errorf("drill-down: digest item %d: media_ref пуст", itemID)
+	}
+	return &telegram.CallbackResult{Send: &telegram.SendAction{
+		PhotoMediaRef: it.MediaRef,
+		PhotoCaption:  photoCaption(it),
+		PhotoButtons: [][]telegram.InlineButton{
+			{{Text: photoCloseLabel, Data: photoDeleteCallbackData}},
+		},
+	}}, nil
+}
+
+// photoCaption — caption фото-сообщения (план §4.5.2/9E): «<b>title</b>\n
+// <summary ≤200 рун>\n↪ <a href="LINK">источник</a>». Весь динамический текст
+// через telegram.EscapeHTML ДО сборки; title/summary режутся по рунам ДО
+// EscapeHTML (урок 9D M1); href — l3Link (только http/https, кавычка
+// отвергнута, fallback t.me deep link; пуст → строка «↪» не рендерится).
+// Итог режется до ≤1024 БАЙТ на границе рун (truncateToBytes).
+func photoCaption(it storage.DigestItem) string {
+	title := strings.TrimSpace(it.Title)
+	if title == "" {
+		title = "(без заголовка)" // паттерн RenderMessageView
+	}
+	var b strings.Builder
+	b.WriteString("<b>")
+	b.WriteString(telegram.EscapeHTML(navTruncateTitle(title, photoCaptionTitleRunes)))
+	b.WriteString("</b>")
+	if s := strings.TrimSpace(it.Summary); s != "" {
+		b.WriteString("\n")
+		b.WriteString(telegram.EscapeHTML(truncateRunes(s, photoCaptionSummaryRunes)))
+	}
+	if link := l3Link(it); link != "" {
+		b.WriteString("\n↪ <a href=\"")
+		b.WriteString(link)
+		b.WriteString("\">источник</a>")
+	}
+	return truncateToBytes(b.String(), photoCaptionMaxBytes)
+}
+
+// truncateToBytes — обобщение telegram.TruncateButtonLabelTo на произвольный
+// байтовый бюджет (план 9E: «НЕ дублировать логику»): режет s до ≤maxBytes
+// БАЙТ на границе рун, при обрезке добавляет «…».
+func truncateToBytes(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s // в лимит уже укладывается — резать нечего (граница «ровно 1024»)
+	}
+	return telegram.TruncateButtonLabelTo(s, maxBytes-len("…"))
 }
